@@ -96,12 +96,12 @@ type SANs struct {
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.
 type CertificateAuthority struct {
 	ID        uuid.UUID  `json:"id"`
-	ParentID  *uuid.UUID `json:"parent_id,omitempty"` // nil for root CAs
+	ParentID  *uuid.UUID `json:"parent_id,omitempty"`
 	Name      string     `json:"name"`
 	Type      CAType     `json:"type"`
 	Status    CAStatus   `json:"status"`
 	CertPEM   string     `json:"cert_pem"`
-	KeyEnc    []byte     `json:"-"` // never serialised to API responses
+	KeyEnc    []byte     `json:"-"`
 	KeyAlgo   string     `json:"key_algo"`
 	NotBefore time.Time  `json:"not_before"`
 	NotAfter  time.Time  `json:"not_after"`
