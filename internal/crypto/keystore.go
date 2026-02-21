@@ -1,4 +1,3 @@
-// internal/crypto/keystore.go
 package crypto
 
 import (
