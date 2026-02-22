@@ -16,13 +16,14 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     -trimpath \
     -ldflags="-s -w" \
     -o /out/mint-ca \
-    ./cmd/main
+    ./cmd/server
 
 FROM alpine:3.19
 
 RUN apk add --no-cache \
     ca-certificates \
     sqlite-libs \
+    sqlite \
     tzdata
 
 RUN addgroup -g 1001 -S mintca && \

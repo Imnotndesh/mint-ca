@@ -93,6 +93,12 @@ CREATE TABLE IF NOT EXISTS provisioners (
 	created_at DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS setup_state (
+    id         INTEGER PRIMARY KEY CHECK(id = 1),
+    state      TEXT    NOT NULL DEFAULT 'uninitialized',
+    updated_at DATETIME NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS certificates (
 	id             TEXT    NOT NULL PRIMARY KEY,
 	ca_id          TEXT    NOT NULL REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
@@ -1250,4 +1256,38 @@ func scanAPIKey(row *sql.Row) (*APIKey, error) {
 	k.CAID = sqlToUUID(caIDStr)
 	k.Scopes, _ = unmarshalStringSlice(scopesStr)
 	return &k, nil
+}
+func (s *sqliteStore) GetSetupState(ctx context.Context) (SetupState, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT state FROM setup_state WHERE id = 1`)
+	var state string
+	err := row.Scan(&state)
+	if err == sql.ErrNoRows {
+		return StateUninitialized, nil
+	}
+	if err != nil {
+		return StateUninitialized, fmt.Errorf("sqlite: GetSetupState: %w", err)
+	}
+	return SetupState(state), nil
+}
+
+func (s *sqliteStore) SetSetupState(ctx context.Context, state SetupState) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO setup_state (id, state, updated_at)
+		VALUES (1, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			state      = excluded.state,
+			updated_at = excluded.updated_at`,
+		string(state), time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: SetSetupState: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		FROM api_keys WHERE name = ?`, name)
+	return scanAPIKey(row)
 }
