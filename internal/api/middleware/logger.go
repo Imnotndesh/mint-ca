@@ -12,14 +12,24 @@ func Logger() func(http.Handler) http.Handler {
 			start := time.Now()
 			ww := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 			next.ServeHTTP(ww, r)
-			slog.Info("request",
-				"method", r.Method,
-				"path", r.URL.Path,
-				"status", ww.status,
-				"duration_ms", time.Since(start).Milliseconds(),
-				"remote", r.RemoteAddr,
-				"request_id", r.Header.Get("X-Request-Id"),
-			)
+			if rid := r.Header.Get("X-Request-Id"); rid != "" {
+				slog.Info("request",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", ww.status,
+					"duration_ms", time.Since(start).Milliseconds(),
+					"remote", r.RemoteAddr,
+					"request_id", rid,
+				)
+			} else {
+				slog.Info("request",
+					"method", r.Method,
+					"path", r.URL.Path,
+					"status", ww.status,
+					"duration_ms", time.Since(start).Milliseconds(),
+					"remote", r.RemoteAddr,
+				)
+			}
 		})
 	}
 }
