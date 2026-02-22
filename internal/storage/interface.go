@@ -8,6 +8,13 @@ import (
 )
 
 type CAType string
+type SetupState string
+
+const (
+	StateUninitialized SetupState = "uninitialized"
+	StateSetup         SetupState = "setup"
+	StateReady         SetupState = "ready"
+)
 
 const (
 	CATypeRoot         CAType = "root"
@@ -387,6 +394,15 @@ type Store interface {
 
 	// Migrate runs schema creation idempotently. Safe to call on every startup.
 	Migrate(ctx context.Context) error
+
+	GetSetupState(ctx context.Context) (SetupState, error)
+
+	// SetSetupState writes or updates the single setup state row.
+	SetSetupState(ctx context.Context, state SetupState) error
+
+	// GetAPIKeyByName returns the API key with the given name, or (nil, nil).
+	// Used during setup to locate the bootstrap key.
+	GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error)
 
 	// Close releases all connections held by the store.
 	Close() error
