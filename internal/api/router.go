@@ -9,12 +9,15 @@ import (
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
 	"mint-ca/internal/policy"
+	"mint-ca/internal/setup"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 )
 
+// BuildRouter builds the full management API router.
+// Only mounted when setup state is READY.
 func BuildRouter(
 	cfg *config.Config,
 	store storage.Store,
@@ -25,25 +28,21 @@ func BuildRouter(
 ) http.Handler {
 	r := chi.NewRouter()
 
-	// Global middleware
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(apimiddleware.Logger())
 
-	// Health check — no auth, no audit
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok","service":"mint-ca"}`))
 	})
 
-	// Public PKI endpoints — no auth required
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
 	})
 
-	// Authenticated management API
 	r.Group(func(r chi.Router) {
 		r.Use(apimiddleware.Auth(store))
 		r.Use(apimiddleware.Audit(store))
@@ -58,10 +57,43 @@ func BuildRouter(
 		handlers.NewMetricsHandler(store).RegisterRoutes(r)
 	})
 
-	// ACME — conditionally registered
 	if cfg.ACME.Enabled {
 		handlers.NewACMEHandler(store, caEngine, policyEngine, cfg.ACME).RegisterRoutes(r)
 	}
+
+	return r
+}
+
+// BuildSetupRouter builds the minimal router active during setup mode.
+// Only /healthz and /setup/* are exposed.
+// Every other route returns 503 with a hint so the caller knows why.
+func BuildSetupRouter(
+	cfg *config.Config,
+	store storage.Store,
+	caEngine *ca.Engine,
+	onReady setup.ReadyFunc,
+) http.Handler {
+	r := chi.NewRouter()
+
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+	r.Use(apimiddleware.Logger())
+
+	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"setup","message":"complete setup at POST /setup/root-ca then POST /setup/api-key"}`))
+	})
+
+	setup.NewHandler(store, caEngine, cfg, onReady).RegisterRoutes(r)
+
+	// Catch-all: tell callers the server is not ready yet instead of a bare 404.
+	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"server is in setup mode","hint":"POST /setup/root-ca then POST /setup/api-key"}`))
+	})
 
 	return r
 }

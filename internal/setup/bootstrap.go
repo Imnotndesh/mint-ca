@@ -9,8 +9,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/google/uuid"
 	"mint-ca/internal/storage"
+
+	"github.com/google/uuid"
 )
 
 const bootstrapKeyName = "__bootstrap__"

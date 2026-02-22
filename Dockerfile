@@ -23,7 +23,6 @@ FROM alpine:3.19
 RUN apk add --no-cache \
     ca-certificates \
     sqlite-libs \
-    sqlite \
     tzdata
 
 RUN addgroup -g 1001 -S mintca && \
@@ -46,6 +45,6 @@ HEALTHCHECK \
     --timeout=5s \
     --start-period=10s \
     --retries=3 \
-    CMD wget -qO- http://localhost:8443/healthz || exit 1
+    CMD wget -qO- --no-check-certificate https://localhost:8443/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/mint-ca"]
