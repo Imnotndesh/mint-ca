@@ -191,6 +191,12 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	last_used  TIMESTAMPTZ,
 	created_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS setup_state (
+    id         INTEGER     NOT NULL PRIMARY KEY CHECK(id = 1),
+    state      TEXT        NOT NULL DEFAULT 'uninitialized',
+    updated_at TIMESTAMPTZ NOT NULL
+);
 `
 
 func pgMarshalJSON(v interface{}) (string, error) {
@@ -1146,6 +1152,41 @@ func (s *postgresStore) TouchAPIKey(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("postgres: TouchAPIKey: %w", err)
 	}
 	return nil
+}
+
+func (s *postgresStore) GetSetupState(ctx context.Context) (SetupState, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT state FROM setup_state WHERE id = 1`)
+	var state string
+	err := row.Scan(&state)
+	if err == sql.ErrNoRows {
+		return StateUninitialized, nil
+	}
+	if err != nil {
+		return StateUninitialized, fmt.Errorf("postgres: GetSetupState: %w", err)
+	}
+	return SetupState(state), nil
+}
+
+func (s *postgresStore) SetSetupState(ctx context.Context, state SetupState) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO setup_state (id, state, updated_at)
+		VALUES (1, $1, $2)
+		ON CONFLICT(id) DO UPDATE SET
+			state      = EXCLUDED.state,
+			updated_at = EXCLUDED.updated_at`,
+		string(state), time.Now().UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: SetSetupState: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		FROM api_keys WHERE name = $1`, name)
+	return pgScanAPIKey(row)
 }
 
 func pgScanAPIKey(row *sql.Row) (*APIKey, error) {

@@ -1,0 +1,61 @@
+# First-time bootstrap (run after the container is up):
+#   See BOOTSTRAP.md for the exact curl commands to:
+#     - Create your first API key (direct DB insert, once only)
+#     - Create a root CA
+#     - Create an intermediate CA
+#     - Create a provisioner
+#     - Issue your first certificate
+
+services:
+  mint-ca:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mint-ca
+    restart: unless-stopped
+
+    # Load all configuration from the .env file.
+    # Never hard-code secrets in this file.
+    env_file:
+      - .env
+
+    ports:
+      # HOST:CONTAINER — change the host port if 8443 is already taken.
+      - "8443:8443"
+
+    volumes:
+      # Persistent SQLite database. Back this up regularly.
+      # In production use a named volume or a bind mount to a backed-up path.
+      - mint-data:/data
+
+      # Uncomment to mount TLS certificates for production use.
+      # Point MINT_TLS_CERT and MINT_TLS_KEY at these paths in .env.
+      # - ./certs:/certs:ro
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "https://localhost:8443/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # Resource limits — reasonable defaults for a CA that is not under
+    # heavy load. Adjust if you are issuing thousands of certificates per minute.
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 256M
+        reservations:
+          cpus: "0.25"
+          memory: 64M
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  mint-data:
+    driver: local
