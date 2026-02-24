@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"mint-ca/internal/logger"
 	"net/http"
@@ -59,6 +60,7 @@ func main() {
 
 	apiWorkers := workers.NewWorkerGroup()
 	apiWorkers.Add(workers.NewCRLWorker(crlManager, cfg.CRL))
+	apiWorkers.Add(workers.NewNonceWorker(store))
 	apiWorkers.Start(context.Background())
 
 	// Read state before starting the listener so we know which router to mount.
@@ -197,7 +199,7 @@ func main() {
 	case sig := <-quit:
 		slog.Info("shutdown signal received", "signal", sig.String())
 	case err := <-listenErr:
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("server error", "err", err)
 			apiWorkers.Stop()
 			_ = store.Close()

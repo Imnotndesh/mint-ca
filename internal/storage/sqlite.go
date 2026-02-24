@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,14 @@ import (
 )
 
 // sqliteStore is the SQLite implementation of Store.
+const sqliteNonceSchema = `
+CREATE TABLE IF NOT EXISTS acme_nonces (
+	nonce      TEXT     NOT NULL PRIMARY KEY,
+	expires_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nonces_expires_at ON acme_nonces(expires_at);
+`
+
 type sqliteStore struct {
 	db *sql.DB
 }
@@ -49,7 +58,10 @@ func (s *sqliteStore) Close() error {
 }
 
 func (s *sqliteStore) Migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, sqliteSchema)
+	if _, err := s.db.ExecContext(ctx, sqliteSchema); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, sqliteNonceSchema)
 	return err
 }
 
@@ -1246,7 +1258,7 @@ func scanAPIKey(row *sql.Row) (*APIKey, error) {
 		&idStr, &k.Name, &k.KeyHash, &scopesStr,
 		&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1261,7 +1273,7 @@ func (s *sqliteStore) GetSetupState(ctx context.Context) (SetupState, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT state FROM setup_state WHERE id = 1`)
 	var state string
 	err := row.Scan(&state)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return StateUninitialized, nil
 	}
 	if err != nil {
@@ -1290,4 +1302,59 @@ func (s *sqliteStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey
 		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
 		FROM api_keys WHERE name = ?`, name)
 	return scanAPIKey(row)
+}
+func (s *sqliteStore) MigrateNonces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, sqliteNonceSchema)
+	return err
+}
+func (s *sqliteStore) CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO acme_nonces (nonce, expires_at) VALUES (?, ?)`,
+		nonce, expiresAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateNonce: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ConsumeNonce(ctx context.Context, nonce string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var expiresAt time.Time
+	row := tx.QueryRowContext(ctx,
+		`SELECT expires_at FROM acme_nonces WHERE nonce = ?`, nonce)
+	if err := row.Scan(&expiresAt); errors.Is(err, sql.ErrNoRows) {
+		return false, nil // unknown nonce
+	} else if err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: lookup: %w", err)
+	}
+
+	if time.Now().UTC().After(expiresAt.UTC()) {
+		// Expired — delete it and report invalid.
+		_, _ = tx.ExecContext(ctx, `DELETE FROM acme_nonces WHERE nonce = ?`, nonce)
+		_ = tx.Commit()
+		return false, nil
+	}
+
+	// Valid — delete it (single-use).
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acme_nonces WHERE nonce = ?`, nonce); err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: delete: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: commit: %w", err)
+	}
+	return true, nil
+}
+func (s *sqliteStore) PruneExpiredNonces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM acme_nonces WHERE expires_at < ?`, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: PruneExpiredNonces: %w", err)
+	}
+	return nil
 }
