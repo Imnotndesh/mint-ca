@@ -1,4 +1,3 @@
-// internal/storage/postgres.go
 package storage
 
 import (
@@ -17,6 +16,14 @@ import (
 type postgresStore struct {
 	db *sql.DB
 }
+
+const postgresNonceSchema = `
+CREATE TABLE IF NOT EXISTS acme_nonces (
+	nonce      TEXT        NOT NULL PRIMARY KEY,
+	expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pg_nonces_expires_at ON acme_nonces(expires_at);
+`
 
 func newPostgresStore(dsn string) (*postgresStore, error) {
 	db, err := sql.Open("postgres", dsn)
@@ -49,7 +56,10 @@ func (s *postgresStore) Close() error {
 }
 
 func (s *postgresStore) Migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, postgresSchema)
+	if _, err := s.db.ExecContext(ctx, postgresSchema); err != nil {
+		return err
+	}
+	_, err := s.db.ExecContext(ctx, postgresNonceSchema)
 	return err
 }
 
@@ -1158,7 +1168,7 @@ func (s *postgresStore) GetSetupState(ctx context.Context) (SetupState, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT state FROM setup_state WHERE id = 1`)
 	var state string
 	err := row.Scan(&state)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return StateUninitialized, nil
 	}
 	if err != nil {
@@ -1207,4 +1217,52 @@ func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 	k.CAID = pgSQLToUUID(caIDStr)
 	k.Scopes, _ = pgUnmarshalStringSlice(scopesStr)
 	return &k, nil
+}
+
+// MigrateNonces runs the nonce schema migration for Postgres.
+func (s *postgresStore) MigrateNonces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, postgresNonceSchema)
+	return err
+}
+
+// CreateNonce inserts a nonce, ignoring conflicts on the primary key.
+func (s *postgresStore) CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO acme_nonces (nonce, expires_at) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		nonce, expiresAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateNonce: %w", err)
+	}
+	return nil
+}
+
+// ConsumeNonce atomically validates and deletes a nonce using
+// DELETE…RETURNING, which is atomic in Postgres without an explicit
+// transaction. It returns false for unknown or expired nonces.
+func (s *postgresStore) ConsumeNonce(ctx context.Context, nonce string) (bool, error) {
+	// DELETE the row and return expires_at in one round trip.
+	row := s.db.QueryRowContext(ctx,
+		`DELETE FROM acme_nonces WHERE nonce = $1 RETURNING expires_at`, nonce)
+	var expiresAt time.Time
+	if err := row.Scan(&expiresAt); errors.Is(err, sql.ErrNoRows) {
+		return false, nil // unknown nonce
+	} else if err != nil {
+		return false, fmt.Errorf("postgres: ConsumeNonce: %w", err)
+	}
+	// Check expiry after deleting — the nonce is consumed either way.
+	if time.Now().UTC().After(expiresAt.UTC()) {
+		return false, nil
+	}
+	return true, nil
+}
+
+// PruneExpiredNonces deletes all nonces past their expiry.
+func (s *postgresStore) PruneExpiredNonces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM acme_nonces WHERE expires_at < NOW()`)
+	if err != nil {
+		return fmt.Errorf("postgres: PruneExpiredNonces: %w", err)
+	}
+	return nil
 }

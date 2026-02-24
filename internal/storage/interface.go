@@ -404,6 +404,15 @@ type Store interface {
 	// Used during setup to locate the bootstrap key.
 	GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error)
 
+	// CreateNonce inserts a single-use ACME replay nonce that expires at expiresAt.
+	CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error
+
+	// ConsumeNonce atomically validates and deletes a nonce.
+	// Returns (true, nil) if valid, (false, nil) if unknown/expired, or (false, err) on a database error.
+	ConsumeNonce(ctx context.Context, nonce string) (bool, error)
+
+	// PruneExpiredNonces removes nonces past their expiry timestamp.
+	PruneExpiredNonces(ctx context.Context) error
 	// Close releases all connections held by the store.
 	Close() error
 }
