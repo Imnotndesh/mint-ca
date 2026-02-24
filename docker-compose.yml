@@ -23,7 +23,7 @@ services:
       - MINT_TLS_KEY=/data/server.key
       - MINT_ACME_ENABLED=true
       # Uncomment and update these if ACME is enabled:
-      - MINT_ACME_BASE_URL=https://localhost:8443
+      - MINT_ACME_BASE_URL=https://mint-ca:8443
       - MINT_ACME_EAB_REQUIRED=true
 
     ports:
