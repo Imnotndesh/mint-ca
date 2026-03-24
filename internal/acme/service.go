@@ -185,8 +185,6 @@ func (s *Service) AuthenticateKID(ctx context.Context, jws *RawJWS, hdr *Protect
 	if account.Status != storage.ACMEAccountStatusValid {
 		return nil, ErrUnauthorizedProblem(fmt.Sprintf("account status is %s", account.Status))
 	}
-
-	// Reconstruct the public key from the stored JWK.
 	jwkBytes, err := json.Marshal(account.KeyJWK)
 	if err != nil {
 		return nil, ErrServerInternalProblem("marshal stored account key: " + err.Error())
@@ -196,8 +194,6 @@ func (s *Service) AuthenticateKID(ctx context.Context, jws *RawJWS, hdr *Protect
 	if err != nil {
 		return nil, ErrServerInternalProblem("parse stored account key: " + err.Error())
 	}
-
-	// Determine algorithm from the alg field in the protected header.
 	if err := jws.Verify(pub, hdr.Algorithm); err != nil {
 		return nil, ErrUnauthorizedProblem("JWS signature verification failed: " + err.Error())
 	}
@@ -210,9 +206,8 @@ func (s *Service) ValidateNonce(ctx context.Context, hdr *ProtectedHeader) *Prob
 }
 
 // ValidateURL checks that the JWS "url" header matches the request URL.
-// This prevents cross-endpoint replay attacks (RFC 8555 §6.4).
+// This prevents cross-endpoint replay attacks (RFC 8555 6.4).
 func (s *Service) ValidateURL(hdr *ProtectedHeader, requestURL string) *Problem {
-	// Normalise: strip trailing slash for comparison.
 	want := strings.TrimRight(requestURL, "/")
 	got := strings.TrimRight(hdr.URL, "/")
 	if want != got {
@@ -414,16 +409,23 @@ func (s *Service) NewOrder(
 		}
 	}
 
-	// Build the identifier JSON for storage.
-	idJSON, _ := json.Marshal(identifiers)
+	identifiersObj := map[string]interface{}{"identifiers": identifiers}
+	idJSON, err := json.Marshal(identifiersObj)
+	if err != nil {
+		return nil, nil, ErrServerInternalProblem("marshal identifiers: " + err.Error())
+	}
+	var idsJSON storage.JSON
+	if err := json.Unmarshal(idJSON, &idsJSON); err != nil {
+		return nil, nil, ErrServerInternalProblem("unmarshal identifiers: " + err.Error())
+	}
 
 	now := time.Now().UTC()
 	order := &storage.ACMEOrder{
 		ID:          uuid.New(),
 		AccountID:   account.ID,
 		Status:      storage.ACMEOrderStatusPending,
-		Identifiers: storage.JSON{"identifiers": mustUnmarshalRawJSON(idJSON)},
-		ExpiresAt:   now.Add(24 * time.Hour), // order expires if not finalized
+		Identifiers: idsJSON,
+		ExpiresAt:   now.Add(24 * time.Hour),
 		CreatedAt:   now,
 	}
 	if err := s.store.CreateACMEOrder(ctx, order); err != nil {

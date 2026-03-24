@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: Dockerfile
     container_name: mint-ca
+    network_mode: host
     restart: unless-stopped
 
     environment:
@@ -16,10 +17,11 @@ services:
       - MINT_IDLE_TIMEOUT_SECONDS=120
       - MINT_CRL_REFRESH_INTERVAL_SECONDS=3600
       - MINT_TLS_DISABLED=false
+      - MINT_LOG_LEVEL=debug
       - MINT_TLS_CERT=/data/server.crt
       - MINT_TLS_KEY=/data/server.key
       - MINT_ACME_ENABLED=true
-      - MINT_ACME_BASE_URL=https://mint-ca:8443
+      - MINT_ACME_BASE_URL=https://localhost:8443
       - MINT_ACME_EAB_REQUIRED=true
 
     ports:
