@@ -29,8 +29,7 @@ builds:
 
 archives:
   - format_overrides:
-    - format: tar.gz
-    - format: zip
+    - formats: ["tar.gz"]
   - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
@@ -40,7 +39,7 @@ nfpms:
   - id: packages
     package_name: mint-ca
     file_name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Arch }}"
-    vendor: "Your Organization"
+    vendor: "Imnotndesh"
     homepage: "https://github.com/imnotndesh/mint-ca"
     maintainer: "Brian <brian@ndegwa.uk>"
     description: "mint-ca – a lightweight Certificate Authority server"
