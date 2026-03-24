@@ -72,22 +72,12 @@ func main() {
 		ks.Zero()
 		os.Exit(1)
 	}
-
-	// listenErr receives the error from whichever http.Server is active.
-	// It is also used by onReady to trigger a clean shutdown so the container
-	// restarts in READY state with TLS enabled.
 	listenErr := make(chan error, 1)
 
-	// onReady is the callback the setup handler calls when setup completes.
-	// It writes the issued cert and key to the configured TLS paths, then
-	// signals main to shut down cleanly. The container restart policy brings
-	// the server back up immediately in READY state, this time over TLS.
 	onReady := func(certPEM, keyPEM []byte) error {
 		certPath := cfg.Server.TLSCertFile
 		keyPath := cfg.Server.TLSKeyFile
 
-		// Fall back to predictable paths if the operator has not configured them.
-		// These paths are inside the /data volume so they survive restarts.
 		if certPath == "" {
 			certPath = "/data/server.crt"
 		}
