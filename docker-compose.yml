@@ -23,25 +23,10 @@ services:
       - MINT_ACME_ENABLED=true
       - MINT_ACME_BASE_URL=https://localhost:8443
       - MINT_ACME_EAB_REQUIRED=true
-
     ports:
       - "8443:8443"
 
     volumes:
       - mint-data:/data
-
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "https://localhost:8443/healthz"]
-      interval: 30s
-      timeout: 5s
-      start_period: 15s
-      retries: 3
-
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 256M
-
 volumes:
   mint-data:

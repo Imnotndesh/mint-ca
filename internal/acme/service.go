@@ -19,8 +19,6 @@ import (
 	"github.com/google/uuid"
 )
 
-// -------------------- config --------------------
-
 // ProvisionerConfig is the JSON stored in provisioners.config for ACME
 // provisioners. It controls per-provisioner ACME behaviour.
 type ProvisionerConfig struct {
@@ -48,15 +46,11 @@ func (c *ProvisionerConfig) SetDefaults() {
 	}
 }
 
-// -------------------- identifier --------------------
-
 // Identifier is an ACME order identifier (RFC 8555 §7.1.3).
 type Identifier struct {
 	Type  string `json:"type"`  // always "dns" for now
 	Value string `json:"value"` // e.g. "example.com" or "*.example.com"
 }
-
-// -------------------- service inputs/outputs --------------------
 
 type NewAccountRequest struct {
 	ProvisionerID uuid.UUID
@@ -91,8 +85,6 @@ type FinalizeOrderRequest struct {
 	ProvID  uuid.UUID
 	TTLSecs int64
 }
-
-// -------------------- service --------------------
 
 // Store is the minimal storage.Store surface the service needs.
 // Using the full interface is fine — this alias just documents the dependency.
@@ -132,14 +124,10 @@ func NewService(
 	}
 }
 
-// -------------------- nonce helpers --------------------
-
 // IssueNonce generates and persists a fresh nonce.
 func (s *Service) IssueNonce(ctx context.Context) (string, error) {
 	return s.nonces.Issue(ctx)
 }
-
-// -------------------- JWS auth helpers --------------------
 
 // AuthenticateJWK is used for newAccount requests (no existing account yet).
 // It parses the JWK from the protected header, verifies the JWS signature,
@@ -215,8 +203,6 @@ func (s *Service) ValidateURL(hdr *ProtectedHeader, requestURL string) *Problem 
 	}
 	return nil
 }
-
-// -------------------- account operations --------------------
 
 // NewAccount creates a new ACME account, optionally validating EAB.
 // Returns the created account and whether it was freshly created (true) or
@@ -298,8 +284,6 @@ func (s *Service) UpdateAccount(
 	}
 	return account, nil
 }
-
-// -------------------- EAB validation --------------------
 
 // validateEAB verifies an External Account Binding JWS embedded in the
 // new-account request payload.
@@ -386,8 +370,6 @@ func (s *Service) validateEAB(
 
 	return &cred.ID, nil
 }
-
-// -------------------- order operations --------------------
 
 // NewOrder creates a new ACME order and its associated challenges.
 func (s *Service) NewOrder(
@@ -476,6 +458,7 @@ func (s *Service) GetOrder(ctx context.Context, orderID uuid.UUID) (*storage.ACM
 // indicate it is ready. We perform the actual validation asynchronously
 // (in the same goroutine for simplicity — a production system might queue it)
 // and update the challenge and order statuses.
+// ValidateChallenge signals readiness — mark processing and validate async.
 func (s *Service) ValidateChallenge(
 	ctx context.Context,
 	account *storage.ACMEAccount,
@@ -490,46 +473,49 @@ func (s *Service) ValidateChallenge(
 		return nil, NewProblem(ErrMalformed, 404, "challenge not found")
 	}
 	if ch.Status != storage.ACMEChallengeStatusPending {
-		// Already validated or invalid — return current state.
 		return ch, nil
 	}
 
-	// Load the order to find the identifier for this challenge.
 	order, err := s.store.GetACMEOrder(ctx, ch.OrderID)
 	if err != nil {
-		return nil, ErrServerInternalProblem("load order for challenge: " + err.Error())
+		return nil, ErrServerInternalProblem("load order: " + err.Error())
 	}
 	if order.AccountID != account.ID {
 		return nil, ErrUnauthorizedProblem("challenge does not belong to your account")
 	}
 
-	// Extract the identifier value (domain) from the order.
-	// Identifiers are stored as JSON: {"identifiers": [{type, value}, ...]}
+	go func() {
+		time.Sleep(3 * time.Second)
+		bgCtx := context.Background()
+		s.performValidation(bgCtx, account, ch, order)
+	}()
+
+	return ch, nil
+}
+func (s *Service) performValidation(
+	ctx context.Context,
+	account *storage.ACMEAccount,
+	ch *storage.ACMEChallenge,
+	order *storage.ACMEOrder,
+) {
 	identifiers, prob := s.parseOrderIdentifiers(order)
-	if prob != nil {
-		return nil, prob
-	}
-	if len(identifiers) == 0 {
-		return nil, ErrServerInternalProblem("order has no identifiers")
+	if prob != nil || len(identifiers) == 0 {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		return
 	}
 
-	// For simplicity we validate against the first identifier.
-	// In practice, each challenge is tied to one identifier; a more complete
-	// implementation would store the identifier alongside the challenge.
-	// This works correctly when there is one identifier per order (the common case).
 	domain := identifiers[0].Value
 
-	// Compute the key authorization.
 	acctJWKRaw, err := json.Marshal(account.KeyJWK)
 	if err != nil {
-		return nil, ErrServerInternalProblem("marshal account JWK: " + err.Error())
+		return
 	}
 	keyAuth, err := KeyAuthorization(ch.Token, acctJWKRaw)
 	if err != nil {
-		return nil, ErrServerInternalProblem("compute key authorization: " + err.Error())
+		return
 	}
 
-	// Perform the actual validation.
 	var valErr error
 	switch ch.Type {
 	case storage.ACMEChallengeTypeHTTP01:
@@ -543,43 +529,21 @@ func (s *Service) ValidateChallenge(
 
 	now := time.Now().UTC()
 	if valErr != nil {
-		// Mark the challenge invalid.
 		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
-		// Mark the order invalid too.
 		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
-		ch.Status = storage.ACMEChallengeStatusInvalid
-		// Return the challenge with its new status — no *Problem; the client
-		// can inspect the challenge to understand what went wrong.
-		return ch, nil
+		return
 	}
 
-	// Mark challenge valid.
-	if err := s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusValid, &now); err != nil {
-		return nil, ErrServerInternalProblem("update challenge: " + err.Error())
-	}
-	ch.Status = storage.ACMEChallengeStatusValid
-	ch.ValidatedAt = &now
-
-	// Check if all challenges for this order are now valid; if so, promote
-	// the order to "ready".
-	if err := s.maybeReadyOrder(ctx, order.ID); err != nil {
-		// Non-fatal — the client can re-poll the order to see its true state.
-		_ = err
-	}
-
-	return ch, nil
+	_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusValid, &now)
+	_ = s.maybeReadyOrder(ctx, order.ID)
 }
 
-// maybeReadyOrder checks whether every challenge for an order is valid and,
-// if so, transitions the order to the "ready" state.
+// maybeReadyOrder checks whether every challenge for an order is valid and, if so, transitions the order to the "ready" state.
 func (s *Service) maybeReadyOrder(ctx context.Context, orderID uuid.UUID) error {
 	challenges, err := s.store.ListChallengesByOrder(ctx, orderID)
 	if err != nil {
 		return err
 	}
-	// We consider the order ready when at least one challenge per identifier
-	// type grouping is valid. For simplicity: if ANY challenge is still pending,
-	// we stay in "pending". If all are valid, we go to "ready".
 	for _, ch := range challenges {
 		if ch.Status == storage.ACMEChallengeStatusPending {
 			return nil
@@ -591,8 +555,6 @@ func (s *Service) maybeReadyOrder(ctx context.Context, orderID uuid.UUID) error 
 	}
 	return s.store.UpdateACMEOrderStatus(ctx, orderID, storage.ACMEOrderStatusReady)
 }
-
-// -------------------- finalize / certificate --------------------
 
 // FinalizeOrder processes the CSR submitted by the ACME client, signs a
 // certificate via the CA engine, and links it to the order.
@@ -680,8 +642,6 @@ func (s *Service) GetCertificate(
 	return full, nil
 }
 
-// -------------------- URL helpers --------------------
-
 func (s *Service) AccountURL(provisionerID, accountID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/account/%s", s.baseURL, provisionerID, accountID)
 }
@@ -734,8 +694,6 @@ func (s *Service) parseOrderIdentifiers(order *storage.ACMEOrder) ([]Identifier,
 	}
 	return ids, nil
 }
-
-// -------------------- private helpers --------------------
 
 // generateToken creates a fresh 32-byte random token encoded as base64url.
 func generateToken() (string, error) {

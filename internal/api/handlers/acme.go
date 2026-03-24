@@ -3,7 +3,9 @@ package handlers
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strconv"
 
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ca"
@@ -45,6 +47,7 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/new-order", h.newOrder)
 		r.Post("/order/{orderID}", h.getOrder)
+		r.Post("/order/{orderID}/authz/{index}", h.getAuthorization)
 		r.Post("/order/{orderID}/finalize", h.finalizeOrder)
 		r.Post("/challenge/{challengeID}", h.validateChallenge)
 		r.Post("/certificate/{certID}", h.getCertificate)
@@ -52,7 +55,7 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 }
 
 // acmeWriteJSON writes a JSON response with ACME-required headers. It always
-// adds a fresh Replay-Nonce so the client can make its next request immediately.
+// adds a fresh Replay-Nonce so the client can make its next request immediately
 func (h *ACMEHandler) acmeWriteJSON(w http.ResponseWriter, r *http.Request, status int, body interface{}) {
 	nonce, err := h.service.IssueNonce(r.Context())
 	if err == nil {
@@ -588,26 +591,112 @@ func accountResponse(a *storage.ACMEAccount, accountURL string) map[string]inter
 		"orders":  accountURL + "/orders",
 	}
 }
+func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
 
-// orderResponse builds the RFC 8555 §7.1.3 order object.
-// challenges is the flat list from the store; we group them per identifier into
-// authorization objects (inlined here as URLs per the spec).
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	orderID, err := uuid.Parse(chi.URLParam(r, "orderID"))
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid order ID"))
+		return
+	}
+	indexStr := chi.URLParam(r, "index")
+	index, err := strconv.Atoi(indexStr)
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid authz index"))
+		return
+	}
+
+	order, prob := h.service.GetOrder(ctx, orderID)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if order.AccountID != account.ID {
+		h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("order does not belong to your account"))
+		return
+	}
+
+	identifiers, err := parseIdentifiersFromOrder(order)
+	if err != nil || index >= len(identifiers) {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid authz index"))
+		return
+	}
+	identifier := identifiers[index]
+
+	allChallenges, err := h.store.ListChallengesByOrder(ctx, order.ID)
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load challenges: "+err.Error()))
+		return
+	}
+
+	// Build the challenges array for the response.
+	challObjs := make([]map[string]interface{}, 0, len(allChallenges))
+	for _, ch := range allChallenges {
+		obj := map[string]interface{}{
+			"type":   string(ch.Type),
+			"url":    h.service.ChallengeURL(prov.ID, ch.ID),
+			"status": string(ch.Status),
+			"token":  ch.Token,
+		}
+		if ch.ValidatedAt != nil {
+			obj["validated"] = ch.ValidatedAt.Format("2006-01-02T15:04:05Z")
+		}
+		challObjs = append(challObjs, obj)
+	}
+	authzStatus := "pending"
+	for _, ch := range allChallenges {
+		if ch.Status == storage.ACMEChallengeStatusValid {
+			authzStatus = "valid"
+			break
+		}
+		if ch.Status == storage.ACMEChallengeStatusInvalid {
+			authzStatus = "invalid"
+			break
+		}
+	}
+
+	authzURL := h.service.AuthorizationURL(prov.ID, order.ID, index)
+	w.Header().Set("Location", authzURL)
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
+		"status":     authzStatus,
+		"expires":    order.ExpiresAt.Format("2006-01-02T15:04:05Z"),
+		"identifier": map[string]string{"type": identifier.Type, "value": identifier.Value},
+		"challenges": challObjs,
+	})
+}
 func (h *ACMEHandler) orderResponse(
 	provisionerID uuid.UUID,
 	order *storage.ACMEOrder,
 	challenges []*storage.ACMEChallenge,
 ) map[string]interface{} {
-
-	// Build authorization URL list (one per challenge grouping by order).
-	// The spec requires one authorization URL per identifier; we emit one per
-	// unique challenge, which is equivalent when each identifier has one of each type.
-	authzURLs := make([]string, 0, len(challenges))
-	seen := map[uuid.UUID]bool{}
-	for _, ch := range challenges {
-		if !seen[ch.ID] {
-			authzURLs = append(authzURLs, h.service.ChallengeURL(provisionerID, ch.ID))
-			seen[ch.ID] = true
-		}
+	identifiers, _ := parseIdentifiersFromOrder(order)
+	authzURLs := make([]string, len(identifiers))
+	for i := range identifiers {
+		authzURLs[i] = h.service.AuthorizationURL(provisionerID, order.ID, i)
 	}
 
 	resp := map[string]interface{}{
@@ -623,6 +712,18 @@ func (h *ACMEHandler) orderResponse(
 	}
 
 	return resp
+}
+func parseIdentifiersFromOrder(order *storage.ACMEOrder) ([]internalacme.Identifier, error) {
+	raw, ok := order.Identifiers["identifiers"]
+	if !ok {
+		return nil, fmt.Errorf("missing identifiers")
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil, err
+	}
+	var ids []internalacme.Identifier
+	return ids, json.Unmarshal(b, &ids)
 }
 
 func challengeResponse(ch *storage.ACMEChallenge, challURL string) map[string]interface{} {
