@@ -92,6 +92,18 @@ CREATE TABLE IF NOT EXISTS policies (
 	created_at      TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS acme_authorizations (
+    id               TEXT        NOT NULL PRIMARY KEY,
+    order_id         TEXT        NOT NULL REFERENCES acme_orders(id) ON DELETE CASCADE,
+    identifier_type  TEXT        NOT NULL CHECK(identifier_type IN ('dns')),
+    identifier_value TEXT        NOT NULL,
+    status           TEXT        NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','valid','invalid')),
+    expires_at       TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL
+);
+
+ALTER TABLE acme_challenges ADD COLUMN IF NOT EXISTS authorization_id TEXT REFERENCES acme_authorizations(id) ON DELETE CASCADE;
+
 CREATE TABLE IF NOT EXISTS provisioners (
 	id         TEXT        NOT NULL PRIMARY KEY,
 	ca_id      TEXT        NOT NULL REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
@@ -929,9 +941,9 @@ func pgScanOrder(row *sql.Row) (*ACMEOrder, error) {
 
 func (s *postgresStore) CreateACMEChallenge(ctx context.Context, c *ACMEChallenge) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO acme_challenges (id, order_id, type, token, status)
-		VALUES ($1,$2,$3,$4,$5)`,
-		c.ID.String(), c.OrderID.String(),
+        INSERT INTO acme_challenges (id, order_id, authorization_id, type, token, status)
+        VALUES ($1,$2,$3,$4,$5,$6)`,
+		c.ID.String(), c.OrderID.String(), pgUUIDToSQL(c.AuthorizationID),
 		string(c.Type), c.Token, string(c.Status),
 	)
 	if err != nil {
@@ -950,27 +962,85 @@ func (s *postgresStore) GetACMEChallenge(ctx context.Context, id uuid.UUID) (*AC
 	}
 	return c, nil
 }
+func (s *postgresStore) CreateACMEAuthorization(ctx context.Context, a *ACMEAuthorization) error {
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO acme_authorizations
+            (id, order_id, identifier_type, identifier_value, status, expires_at, created_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		a.ID.String(), a.OrderID.String(),
+		a.IdentifierType, a.IdentifierValue,
+		string(a.Status), a.ExpiresAt.UTC(), a.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateACMEAuthorization: %w", err)
+	}
+	return nil
+}
 
+func (s *postgresStore) GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*ACMEAuthorization, error) {
+	row := s.db.QueryRowContext(ctx, `
+        SELECT id, order_id, identifier_type, identifier_value, status, expires_at, created_at
+        FROM acme_authorizations WHERE id = $1`, id.String())
+	var a ACMEAuthorization
+	var idStr, orderIDStr string
+	err := row.Scan(&idStr, &orderIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetACMEAuthorization: %w", err)
+	}
+	a.ID = uuid.MustParse(idStr)
+	a.OrderID = uuid.MustParse(orderIDStr)
+	return &a, nil
+}
+
+func (s *postgresStore) UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status ACMEAuthorizationStatus) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE acme_authorizations SET status = $1 WHERE id = $2`,
+		string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateACMEAuthorizationStatus: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEAuthorization, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT id, order_id, identifier_type, identifier_value, status, expires_at, created_at
+        FROM acme_authorizations WHERE order_id = $1`, orderID.String())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListAuthorizationsByOrder: %w", err)
+	}
+	defer rows.Close()
+	var out []*ACMEAuthorization
+	for rows.Next() {
+		var a ACMEAuthorization
+		var idStr, orderIDStr string
+		if err := rows.Scan(&idStr, &orderIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		a.ID = uuid.MustParse(idStr)
+		a.OrderID = uuid.MustParse(orderIDStr)
+		out = append(out, &a)
+	}
+	return out, rows.Err()
+}
 func (s *postgresStore) ListChallengesByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEChallenge, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, order_id, type, token, status, validated_at
-		FROM acme_challenges WHERE order_id = $1`, orderID.String())
+        SELECT id, order_id, authorization_id, type, token, status, validated_at
+        FROM acme_challenges WHERE order_id = $1`, orderID.String())
 	if err != nil {
 		return nil, fmt.Errorf("postgres: ListChallengesByOrder: %w", err)
 	}
 	defer rows.Close()
 	var out []*ACMEChallenge
 	for rows.Next() {
-		var c ACMEChallenge
-		var idStr, orderIDStr string
-		if err := rows.Scan(
-			&idStr, &orderIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt,
-		); err != nil {
+		c, err := pgScanChallengeRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.ID = uuid.MustParse(idStr)
-		c.OrderID = uuid.MustParse(orderIDStr)
-		out = append(out, &c)
+		out = append(out, c)
 	}
 	return out, rows.Err()
 }
@@ -984,11 +1054,23 @@ func (s *postgresStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID,
 	}
 	return nil
 }
-
+func pgScanChallengeRows(rows *sql.Rows) (*ACMEChallenge, error) {
+	var c ACMEChallenge
+	var idStr, orderIDStr string
+	var authIDStr *string
+	if err := rows.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt); err != nil {
+		return nil, err
+	}
+	c.ID = uuid.MustParse(idStr)
+	c.OrderID = uuid.MustParse(orderIDStr)
+	c.AuthorizationID = pgSQLToUUID(authIDStr)
+	return &c, nil
+}
 func pgScanChallenge(row *sql.Row) (*ACMEChallenge, error) {
 	var c ACMEChallenge
 	var idStr, orderIDStr string
-	err := row.Scan(&idStr, &orderIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt)
+	var authIDStr *string
+	err := row.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -997,9 +1079,34 @@ func pgScanChallenge(row *sql.Row) (*ACMEChallenge, error) {
 	}
 	c.ID = uuid.MustParse(idStr)
 	c.OrderID = uuid.MustParse(orderIDStr)
+	c.AuthorizationID = pgSQLToUUID(authIDStr)
 	return &c, nil
 }
 
+// ListChallengesByAuthorization returns all challenges belonging to a given authorization.
+func (s *sqliteStore) ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*ACMEChallenge, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT id, order_id, authorization_id, type, token, status, validated_at
+        FROM acme_challenges WHERE authorization_id = ?`, authID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListChallengesByAuthorization: %w", err)
+	}
+	defer rows.Close()
+	var out []*ACMEChallenge
+	for rows.Next() {
+		var c ACMEChallenge
+		var idStr, orderIDStr string
+		var authIDStr *string
+		if err := rows.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt); err != nil {
+			return nil, err
+		}
+		c.ID = uuid.MustParse(idStr)
+		c.OrderID = uuid.MustParse(orderIDStr)
+		c.AuthorizationID = sqlToUUID(authIDStr)
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
 func (s *postgresStore) WriteAuditLog(ctx context.Context, entry *AuditLog) error {
 	payload, _ := pgMarshalJSON(entry.Payload)
 	_, err := s.db.ExecContext(ctx, `
