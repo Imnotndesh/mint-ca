@@ -426,7 +426,6 @@ type Store interface {
 	CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error
 
 	// ConsumeNonce atomically validates and deletes a nonce.
-	// Returns (true, nil) if valid, (false, nil) if unknown/expired, or (false, err) on a database error.
 	ConsumeNonce(ctx context.Context, nonce string) (bool, error)
 	CreateACMEAuthorization(ctx context.Context, auth *ACMEAuthorization) error
 	GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*ACMEAuthorization, error)
