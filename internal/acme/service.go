@@ -639,8 +639,7 @@ func (s *Service) maybeReadyOrder(ctx context.Context, orderID uuid.UUID) error 
 	return s.store.UpdateACMEOrderStatus(ctx, orderID, storage.ACMEOrderStatusReady)
 }
 
-// FinalizeOrder processes the CSR submitted by the ACME client, signs a
-// certificate via the CA engine, and links it to the order.
+// FinalizeOrder processes the CSR submitted by the ACME client, signs a certificate via the CA engine, and links it to the order.
 func (s *Service) FinalizeOrder(
 	ctx context.Context,
 	account *storage.ACMEAccount,
