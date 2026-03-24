@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -391,8 +392,9 @@ func (s *Service) NewOrder(
 		}
 	}
 
-	identifiersObj := map[string]interface{}{"identifiers": identifiers}
-	idJSON, err := json.Marshal(identifiersObj)
+	// Build the identifier JSON for storage (order level).
+	idObj := map[string]interface{}{"identifiers": identifiers}
+	idJSON, err := json.Marshal(idObj)
 	if err != nil {
 		return nil, nil, ErrServerInternalProblem("marshal identifiers: " + err.Error())
 	}
@@ -402,44 +404,68 @@ func (s *Service) NewOrder(
 	}
 
 	now := time.Now().UTC()
+	expiresAt := now.Add(24 * time.Hour)
+
+	// Create the order.
 	order := &storage.ACMEOrder{
 		ID:          uuid.New(),
 		AccountID:   account.ID,
 		Status:      storage.ACMEOrderStatusPending,
 		Identifiers: idsJSON,
-		ExpiresAt:   now.Add(24 * time.Hour),
+		ExpiresAt:   expiresAt,
 		CreatedAt:   now,
 	}
 	if err := s.store.CreateACMEOrder(ctx, order); err != nil {
 		return nil, nil, ErrServerInternalProblem("create order: " + err.Error())
 	}
 
-	// Create one challenge of each supported/allowed type per identifier.
+	// Create authorizations and challenges.
 	var allChallenges []*storage.ACMEChallenge
 	for _, id := range identifiers {
+		// Create authorization for this identifier.
+		authID := uuid.New()
+		auth := &storage.ACMEAuthorization{
+			ID:              authID,
+			OrderID:         order.ID,
+			IdentifierType:  id.Type,
+			IdentifierValue: id.Value,
+			Status:          storage.ACMEAuthorizationStatusPending,
+			ExpiresAt:       expiresAt,
+			CreatedAt:       now,
+		}
+		if err := s.store.CreateACMEAuthorization(ctx, auth); err != nil {
+			return nil, nil, ErrServerInternalProblem("create authorization: " + err.Error())
+		}
+
+		// Create challenges for each allowed type.
 		for _, challType := range cfg.AllowedChallengeTypes {
 			token, err := generateToken()
 			if err != nil {
 				return nil, nil, ErrServerInternalProblem("generate challenge token: " + err.Error())
 			}
 			ch := &storage.ACMEChallenge{
-				ID:      uuid.New(),
-				OrderID: order.ID,
-				Type:    storage.ACMEChallengeType(challType),
-				Token:   token,
-				Status:  storage.ACMEChallengeStatusPending,
+				ID:              uuid.New(),
+				OrderID:         order.ID,
+				AuthorizationID: &authID,
+				Type:            storage.ACMEChallengeType(challType),
+				Token:           token,
+				Status:          storage.ACMEChallengeStatusPending,
 			}
 			if err := s.store.CreateACMEChallenge(ctx, ch); err != nil {
 				return nil, nil, ErrServerInternalProblem("create challenge: " + err.Error())
 			}
-			// Annotate for the response — the identifier is needed by the handler
-			// to construct the authorization object.
-			_ = id // handler will group by order
 			allChallenges = append(allChallenges, ch)
 		}
 	}
 
 	return order, allChallenges, nil
+}
+func (s *Service) GetAuthorizationsForOrder(ctx context.Context, orderID uuid.UUID) ([]*storage.ACMEAuthorization, *Problem) {
+	auths, err := s.store.ListAuthorizationsByOrder(ctx, orderID)
+	if err != nil {
+		return nil, ErrServerInternalProblem("list authorizations: " + err.Error())
+	}
+	return auths, nil
 }
 
 // GetOrder loads and returns an order. The caller must verify the account owns it.
@@ -454,11 +480,6 @@ func (s *Service) GetOrder(ctx context.Context, orderID uuid.UUID) (*storage.ACM
 	return order, nil
 }
 
-// ValidateChallenge is called when the client POSTs to a challenge URL to
-// indicate it is ready. We perform the actual validation asynchronously
-// (in the same goroutine for simplicity — a production system might queue it)
-// and update the challenge and order statuses.
-// ValidateChallenge signals readiness — mark processing and validate async.
 func (s *Service) ValidateChallenge(
 	ctx context.Context,
 	account *storage.ACMEAccount,
@@ -485,7 +506,7 @@ func (s *Service) ValidateChallenge(
 	}
 
 	go func() {
-		time.Sleep(3 * time.Second)
+		time.Sleep(1 * time.Second)
 		bgCtx := context.Background()
 		s.performValidation(bgCtx, account, ch, order)
 	}()
@@ -502,6 +523,9 @@ func (s *Service) performValidation(
 	if prob != nil || len(identifiers) == 0 {
 		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
 		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		if ch.AuthorizationID != nil {
+			_ = s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusInvalid)
+		}
 		return
 	}
 
@@ -509,10 +533,20 @@ func (s *Service) performValidation(
 
 	acctJWKRaw, err := json.Marshal(account.KeyJWK)
 	if err != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		if ch.AuthorizationID != nil {
+			_ = s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusInvalid)
+		}
 		return
 	}
 	keyAuth, err := KeyAuthorization(ch.Token, acctJWKRaw)
 	if err != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		if ch.AuthorizationID != nil {
+			_ = s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusInvalid)
+		}
 		return
 	}
 
@@ -531,11 +565,60 @@ func (s *Service) performValidation(
 	if valErr != nil {
 		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
 		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		if ch.AuthorizationID != nil {
+			_ = s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusInvalid)
+		}
 		return
 	}
 
-	_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusValid, &now)
-	_ = s.maybeReadyOrder(ctx, order.ID)
+	// Challenge valid: update status
+	if err := s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusValid, &now); err != nil {
+		slog.Error("failed to update challenge status", "challenge_id", ch.ID, "err", err)
+		return
+	}
+
+	slog.Info("challenge validated", "challenge_id", ch.ID, "auth_id", ch.AuthorizationID)
+
+	// If the challenge belongs to an authorization, mark it valid immediately.
+	if ch.AuthorizationID != nil {
+		slog.Info("updating authorization status", "auth_id", *ch.AuthorizationID)
+		if err := s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusValid); err != nil {
+			slog.Error("failed to update authorization status", "auth_id", *ch.AuthorizationID, "err", err)
+		} else {
+			slog.Info("authorization status updated to valid", "auth_id", *ch.AuthorizationID)
+		}
+	} else {
+		slog.Warn("challenge has no authorization ID", "challenge_id", ch.ID)
+	}
+
+	// Check if all authorizations for the order are valid
+	auths, err := s.store.ListAuthorizationsByOrder(ctx, order.ID)
+	if err != nil {
+		slog.Error("failed to list authorizations", "order_id", order.ID, "err", err)
+		return
+	}
+	slog.Info("authorizations for order", "order_id", order.ID, "auth_statuses", func() []string {
+		var ss []string
+		for _, a := range auths {
+			ss = append(ss, string(a.Status))
+		}
+		return ss
+	}())
+
+	allAuthsValid := true
+	for _, a := range auths {
+		if a.Status != storage.ACMEAuthorizationStatusValid {
+			allAuthsValid = false
+			break
+		}
+	}
+	if allAuthsValid {
+		if err := s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusReady); err != nil {
+			slog.Error("failed to update order status to ready", "order_id", order.ID, "err", err)
+		} else {
+			slog.Info("order marked ready", "order_id", order.ID)
+		}
+	}
 }
 
 // maybeReadyOrder checks whether every challenge for an order is valid and, if so, transitions the order to the "ready" state.
@@ -662,8 +745,8 @@ func (s *Service) CertificateURL(provisionerID, certID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/certificate/%s", s.baseURL, provisionerID, certID)
 }
 
-func (s *Service) AuthorizationURL(provisionerID, orderID uuid.UUID, idx int) string {
-	return fmt.Sprintf("%s/acme/%s/order/%s/auth/%d", s.baseURL, provisionerID, orderID, idx)
+func (s *Service) AuthorizationURL(provisionerID, authID uuid.UUID) string {
+	return fmt.Sprintf("%s/acme/%s/auth/%s", s.baseURL, provisionerID, authID)
 }
 
 // accountIDFromKID extracts the account UUID from a KID URL of the form:
