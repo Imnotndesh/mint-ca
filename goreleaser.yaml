@@ -31,11 +31,13 @@ archives:
   - id: default
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
-      - README.md
       - LICENSE
+      - docs/Api.md
+      - docs/Setup.md
+      - docs/UserGuide.md
     format_overrides:
       - goos: windows
-        format: zip
+        formats: ['zip']
 
 nfpms:
   - id: packages
