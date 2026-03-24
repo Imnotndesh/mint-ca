@@ -1,6 +1,7 @@
 package api
 
 import (
+	internalacme "mint-ca/internal/acme"
 	"net/http"
 
 	"mint-ca/internal/api/handlers"
@@ -58,7 +59,8 @@ func BuildRouter(
 	})
 
 	if cfg.ACME.Enabled {
-		handlers.NewACMEHandler(store, caEngine, policyEngine, cfg.ACME).RegisterRoutes(r)
+		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), cfg.ACME.BaseURL)
+		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME).RegisterRoutes(r)
 	}
 
 	return r
@@ -83,7 +85,10 @@ func BuildSetupRouter(
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"setup","message":"complete setup at POST /setup/root-ca then POST /setup/api-key"}`))
+		_, err := w.Write([]byte(`{"status":"setup","message":"complete setup at POST /setup/root-ca then POST /setup/api-key"}`))
+		if err != nil {
+			return
+		}
 	})
 
 	setup.NewHandler(store, caEngine, cfg, onReady).RegisterRoutes(r)
@@ -92,7 +97,10 @@ func BuildSetupRouter(
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(`{"error":"server is in setup mode","hint":"POST /setup/root-ca then POST /setup/api-key"}`))
+		_, err := w.Write([]byte(`{"error":"server is in setup mode","hint":"POST /setup/root-ca then POST /setup/api-key"}`))
+		if err != nil {
+			return
+		}
 	})
 
 	return r

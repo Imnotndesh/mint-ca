@@ -114,6 +114,23 @@ type CertificateAuthority struct {
 	NotAfter  time.Time  `json:"not_after"`
 	CreatedAt time.Time  `json:"created_at"`
 }
+type ACMEAuthorizationStatus string
+
+const (
+	ACMEAuthorizationStatusPending ACMEAuthorizationStatus = "pending"
+	ACMEAuthorizationStatusValid   ACMEAuthorizationStatus = "valid"
+	ACMEAuthorizationStatusInvalid ACMEAuthorizationStatus = "invalid"
+)
+
+type ACMEAuthorization struct {
+	ID              uuid.UUID               `json:"id"`
+	OrderID         uuid.UUID               `json:"order_id"`
+	IdentifierType  string                  `json:"identifier_type"`
+	IdentifierValue string                  `json:"identifier_value"`
+	Status          ACMEAuthorizationStatus `json:"status"`
+	ExpiresAt       time.Time               `json:"expires_at"`
+	CreatedAt       time.Time               `json:"created_at"`
+}
 
 // Certificate represents a leaf certificate issued by one of the stored CAs.
 type Certificate struct {
@@ -199,12 +216,13 @@ type ACMEOrder struct {
 
 // ACMEChallenge is one challenge within an ACME order.
 type ACMEChallenge struct {
-	ID          uuid.UUID           `json:"id"`
-	OrderID     uuid.UUID           `json:"order_id"`
-	Type        ACMEChallengeType   `json:"type"`
-	Token       string              `json:"token"`
-	Status      ACMEChallengeStatus `json:"status"`
-	ValidatedAt *time.Time          `json:"validated_at,omitempty"`
+	ID              uuid.UUID           `json:"id"`
+	OrderID         uuid.UUID           `json:"order_id"`
+	Type            ACMEChallengeType   `json:"type"`
+	AuthorizationID *uuid.UUID          `json:"authorization_id,omitempty"`
+	Token           string              `json:"token"`
+	Status          ACMEChallengeStatus `json:"status"`
+	ValidatedAt     *time.Time          `json:"validated_at,omitempty"`
 }
 
 // AuditLog is an append-only record of every mutating action in the system.
@@ -404,6 +422,22 @@ type Store interface {
 	// Used during setup to locate the bootstrap key.
 	GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error)
 
+	// CreateNonce inserts a single-use ACME replay nonce that expires at expiresAt.
+	CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error
+
+	// ConsumeNonce atomically validates and deletes a nonce.
+	// Returns (true, nil) if valid, (false, nil) if unknown/expired, or (false, err) on a database error.
+	ConsumeNonce(ctx context.Context, nonce string) (bool, error)
+	CreateACMEAuthorization(ctx context.Context, auth *ACMEAuthorization) error
+	GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*ACMEAuthorization, error)
+	UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status ACMEAuthorizationStatus) error
+	ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEAuthorization, error)
+	ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*ACMEChallenge, error)
+
+	// (Update CreateACMEChallenge to use the new struct)
+
+	// PruneExpiredNonces removes nonces past their expiry timestamp.
+	PruneExpiredNonces(ctx context.Context) error
 	// Close releases all connections held by the store.
 	Close() error
 }
