@@ -28,12 +28,14 @@ builds:
       - -s -w
 
 archives:
-  - format_overrides:
-    - formats: ["tar.gz"]
-  - name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+  - id: default
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
       - LICENSE
+    format_overrides:
+      - goos: windows
+        format: zip
 
 nfpms:
   - id: packages
