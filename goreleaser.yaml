@@ -60,22 +60,16 @@ nfpms:
 
 dockers:
   - image_templates:
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}"
-      - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:latest"
+      - "ghcr.io/{{ lower .Env.GITHUB_REPOSITORY }}:{{ .Version }}"
+      - "ghcr.io/{{ lower .Env.GITHUB_REPOSITORY }}:latest"
     dockerfile: Dockerfile
+    use: buildx
     build_flag_templates:
+      - "--platform=linux/amd64,linux/arm64"
       - "--label=org.opencontainers.image.created={{.Date}}"
       - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
-    goos: linux
-    goarch: amd64
-    # If you want arm64, uncomment the following block (or use a matrix)
-    # - id: arm64
-    #   image_templates:
-    #     - "ghcr.io/{{ .Env.GITHUB_REPOSITORY }}:{{ .Version }}-arm64"
-    #   goarch: arm64
-    #   skip_push: false
 
 checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
