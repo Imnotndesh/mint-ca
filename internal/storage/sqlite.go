@@ -576,7 +576,7 @@ func scanCert(row *sql.Row) (*Certificate, error) {
 		&c.NotBefore, &c.NotAfter, &c.IssuedAt,
 		&provIDStr, &c.Requester, &metaStr,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
