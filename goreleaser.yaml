@@ -68,7 +68,6 @@ dockers:
       - "--label=org.opencontainers.image.title={{.ProjectName}}"
       - "--label=org.opencontainers.image.revision={{.FullCommit}}"
       - "--label=org.opencontainers.image.version={{.Version}}"
-    use_buildx: true
     goos: linux
     goarch: amd64
     # If you want arm64, uncomment the following block (or use a matrix)
