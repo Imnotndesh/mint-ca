@@ -15,14 +15,10 @@ services:
       - MINT_WRITE_TIMEOUT_SECONDS=60
       - MINT_IDLE_TIMEOUT_SECONDS=120
       - MINT_CRL_REFRESH_INTERVAL_SECONDS=3600
-
-      # During setup set to true to configure your CA and after configuring it will generate the certs inside of /data/ directory
       - MINT_TLS_DISABLED=false
-      # Certs are generated after setting up the CA but you CA supply separate certs by adding the below:
       - MINT_TLS_CERT=/data/server.crt
       - MINT_TLS_KEY=/data/server.key
       - MINT_ACME_ENABLED=true
-      # Uncomment and update these if ACME is enabled:
       - MINT_ACME_BASE_URL=https://mint-ca:8443
       - MINT_ACME_EAB_REQUIRED=true
 
