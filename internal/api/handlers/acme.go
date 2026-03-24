@@ -213,8 +213,6 @@ func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 
 	provID := prov.ID
 	base := h.cfg.BaseURL + "/acme/" + provID.String()
-
-	// Parse provisioner config to read EABRequired.
 	var cfg internalacme.ProvisionerConfig
 	if raw, err := json.Marshal(prov.Config); err == nil {
 		_ = json.Unmarshal(raw, &cfg)
@@ -531,7 +529,7 @@ func (h *ACMEHandler) finalizeOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		CSR string `json:"csr"` // base64url-encoded DER CSR
+		CSR string `json:"csr"`
 	}
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode finalize payload: "+err.Error()))
