@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -12,6 +13,14 @@ import (
 )
 
 // sqliteStore is the SQLite implementation of Store.
+const sqliteNonceSchema = `
+CREATE TABLE IF NOT EXISTS acme_nonces (
+	nonce      TEXT     NOT NULL PRIMARY KEY,
+	expires_at DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_nonces_expires_at ON acme_nonces(expires_at);
+`
+
 type sqliteStore struct {
 	db *sql.DB
 }
@@ -49,8 +58,43 @@ func (s *sqliteStore) Close() error {
 }
 
 func (s *sqliteStore) Migrate(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, sqliteSchema)
-	return err
+	// Create all tables
+	if _, err := s.db.ExecContext(ctx, sqliteSchema); err != nil {
+		return err
+	}
+
+	// Add authorization_id column to acme_challenges if it doesn't exist
+	var exists bool
+	rows, err := s.db.QueryContext(ctx, "PRAGMA table_info(acme_challenges)")
+	if err != nil {
+		return fmt.Errorf("sqlite: query table_info: %w", err)
+	}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("sqlite: scan table_info: %w", err)
+		}
+		if name == "authorization_id" {
+			exists = true
+			break
+		}
+	}
+	rows.Close()
+
+	if !exists {
+		if _, err := s.db.ExecContext(ctx, "ALTER TABLE acme_challenges ADD COLUMN authorization_id TEXT REFERENCES acme_authorizations(id) ON DELETE CASCADE"); err != nil {
+			return fmt.Errorf("sqlite: add authorization_id column: %w", err)
+		}
+	}
+
+	if _, err := s.db.ExecContext(ctx, sqliteNonceSchema); err != nil {
+		return err
+	}
+	return nil
 }
 
 const sqliteSchema = `
@@ -197,6 +241,17 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	last_used  DATETIME,
 	created_at DATETIME NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS acme_authorizations (
+    id               TEXT    NOT NULL PRIMARY KEY,
+    order_id         TEXT    NOT NULL REFERENCES acme_orders(id) ON DELETE CASCADE,
+    identifier_type  TEXT    NOT NULL CHECK(identifier_type IN ('dns')),
+    identifier_value TEXT    NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','valid','invalid')),
+    expires_at       DATETIME NOT NULL,
+    created_at       DATETIME NOT NULL
+);
+
 `
 
 func marshalJSON(v interface{}) (string, error) {
@@ -363,6 +418,31 @@ func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 	return &ca, nil
 }
 
+// ListChallengesByAuthorization returns all challenges belonging to a given authorization.
+func (s *postgresStore) ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*ACMEChallenge, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT id, order_id, authorization_id, type, token, status, validated_at
+        FROM acme_challenges WHERE authorization_id = $1`, authID.String())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListChallengesByAuthorization: %w", err)
+	}
+	defer rows.Close()
+	var out []*ACMEChallenge
+	for rows.Next() {
+		var c ACMEChallenge
+		var idStr, orderIDStr string
+		var authIDStr *string
+		if err := rows.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt); err != nil {
+			return nil, err
+		}
+		c.ID = uuid.MustParse(idStr)
+		c.OrderID = uuid.MustParse(orderIDStr)
+		c.AuthorizationID = pgSQLToUUID(authIDStr)
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
 func scanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 	var out []*CertificateAuthority
 	for rows.Next() {
@@ -496,7 +576,7 @@ func scanCert(row *sql.Row) (*Certificate, error) {
 		&c.NotBefore, &c.NotAfter, &c.IssuedAt,
 		&provIDStr, &c.Requester, &metaStr,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1004,9 +1084,9 @@ func scanACMEOrder(row *sql.Row) (*ACMEOrder, error) {
 
 func (s *sqliteStore) CreateACMEChallenge(ctx context.Context, c *ACMEChallenge) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO acme_challenges (id, order_id, type, token, status)
-		VALUES (?, ?, ?, ?, ?)`,
-		c.ID.String(), c.OrderID.String(),
+        INSERT INTO acme_challenges (id, order_id, authorization_id, type, token, status)
+        VALUES (?, ?, ?, ?, ?, ?)`,
+		c.ID.String(), c.OrderID.String(), uuidToSQL(c.AuthorizationID),
 		string(c.Type), c.Token, string(c.Status),
 	)
 	if err != nil {
@@ -1017,37 +1097,105 @@ func (s *sqliteStore) CreateACMEChallenge(ctx context.Context, c *ACMEChallenge)
 
 func (s *sqliteStore) GetACMEChallenge(ctx context.Context, id uuid.UUID) (*ACMEChallenge, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, order_id, type, token, status, validated_at
-		 FROM acme_challenges WHERE id = ?`, id.String())
+		`SELECT id, order_id, authorization_id, type, token, status, validated_at FROM acme_challenges WHERE id = ?`, id.String())
 	c, err := scanChallenge(row)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: GetACMEChallenge: %w", err)
 	}
 	return c, nil
 }
+func (s *sqliteStore) CreateACMEAuthorization(ctx context.Context, a *ACMEAuthorization) error {
+	_, err := s.db.ExecContext(ctx, `
+        INSERT INTO acme_authorizations
+            (id, order_id, identifier_type, identifier_value, status, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		a.ID.String(), a.OrderID.String(),
+		a.IdentifierType, a.IdentifierValue,
+		string(a.Status), a.ExpiresAt.UTC(), a.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateACMEAuthorization: %w", err)
+	}
+	return nil
+}
 
+func (s *sqliteStore) GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*ACMEAuthorization, error) {
+	row := s.db.QueryRowContext(ctx, `
+        SELECT id, order_id, identifier_type, identifier_value, status, expires_at, created_at
+        FROM acme_authorizations WHERE id = ?`, id.String())
+	var a ACMEAuthorization
+	var idStr, orderIDStr string
+	err := row.Scan(&idStr, &orderIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetACMEAuthorization: %w", err)
+	}
+	a.ID = uuid.MustParse(idStr)
+	a.OrderID = uuid.MustParse(orderIDStr)
+	return &a, nil
+}
+
+func (s *sqliteStore) UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status ACMEAuthorizationStatus) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE acme_authorizations SET status = ? WHERE id = ?`,
+		string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateACMEAuthorizationStatus: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEAuthorization, error) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT id, order_id, identifier_type, identifier_value, status, expires_at, created_at
+        FROM acme_authorizations WHERE order_id = ?`, orderID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListAuthorizationsByOrder: %w", err)
+	}
+	defer rows.Close()
+	var out []*ACMEAuthorization
+	for rows.Next() {
+		var a ACMEAuthorization
+		var idStr, orderIDStr string
+		if err := rows.Scan(&idStr, &orderIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt); err != nil {
+			return nil, err
+		}
+		a.ID = uuid.MustParse(idStr)
+		a.OrderID = uuid.MustParse(orderIDStr)
+		out = append(out, &a)
+	}
+	return out, rows.Err()
+}
 func (s *sqliteStore) ListChallengesByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEChallenge, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, order_id, type, token, status, validated_at
-		 FROM acme_challenges WHERE order_id = ?`, orderID.String())
+		`SELECT id, order_id, authorization_id, type, token, status, validated_at FROM acme_challenges WHERE order_id = ?`, orderID.String())
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: ListChallengesByOrder: %w", err)
 	}
 	defer rows.Close()
 	var out []*ACMEChallenge
 	for rows.Next() {
-		var c ACMEChallenge
-		var idStr, orderIDStr string
-		if err := rows.Scan(
-			&idStr, &orderIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt,
-		); err != nil {
+		c, err := scanChallengeRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		c.ID = uuid.MustParse(idStr)
-		c.OrderID = uuid.MustParse(orderIDStr)
-		out = append(out, &c)
+		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+func scanChallengeRows(rows *sql.Rows) (*ACMEChallenge, error) {
+	var c ACMEChallenge
+	var idStr, orderIDStr string
+	var authIDStr *string
+	if err := rows.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt); err != nil {
+		return nil, err
+	}
+	c.ID = uuid.MustParse(idStr)
+	c.OrderID = uuid.MustParse(orderIDStr)
+	c.AuthorizationID = sqlToUUID(authIDStr)
+	return &c, nil
 }
 
 func (s *sqliteStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID, status ACMEChallengeStatus, validatedAt *time.Time) error {
@@ -1063,8 +1211,9 @@ func (s *sqliteStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID, s
 func scanChallenge(row *sql.Row) (*ACMEChallenge, error) {
 	var c ACMEChallenge
 	var idStr, orderIDStr string
-	err := row.Scan(&idStr, &orderIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt)
-	if err == sql.ErrNoRows {
+	var authIDStr *string
+	err := row.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1072,6 +1221,7 @@ func scanChallenge(row *sql.Row) (*ACMEChallenge, error) {
 	}
 	c.ID = uuid.MustParse(idStr)
 	c.OrderID = uuid.MustParse(orderIDStr)
+	c.AuthorizationID = sqlToUUID(authIDStr)
 	return &c, nil
 }
 func (s *sqliteStore) WriteAuditLog(ctx context.Context, entry *AuditLog) error {
@@ -1246,7 +1396,7 @@ func scanAPIKey(row *sql.Row) (*APIKey, error) {
 		&idStr, &k.Name, &k.KeyHash, &scopesStr,
 		&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 	)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
@@ -1261,7 +1411,7 @@ func (s *sqliteStore) GetSetupState(ctx context.Context) (SetupState, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT state FROM setup_state WHERE id = 1`)
 	var state string
 	err := row.Scan(&state)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return StateUninitialized, nil
 	}
 	if err != nil {
@@ -1290,4 +1440,59 @@ func (s *sqliteStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey
 		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
 		FROM api_keys WHERE name = ?`, name)
 	return scanAPIKey(row)
+}
+func (s *sqliteStore) MigrateNonces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx, sqliteNonceSchema)
+	return err
+}
+func (s *sqliteStore) CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO acme_nonces (nonce, expires_at) VALUES (?, ?)`,
+		nonce, expiresAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateNonce: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ConsumeNonce(ctx context.Context, nonce string) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var expiresAt time.Time
+	row := tx.QueryRowContext(ctx,
+		`SELECT expires_at FROM acme_nonces WHERE nonce = ?`, nonce)
+	if err := row.Scan(&expiresAt); errors.Is(err, sql.ErrNoRows) {
+		return false, nil // unknown nonce
+	} else if err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: lookup: %w", err)
+	}
+
+	if time.Now().UTC().After(expiresAt.UTC()) {
+		// Expired — delete it and report invalid.
+		_, _ = tx.ExecContext(ctx, `DELETE FROM acme_nonces WHERE nonce = ?`, nonce)
+		_ = tx.Commit()
+		return false, nil
+	}
+
+	// Valid — delete it (single-use).
+	if _, err := tx.ExecContext(ctx, `DELETE FROM acme_nonces WHERE nonce = ?`, nonce); err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: delete: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("sqlite: ConsumeNonce: commit: %w", err)
+	}
+	return true, nil
+}
+func (s *sqliteStore) PruneExpiredNonces(ctx context.Context) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM acme_nonces WHERE expires_at < ?`, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: PruneExpiredNonces: %w", err)
+	}
+	return nil
 }
