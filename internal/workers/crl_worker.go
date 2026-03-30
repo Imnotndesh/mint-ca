@@ -35,7 +35,7 @@ func (w *CRLWorker) Run(ctx context.Context) error {
 			return nil
 		case <-ticker.C:
 			refreshCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			if err := w.mgr.RefreshAll(refreshCtx); err != nil {
+			if err := w.mgr.RefreshAll(refreshCtx, w.validity); err != nil {
 				slog.Warn("CRL refresh error", "err", err)
 			} else {
 				slog.Debug("CRL refresh complete")

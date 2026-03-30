@@ -2,7 +2,7 @@ services:
   mint-ca:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.local
     container_name: mint-ca
     network_mode: host
     restart: unless-stopped
