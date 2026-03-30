@@ -520,12 +520,10 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		CRLDistributionPoints: []string{
 			fmt.Sprintf("%s/v1/pki/ca/%s/crl", e.baseUrl, req.CAID),
 		},
-
 		// AIA (Authority Information Access) - OCSP tells the client where to send real-time OCSP status requests.
 		OCSPServer: []string{
 			fmt.Sprintf("%s/v1/pki/ocsp", e.baseUrl),
 		},
-
 		// AIA (Authority Information Access) - Issuing CA tells the client where to download the public certificate of the CA that signed this.
 		IssuingCertificateURL: []string{
 			fmt.Sprintf("%s/v1/pki/ca/%s/crt", e.baseUrl, req.CAID),
@@ -543,13 +541,10 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 	if err != nil {
 		return nil, fmt.Errorf("ca: IssueCert: build chain: %w", err)
 	}
-
-	// Convert net.IP slice to strings for storage.
 	ipStrings := make([]string, len(req.SANsIP))
 	for i, ip := range req.SANsIP {
 		ipStrings[i] = ip.String()
 	}
-
 	record := &storage.Certificate{
 		ID:            uuid.New(),
 		CAID:          req.CAID,

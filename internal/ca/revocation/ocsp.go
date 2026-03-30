@@ -3,7 +3,15 @@ package revocation
 import (
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
 	"fmt"
+	"math/big"
+	"sync"
 	"time"
 
 	mintcrypto "mint-ca/internal/crypto"
@@ -14,21 +22,18 @@ import (
 )
 
 // OCSPResponder handles OCSP requests for certificates issued by mint-ca CAs.
-//
-// OCSP (RFC 6960) works like this:
-//  1. A TLS client receives a certificate and wants to check its revocation status.
-//  2. The client sends a DER-encoded OCSPRequest to the CA's OCSP endpoint
-//     (the URL is baked into the certificate's Authority Information Access extension).
-//  3. The OCSP responder parses the request, looks up the serial number, and
-//     returns a signed OCSPResponse: Good, Revoked, or Unknown.
-//  4. The client verifies the response signature against the issuing CA's cert.
-//
-// Traefik uses OCSP stapling — it fetches the OCSP response itself and bundles
-// it into the TLS handshake so the client never has to make a separate request.
-// Our responder must therefore be reachable by Traefik, not just end-user clients.
+type delegatedCache struct {
+	cert    *x509.Certificate
+	key     crypto.Signer
+	expires time.Time
+}
+
 type OCSPResponder struct {
 	store    storage.Store
 	keystore *mintcrypto.Keystore
+	mu       sync.RWMutex
+	// delegates caches the delegate created at generateDelegatedSigner() in memory
+	delegates map[string]*delegatedCache
 }
 
 // NewOCSPResponder constructs an OCSPResponder.
@@ -36,18 +41,7 @@ func NewOCSPResponder(store storage.Store, keystore *mintcrypto.Keystore) *OCSPR
 	return &OCSPResponder{store: store, keystore: keystore}
 }
 
-// Respond parses a raw DER-encoded OCSP request body and returns a signed
-// DER-encoded OCSP response. This is what the HTTP handler calls directly —
-// it reads r.Body, passes the bytes here, and writes the returned bytes to
-// the response with Content-Type: application/ocsp-response.
-//
-// caID identifies which CA's key should sign the response. In practice the
-// OCSP URL embeds the CA ID so the handler can extract it from the path.
-//
-// This method never returns a Go error to the caller — if anything goes wrong
-// internally it returns a valid but error-typed OCSP response (InternalError),
-// because the HTTP layer must always write a proper OCSP response body, not an
-// HTTP error. OCSP clients do not understand HTTP error status codes.
+// Respond parses a raw DER-encoded OCSP request body and returns a signed DER-encoded OCSP response.
 func (r *OCSPResponder) Respond(ctx context.Context, caID uuid.UUID, requestDER []byte) []byte {
 	resp, err := r.respond(ctx, caID, requestDER)
 	if err != nil {
@@ -59,17 +53,12 @@ func (r *OCSPResponder) Respond(ctx context.Context, caID uuid.UUID, requestDER 
 	return resp
 }
 
-// respond is the internal implementation that can return a Go error.
-// Respond() wraps it and converts errors to OCSP error responses.
+// respond is the internal implementation that can return a Go error.Respond() wraps it and converts errors to OCSP error responses.
 func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER []byte) ([]byte, error) {
-	// Parse the OCSP request.
 	req, err := ocsp.ParseRequest(requestDER)
 	if err != nil {
 		return nil, fmt.Errorf("ocsp: parse request: %w", err)
 	}
-
-	// Load the CA. We need its certificate to sign the response and to
-	// verify that the request is actually asking about one of our certs.
 	caRecord, err := r.store.GetCA(ctx, caID)
 	if err != nil {
 		return nil, fmt.Errorf("ocsp: load CA: %w", err)
@@ -88,8 +77,6 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 		return nil, fmt.Errorf("ocsp: load CA key: %w", err)
 	}
 
-	// Look up the certificate by serial number.
-	// req.SerialNumber is a *big.Int; we store serials as decimal strings.
 	serial := req.SerialNumber.String()
 	cert, err := r.store.GetCertificateBySerial(ctx, serial)
 	if err != nil {
@@ -97,21 +84,12 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 	}
 
 	now := time.Now().UTC()
-
-	// OCSP responses should be short-lived so clients do not cache stale
-	// status for too long. One hour is a common production value.
-	// For revoked certificates, we use a longer window — there is no reason
-	// to re-check a revoked cert frequently.
-	thisUpdate := now
+	thisUpdate := now.Add(-5 * time.Minute)
 	nextUpdate := now.Add(1 * time.Hour)
 
 	var template ocsp.Response
-
 	switch {
 	case cert == nil:
-		// Serial not found in our database — respond Unknown.
-		// RFC 6960 says: "The OCSP responder SHALL respond 'unknown' for
-		// certificates that have not been issued."
 		template = ocsp.Response{
 			Status:     ocsp.Unknown,
 			ThisUpdate: thisUpdate,
@@ -119,7 +97,6 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 		}
 
 	case cert.Status == storage.CertStatusRevoked:
-		// Certificate is revoked — include the revocation time and reason.
 		revokedAt := now
 		if cert.RevokedAt != nil {
 			revokedAt = cert.RevokedAt.UTC()
@@ -128,9 +105,6 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 		if cert.RevokeReason != nil {
 			reason = *cert.RevokeReason
 		}
-
-		// Revoked certs can have a longer NextUpdate — the status will not
-		// change back to good.
 		nextUpdate = now.Add(24 * time.Hour)
 
 		template = ocsp.Response{
@@ -143,7 +117,6 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 		}
 
 	default:
-		// Certificate is active and known — respond Good.
 		template = ocsp.Response{
 			Status:       ocsp.Good,
 			SerialNumber: req.SerialNumber,
@@ -151,13 +124,28 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 			NextUpdate:   nextUpdate,
 		}
 	}
+	r.mu.Lock()
+	if r.delegates == nil {
+		r.delegates = make(map[string]*delegatedCache)
+	}
 
-	// Sign the response. We sign with the CA certificate itself acting as
-	// both the issuer and the responder — this is the "direct" response model
-	// in RFC 6960. An alternative is a delegated responder (a separate cert
-	// with the OCSPSigning EKU), but for mint-ca the direct model is simpler
-	// and avoids managing an additional keypair.
-	responseDER, err := ocsp.CreateResponse(caCert, caCert, template, caKey)
+	delegate, exists := r.delegates[caRecord.ID.String()]
+	if !exists || time.Now().Add(24*time.Hour).After(delegate.expires) {
+		dCert, dKey, err := r.generateDelegatedSigner(caCert, caKey)
+		if err != nil {
+			r.mu.Unlock()
+			return nil, fmt.Errorf("ocsp: generate delegated signer: %w", err)
+		}
+		delegate = &delegatedCache{
+			cert:    dCert,
+			key:     dKey,
+			expires: dCert.NotAfter,
+		}
+		r.delegates[caRecord.ID.String()] = delegate
+	}
+	r.mu.Unlock()
+	template.Certificate = delegate.cert
+	responseDER, err := ocsp.CreateResponse(caCert, delegate.cert, template, delegate.key)
 	if err != nil {
 		return nil, fmt.Errorf("ocsp: create response: %w", err)
 	}
@@ -171,4 +159,39 @@ func (r *OCSPResponder) loadKey(ca *storage.CertificateAuthority) (crypto.Signer
 		return nil, fmt.Errorf("decrypt key for CA %q: %w", ca.Name, err)
 	}
 	return parseKeyPEM(keyPEM)
+}
+
+// generateDelegatedSigner creates a short-lived certificate explicitly for OCSP
+func (r *OCSPResponder) generateDelegatedSigner(caCert *x509.Certificate, caKey crypto.Signer) (*x509.Certificate, crypto.Signer, error) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, err
+	}
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(time.Now().UnixNano()),
+		Subject: pkix.Name{
+			CommonName: caCert.Subject.CommonName + " OCSP Responder",
+		},
+		NotBefore: time.Now().Add(-5 * time.Minute),
+		NotAfter:  time.Now().Add(7 * 24 * time.Hour),
+
+		KeyUsage:    x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning},
+		ExtraExtensions: []pkix.Extension{
+			{
+				Id:       asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 5},
+				Critical: false,
+				Value:    []byte{0x05, 0x00},
+			},
+		},
+	}
+
+	// 3. Sign the throwaway cert with the master CA key
+	derBytes, err := x509.CreateCertificate(rand.Reader, template, caCert, &priv.PublicKey, caKey)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	delegatedCert, err := x509.ParseCertificate(derBytes)
+	return delegatedCert, priv, err
 }
