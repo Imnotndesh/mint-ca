@@ -120,9 +120,6 @@ func (m *CRLManager) GenerateCRL(ctx context.Context, caID uuid.UUID, validFor t
 	for _, cert := range revoked {
 		serial := new(big.Int)
 		if _, ok := serial.SetString(cert.Serial, 10); !ok {
-			// If the serial cannot be parsed, skip this entry rather than
-			// aborting the entire CRL — a corrupt serial should not block
-			// all other revocations from being published.
 			continue
 		}
 
@@ -237,7 +234,7 @@ func (m *CRLManager) GetCRLDER(ctx context.Context, caID uuid.UUID) ([]byte, err
 // RefreshAll regenerates CRLs for every active CA in the store.
 // This is called by the background ticker in cmd/server so that NextUpdate
 // fields stay current even when no revocations occur.
-func (m *CRLManager) RefreshAll(ctx context.Context) error {
+func (m *CRLManager) RefreshAll(ctx context.Context, validity time.Duration) error {
 	cas, err := m.store.ListCAs(ctx)
 	if err != nil {
 		return fmt.Errorf("crl: RefreshAll: list CAs: %w", err)
@@ -248,8 +245,7 @@ func (m *CRLManager) RefreshAll(ctx context.Context) error {
 		if ca.Status != storage.CAStatusActive {
 			continue
 		}
-		if err := m.GenerateCRL(ctx, ca.ID, defaultCRLValidity); err != nil {
-			// Record the error but continue refreshing other CAs.
+		if err := m.GenerateCRL(ctx, ca.ID, validity); err != nil {
 			lastErr = fmt.Errorf("crl: RefreshAll: CA %q: %w", ca.Name, err)
 		}
 	}

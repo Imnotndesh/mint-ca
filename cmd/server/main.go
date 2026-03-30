@@ -28,7 +28,10 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		os.Stderr.WriteString(err.Error() + "\n")
+		_, err = os.Stderr.WriteString(err.Error() + "\n")
+		if err != nil {
+			return
+		}
 		os.Exit(1)
 	}
 
