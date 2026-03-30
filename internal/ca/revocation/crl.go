@@ -152,10 +152,6 @@ func (m *CRLManager) GenerateCRL(ctx context.Context, caID uuid.UUID, validFor t
 
 	now := time.Now().UTC()
 	nextUpdate := now.Add(validFor)
-
-	// The CRL number is a monotonically increasing integer required by RFC 5280.
-	// Using the current Unix timestamp is a pragmatic choice that guarantees
-	// monotonic increase without needing to track a counter in the database.
 	crlNumber := big.NewInt(now.Unix())
 
 	template := &x509.RevocationList{
@@ -163,6 +159,7 @@ func (m *CRLManager) GenerateCRL(ctx context.Context, caID uuid.UUID, validFor t
 		Number:              crlNumber,
 		ThisUpdate:          now,
 		NextUpdate:          nextUpdate,
+		AuthorityKeyId:      caCert.SubjectKeyId,
 	}
 
 	crlDER, err := x509.CreateRevocationList(rand.Reader, template, caCert, caKey)
