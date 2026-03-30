@@ -49,12 +49,10 @@ func (a KeyAlgo) Valid() bool {
 type CreateRootCARequest struct {
 	// Name is the unique human-readable identifier stored in the database.
 	// It is not the X.509 Common Name — it is mint-ca's internal label.
-	Name string
-
-	// Subject fields become the CA certificate's Subject and Issuer (self-signed).
+	Name         string
 	CommonName   string
 	Organization string
-	Country      string // two-letter ISO code, e.g. "US"
+	Country      string
 	State        string
 	Locality     string
 
@@ -153,12 +151,10 @@ type IssueCertRequest struct {
 	// CAID is the issuing CA.
 	CAID uuid.UUID
 
-	// ProvisionerID is the provisioner authorising this issuance. It must exist
-	// and be active. It is recorded on the certificate for audit purposes.
+	// ProvisionerID is the provisioner authorising this issuance. It must exist and be active. It is recorded on the certificate for audit purposes.
 	ProvisionerID uuid.UUID
 
-	// Requester is a free-form string identifying who asked — e.g. an API key
-	// name, an ACME account key thumbprint, etc.
+	// Requester is a free-form string identifying who asked — e.g. an API key ,name, an ACME account key thumbprint, etc.
 	Requester string
 
 	// Subject
@@ -170,12 +166,10 @@ type IssueCertRequest struct {
 	SANsEmail []string
 
 	// KeyUsage and ExtKeyUsage control the certificate's intended purpose.
-	// If both are zero-value the engine sets sensible TLS server+client defaults.
 	KeyUsage    x509.KeyUsage
 	ExtKeyUsage []x509.ExtKeyUsage
 
 	// TTLSeconds is the certificate lifetime. Must be positive.
-	// The engine clamps it to the issuing CA's remaining lifetime.
 	TTLSeconds int64
 
 	// KeyAlgo is the algorithm for the generated leaf keypair.
@@ -190,9 +184,8 @@ func (r *IssueCertRequest) setDefaults() {
 		r.KeyAlgo = DefaultKeyAlgo
 	}
 	if r.TTLSeconds <= 0 {
-		r.TTLSeconds = 86400 // 24 hours
+		r.TTLSeconds = 86400
 	}
-	// If caller did not specify key usage, default to TLS server + client.
 	if r.KeyUsage == 0 && len(r.ExtKeyUsage) == 0 {
 		r.KeyUsage = x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment
 		r.ExtKeyUsage = []x509.ExtKeyUsage{
@@ -261,26 +254,21 @@ type IssuedCertificate struct {
 	// CertPEM is the PEM-encoded certificate (leaf only).
 	CertPEM []byte
 	// KeyPEM is the PEM-encoded private key. This is only populated when
-	// mint-ca generated the keypair (IssueCert). For SignCSR it is nil
-	// because the caller already holds the private key.
 	KeyPEM []byte
 	// ChainPEM is the full certificate chain: leaf + all intermediates + root.
-	// This is what TLS servers should present.
 	ChainPEM []byte
 }
 
 // Engine is the core CA signing engine. It is the only component in mint-ca that performs cryptographic operations on CA private keys.
-
-// Private keys are decrypted from the store on demand for each operation and
-// are not held in memory beyond the scope of a single function call.
 type Engine struct {
 	store    storage.Store
 	keystore *mintcrypto.Keystore
+	baseUrl  string
 }
 
 // NewEngine constructs an Engine. Both arguments are required.
-func NewEngine(store storage.Store, keystore *mintcrypto.Keystore) *Engine {
-	return &Engine{store: store, keystore: keystore}
+func NewEngine(store storage.Store, keystore *mintcrypto.Keystore, baseUrl string) *Engine {
+	return &Engine{store: store, keystore: keystore, baseUrl: baseUrl}
 }
 
 // CreateRootCA generates a self-signed root CA and persists it to the store.
@@ -443,9 +431,16 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 		BasicConstraintsValid: true,
 		MaxPathLen:            maxPathLen,
 		MaxPathLenZero:        maxPathLenZero,
+		CRLDistributionPoints: []string{
+			fmt.Sprintf("%s/v1/pki/ca/%s/crl", e.baseUrl, req.ParentCAID),
+		},
+		OCSPServer: []string{
+			fmt.Sprintf("%s/v1/pki/ocsp", e.baseUrl),
+		},
+		IssuingCertificateURL: []string{
+			fmt.Sprintf("%s/v1/pki/ca/%s/crt", e.baseUrl, req.ParentCAID),
+		},
 	}
-
-	// Signed by the parent CA — template is the new cert, parent is the issuer.
 	certDER, err := x509.CreateCertificate(rand.Reader, template, parentCert, pubkey(privKey), parentKey)
 	if err != nil {
 		return nil, fmt.Errorf("ca: CreateIntermediateCA: sign certificate: %w", err)
@@ -481,8 +476,6 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 }
 
 // IssueCert generates a keypair, signs a leaf certificate with the specified CA,
-// stores the certificate record, and returns the cert PEM, key PEM, and full chain.
-// The private key is returned once and never stored
 func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCertificate, error) {
 	req.setDefaults()
 	if err := req.validate(); err != nil {
@@ -524,6 +517,17 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		EmailAddresses:        req.SANsEmail,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
+		CRLDistributionPoints: []string{
+			fmt.Sprintf("%s/v1/pki/ca/%s/crl", e.baseUrl, req.CAID),
+		},
+		// AIA (Authority Information Access) - OCSP tells the client where to send real-time OCSP status requests.
+		OCSPServer: []string{
+			fmt.Sprintf("%s/v1/pki/ocsp", e.baseUrl),
+		},
+		// AIA (Authority Information Access) - Issuing CA tells the client where to download the public certificate of the CA that signed this.
+		IssuingCertificateURL: []string{
+			fmt.Sprintf("%s/v1/pki/ca/%s/crt", e.baseUrl, req.CAID),
+		},
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, pubkey(leafKey), issuerKey)
@@ -537,13 +541,10 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 	if err != nil {
 		return nil, fmt.Errorf("ca: IssueCert: build chain: %w", err)
 	}
-
-	// Convert net.IP slice to strings for storage.
 	ipStrings := make([]string, len(req.SANsIP))
 	for i, ip := range req.SANsIP {
 		ipStrings[i] = ip.String()
 	}
-
 	record := &storage.Certificate{
 		ID:            uuid.New(),
 		CAID:          req.CAID,

@@ -28,7 +28,10 @@ import (
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		os.Stderr.WriteString(err.Error() + "\n")
+		_, err = os.Stderr.WriteString(err.Error() + "\n")
+		if err != nil {
+			return
+		}
 		os.Exit(1)
 	}
 
@@ -51,7 +54,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	caEngine := ca.NewEngine(store, ks)
+	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
 	crlManager := revocation.NewCRLManager(store, ks)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
 	policyEngine := policy.NewEngine(store)
