@@ -21,6 +21,7 @@ import (
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
+	"mint-ca/internal/sshca"
 	"mint-ca/internal/storage"
 	"mint-ca/internal/workers"
 )
@@ -55,6 +56,7 @@ func main() {
 	}
 
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
+	sshcaEngine := sshca.NewEngine(store, ks)
 	crlManager := revocation.NewCRLManager(store, ks)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
 	policyEngine := policy.NewEngine(store)
@@ -145,7 +147,7 @@ func main() {
 
 	case storage.StateReady:
 		slog.Info("setup complete — starting full API")
-		router = api.BuildRouter(cfg, store, caEngine, crlManager, ocspResponder, policyEngine)
+		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine)
 	}
 
 	srv := &http.Server{
