@@ -22,6 +22,8 @@ type fakeStore struct {
 	orders         map[uuid.UUID]*storage.ACMEOrder
 	authorizations map[uuid.UUID]*storage.ACMEAuthorization
 	challenges     map[uuid.UUID]*storage.ACMEChallenge
+	certsBySerial  map[string]*storage.Certificate
+	crls           map[uuid.UUID]*storage.CRLCache
 	nonces         map[string]time.Time
 }
 
@@ -33,6 +35,8 @@ func newFakeStore() *fakeStore {
 		orders:         make(map[uuid.UUID]*storage.ACMEOrder),
 		authorizations: make(map[uuid.UUID]*storage.ACMEAuthorization),
 		challenges:     make(map[uuid.UUID]*storage.ACMEChallenge),
+		certsBySerial:  make(map[string]*storage.Certificate),
+		crls:           make(map[uuid.UUID]*storage.CRLCache),
 		nonces:         make(map[string]time.Time),
 	}
 }
@@ -80,28 +84,55 @@ func (f *fakeStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status sto
 // ---- Certificates ----
 
 func (f *fakeStore) CreateCertificate(ctx context.Context, cert *storage.Certificate) error {
-	notImplemented("CreateCertificate")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.certsBySerial[cert.Serial] = cert
 	return nil
 }
 func (f *fakeStore) GetCertificate(ctx context.Context, id uuid.UUID) (*storage.Certificate, error) {
-	notImplemented("GetCertificate")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.certsBySerial {
+		if c.ID == id {
+			return c, nil
+		}
+	}
 	return nil, nil
 }
 func (f *fakeStore) GetCertificateBySerial(ctx context.Context, serial string) (*storage.Certificate, error) {
-	notImplemented("GetCertificateBySerial")
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.certsBySerial[serial], nil
 }
 func (f *fakeStore) ListCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.Certificate, error) {
 	notImplemented("ListCertificatesByCA")
 	return nil, nil
 }
 func (f *fakeStore) ListRevokedByCA(ctx context.Context, caID uuid.UUID) ([]*storage.Certificate, error) {
-	notImplemented("ListRevokedByCA")
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.Certificate
+	for _, c := range f.certsBySerial {
+		if c.CAID == caID && c.Status == storage.CertStatusRevoked {
+			out = append(out, c)
+		}
+	}
+	return out, nil
 }
 func (f *fakeStore) RevokeCertificate(ctx context.Context, id uuid.UUID, reason int) error {
-	notImplemented("RevokeCertificate")
-	return nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.certsBySerial {
+		if c.ID == id {
+			if c.Status == storage.CertStatusRevoked {
+				return fmt.Errorf("already revoked")
+			}
+			c.Status = storage.CertStatusRevoked
+			c.RevokeReason = &reason
+			return nil
+		}
+	}
+	return fmt.Errorf("certificate not found")
 }
 
 // ---- Provisioners ----
@@ -323,12 +354,18 @@ func (f *fakeStore) ListAuditLogsByCA(ctx context.Context, caID uuid.UUID, limit
 // ---- CRL ----
 
 func (f *fakeStore) UpsertCRL(ctx context.Context, crl *storage.CRLCache) error {
-	notImplemented("UpsertCRL")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.crls == nil {
+		f.crls = make(map[uuid.UUID]*storage.CRLCache)
+	}
+	f.crls[crl.CAID] = crl
 	return nil
 }
 func (f *fakeStore) GetCRL(ctx context.Context, caID uuid.UUID) (*storage.CRLCache, error) {
-	notImplemented("GetCRL")
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.crls[caID], nil
 }
 
 // ---- API keys ----

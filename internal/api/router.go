@@ -62,7 +62,7 @@ func BuildRouter(
 	})
 
 	if cfg.ACME.Enabled {
-		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), cfg.ACME.BaseURL)
+		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, cfg.ACME.BaseURL)
 		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME).RegisterRoutes(r)
 	}
 

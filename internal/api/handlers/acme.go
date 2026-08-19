@@ -55,6 +55,7 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/certificate/{certID}", h.getCertificate)
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/account/{accountID}/orders", h.listOrders)
+		r.Post("/revoke-cert", h.revokeCert)
 	})
 }
 
@@ -216,6 +217,75 @@ func (h *ACMEHandler) listOrders(w http.ResponseWriter, r *http.Request) {
 	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
 		"orders": urls,
 	})
+}
+func (h *ACMEHandler) revokeCert(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	// RFC 8555 §7.6: revocation may be authenticated by the account key
+	// (kid present) or by the certificate's own key (jwk present).
+	var authAccount *storage.ACMEAccount
+	var authJWK json.RawMessage
+
+	if hdr.KID != "" {
+		account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+		if prob != nil {
+			h.acmeProblem(w, r, prob)
+			return
+		}
+		authAccount = account
+	} else {
+		jwk, _, prob := h.service.AuthenticateJWK(jws, hdr)
+		if prob != nil {
+			h.acmeProblem(w, r, prob)
+			return
+		}
+		authJWK = jwk
+	}
+
+	payloadBytes, err := jws.PayloadBytes()
+	if err != nil || payloadBytes == nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("revoke-cert requires a payload"))
+		return
+	}
+	var payload struct {
+		Certificate string `json:"certificate"`
+		Reason      *int   `json:"reason,omitempty"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode revoke-cert payload: "+err.Error()))
+		return
+	}
+	certDER, err := base64.RawURLEncoding.DecodeString(payload.Certificate)
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode certificate: "+err.Error()))
+		return
+	}
+
+	if prob := h.service.RevokeCert(ctx, certDER, authAccount, authJWK, payload.Reason); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{})
 }
 
 // parseJWS reads and decodes the JWS body common to all ACME POST requests.
