@@ -384,11 +384,10 @@ func (s *Service) NewOrder(
 	_ = json.Unmarshal(mustMarshalJSON(provisioner.Config), &cfg)
 	cfg.SetDefaults()
 
-	// Validate identifiers — we only support DNS.
+	// Validate identifiers — we only support DNS, plus wildcard shape checks.
 	for _, id := range identifiers {
-		if id.Type != "dns" {
-			return nil, nil, NewProblem(ErrUnsupportedIdentifier, 400,
-				fmt.Sprintf("identifier type %q is not supported — only \"dns\" is accepted", id.Type))
+		if err := validateIdentifier(id); err != nil {
+			return nil, nil, NewProblem(ErrRejectedIdentifier, 400, err.Error())
 		}
 	}
 
@@ -437,8 +436,11 @@ func (s *Service) NewOrder(
 			return nil, nil, ErrServerInternalProblem("create authorization: " + err.Error())
 		}
 
-		// Create challenges for each allowed type.
+		// Create challenges for each allowed type — wildcards get dns-01 only.
 		for _, challType := range cfg.AllowedChallengeTypes {
+			if IsWildcardIdentifier(id.Value) && challType != string(storage.ACMEChallengeTypeDNS01) {
+				continue
+			}
 			token, err := generateToken()
 			if err != nil {
 				return nil, nil, ErrServerInternalProblem("generate challenge token: " + err.Error())
@@ -620,6 +622,13 @@ func (s *Service) performValidation(
 		}
 	}
 }
+func (s *Service) ListOrders(ctx context.Context, accountID uuid.UUID) ([]*storage.ACMEOrder, *Problem) {
+	orders, err := s.store.ListACMEOrdersByAccount(ctx, accountID)
+	if err != nil {
+		return nil, ErrServerInternalProblem("list orders: " + err.Error())
+	}
+	return orders, nil
+}
 
 // maybeReadyOrder checks whether every challenge for an order is valid and, if so, transitions the order to the "ready" state.
 func (s *Service) maybeReadyOrder(ctx context.Context, orderID uuid.UUID) error {
@@ -758,6 +767,30 @@ func (s *Service) accountIDFromKID(kid string) (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("empty kid")
 	}
 	return uuid.Parse(parts[len(parts)-1])
+}
+func IsWildcardIdentifier(value string) bool {
+	return strings.HasPrefix(value, "*.")
+}
+
+func validateIdentifier(id Identifier) error {
+	if id.Type != "dns" {
+		return fmt.Errorf("identifier type %q is not supported", id.Type)
+	}
+	v := id.Value
+	if v == "" {
+		return fmt.Errorf("identifier value is empty")
+	}
+	if IsWildcardIdentifier(v) {
+		rest := v[2:]
+		if rest == "" || strings.HasPrefix(rest, "*.") || strings.Contains(rest, "*") {
+			return fmt.Errorf("malformed wildcard identifier %q", v)
+		}
+		return nil
+	}
+	if strings.Contains(v, "*") {
+		return fmt.Errorf("malformed identifier %q: bare wildcards not permitted", v)
+	}
+	return nil
 }
 
 // parseOrderIdentifiers extracts the []Identifier slice from an order's JSON.

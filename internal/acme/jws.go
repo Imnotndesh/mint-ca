@@ -31,8 +31,7 @@ type ProtectedHeader struct {
 	KID       string          `json:"kid,omitempty"` // present on all other requests
 }
 
-// ParseJWS decodes the base64url fields of a RawJWS without verifying the
-// signature. Call VerifyJWS afterward to verify.
+// ParseJWS decodes the base64url fields of a RawJWS without verifying the signature. Call VerifyJWS afterward to verify.
 func (r *RawJWS) ParseProtected() (*ProtectedHeader, error) {
 	protBytes, err := b64Decode(r.Protected)
 	if err != nil {
