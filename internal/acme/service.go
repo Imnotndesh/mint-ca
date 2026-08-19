@@ -2,14 +2,17 @@ package acme
 
 import (
 	"context"
+	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
+	"mint-ca/internal/ca/revocation"
 	"strings"
 	"time"
 
@@ -99,9 +102,14 @@ type Service struct {
 	store   Store
 	engine  *ca.Engine
 	nonces  *NonceManager
+	crlMgr  *revocation.CRLManager
 	http01  *challenge.HTTP01Validator
 	dns01   *challenge.DNS01Validator
 	baseURL string
+}
+
+var allowedACMERevocationReasons = map[int]bool{
+	0: true, 1: true, 3: true, 4: true, 5: true, 6: true, 9: true, 10: true,
 }
 
 // NewService constructs a Service.
@@ -113,12 +121,14 @@ func NewService(
 	store Store,
 	engine *ca.Engine,
 	nonces *NonceManager,
+	crlMgr *revocation.CRLManager,
 	baseURL string,
 ) *Service {
 	return &Service{
 		store:   store,
 		engine:  engine,
 		nonces:  nonces,
+		crlMgr:  crlMgr,
 		http01:  challenge.NewHTTP01Validator(),
 		dns01:   challenge.NewDNS01Validator(nil),
 		baseURL: strings.TrimRight(baseURL, "/"),
@@ -128,6 +138,94 @@ func NewService(
 // IssueNonce generates and persists a fresh nonce.
 func (s *Service) IssueNonce(ctx context.Context) (string, error) {
 	return s.nonces.Issue(ctx)
+}
+
+// RevokeCert handles RFC 8555 §7.6 certificate revocation. Exactly one of
+// authAccount or authJWK must be non-nil, matching whichever auth mode the
+// handler resolved from the JWS protected header.
+func (s *Service) RevokeCert(
+	ctx context.Context,
+	certDER []byte,
+	authAccount *storage.ACMEAccount,
+	authJWK json.RawMessage,
+	reason *int,
+) *Problem {
+	if reason != nil && !allowedACMERevocationReasons[*reason] {
+		return NewProblem(ErrBadRevocationReason, 400,
+			fmt.Sprintf("reason code %d is not permitted", *reason))
+	}
+
+	leaf, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return ErrMalformedProblem("parse certificate: " + err.Error())
+	}
+
+	record, err := s.store.GetCertificateBySerial(ctx, leaf.SerialNumber.String())
+	if err != nil {
+		return ErrServerInternalProblem("load certificate: " + err.Error())
+	}
+	if record == nil {
+		return NewProblem(ErrMalformed, 404, "certificate not found")
+	}
+
+	// Confirm the supplied DER actually matches the stored cert, not just
+	// a serial collision.
+	storedCert, err := parseCertPEMBytes([]byte(record.CertPEM))
+	if err != nil {
+		return ErrServerInternalProblem("parse stored certificate: " + err.Error())
+	}
+	if !storedCert.Equal(leaf) {
+		return ErrMalformedProblem("supplied certificate does not match a certificate issued by this CA")
+	}
+
+	if record.Status == storage.CertStatusRevoked {
+		return NewProblem(ErrAlreadyRevoked, 400, "certificate is already revoked")
+	}
+
+	switch {
+	case authAccount != nil:
+		want := fmt.Sprintf("acme-account:%s", authAccount.ID)
+		if record.Requester != want {
+			return ErrUnauthorizedProblem("account did not request this certificate")
+		}
+	case authJWK != nil:
+		pub, err := ParseJWK(authJWK)
+		if err != nil {
+			return NewProblem(ErrBadPublicKey, 400, err.Error())
+		}
+		if !publicKeysEqual(pub, leaf.PublicKey) {
+			return ErrUnauthorizedProblem("JWK does not match certificate public key")
+		}
+	default:
+		return ErrServerInternalProblem("revoke: no authentication context supplied")
+	}
+
+	reasonCode := 0
+	if reason != nil {
+		reasonCode = *reason
+	}
+	if err := s.crlMgr.RevokeAndRefresh(ctx, record.ID, reasonCode); err != nil {
+		return ErrServerInternalProblem("revoke: " + err.Error())
+	}
+	return nil
+}
+
+func parseCertPEMBytes(pemBytes []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// publicKeysEqual compares two public keys for the algorithm types ParseJWK
+// and x509 certificates can produce (ECDSA, RSA).
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	type equaler interface{ Equal(x crypto.PublicKey) bool }
+	if ea, ok := a.(equaler); ok {
+		return ea.Equal(b)
+	}
+	return false
 }
 
 // AuthenticateJWK is used for newAccount requests (no existing account yet).
