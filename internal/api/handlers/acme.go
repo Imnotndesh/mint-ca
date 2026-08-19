@@ -53,6 +53,8 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/order/{orderID}/finalize", h.finalizeOrder)
 		r.Post("/challenge/{challengeID}", h.validateChallenge)
 		r.Post("/certificate/{certID}", h.getCertificate)
+		r.Post("/account/{accountID}", h.updateAccount)
+		r.Post("/account/{accountID}/orders", h.listOrders)
 	})
 }
 
@@ -157,10 +159,63 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 			"value": auth.IdentifierValue,
 		},
 		"challenges": challengeObjs,
-		"wildcard":   false,
+		"wildcard":   internalacme.IsWildcardIdentifier(auth.IdentifierValue),
 	}
 
 	h.acmeWriteJSON(w, r, http.StatusOK, resp)
+}
+func (h *ACMEHandler) listOrders(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	accountID, err := uuid.Parse(chi.URLParam(r, "accountID"))
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid account ID"))
+		return
+	}
+	if accountID != account.ID {
+		h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("orders list does not belong to your account"))
+		return
+	}
+
+	orders, prob := h.service.ListOrders(ctx, account.ID)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	urls := make([]string, len(orders))
+	for i, o := range orders {
+		urls[i] = h.service.OrderURL(prov.ID, o.ID)
+	}
+
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
+		"orders": urls,
+	})
 }
 
 // parseJWS reads and decodes the JWS body common to all ACME POST requests.

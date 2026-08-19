@@ -42,8 +42,7 @@ type Problem struct {
 
 func (p *Problem) Error() string { return p.Type + ": " + p.Detail }
 
-// NewProblem constructs a Problem with the given ACME error type, HTTP status,
-// and human-readable detail.
+// NewProblem constructs a Problem with the given ACME error type, HTTP status, and human-readable detail.
 func NewProblem(errType string, status int, detail string) *Problem {
 	return &Problem{Type: errType, Status: status, Detail: detail}
 }
