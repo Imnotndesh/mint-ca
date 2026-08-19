@@ -27,6 +27,8 @@ func (h *SSHCAHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/", h.listCAs)
 		r.Get("/{caID}", h.getCA)
 		r.Post("/{caID}/issue", h.issueCert)
+		r.Post("/{caID}/sign/user", h.signUser)
+		r.Post("/{caID}/sign/host", h.signHost)
 		r.Get("/{caID}/certs", h.listCertsByCA)
 	})
 
@@ -35,6 +37,12 @@ func (h *SSHCAHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/serial/{caID}/{serial}", h.getCertBySerial)
 		r.Put("/{certID}/revoke", h.revokeCert)
 	})
+}
+
+// RegisterPublicRoutes mounts the unauthenticated SSH CA endpoints on the
+// public group, alongside the other /pki/* endpoints.
+func (h *SSHCAHandler) RegisterPublicRoutes(r chi.Router) {
+	r.Get("/pki/sshca/{caID}/public-key", h.getPublicKey)
 }
 
 type createSSHCARequest struct {
@@ -94,27 +102,49 @@ type issueSSHCertRequest struct {
 }
 
 func (h *SSHCAHandler) issueCert(w http.ResponseWriter, r *http.Request) {
-	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid CA ID")
-		return
-	}
-
 	var req issueSSHCertRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	provID, err := uuid.Parse(req.ProvisionerID)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
-		return
-	}
-
 	certType := storage.SSHCertType(req.CertType)
 	if certType != storage.SSHCertTypeUser && certType != storage.SSHCertTypeHost {
 		writeError(w, http.StatusBadRequest, "invalid cert_type (must be 'user' or 'host')")
+		return
+	}
+
+	h.issue(w, certType, req, r)
+}
+
+func (h *SSHCAHandler) signUser(w http.ResponseWriter, r *http.Request) {
+	var req issueSSHCertRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.issue(w, storage.SSHCertTypeUser, req, r)
+}
+
+func (h *SSHCAHandler) signHost(w http.ResponseWriter, r *http.Request) {
+	var req issueSSHCertRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	h.issue(w, storage.SSHCertTypeHost, req, r)
+}
+
+func (h *SSHCAHandler) issue(w http.ResponseWriter, certType storage.SSHCertType, req issueSSHCertRequest, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+
+	provID, err := uuid.Parse(req.ProvisionerID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
 		return
 	}
 
@@ -137,6 +167,22 @@ func (h *SSHCAHandler) issueCert(w http.ResponseWriter, r *http.Request) {
 		"certificate": issued.Record,
 		"cert_data":   issued.CertData,
 	})
+}
+
+func (h *SSHCAHandler) getPublicKey(w http.ResponseWriter, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	record, err := h.store.GetSSHCA(r.Context(), caID)
+	if err != nil || record == nil {
+		writeError(w, http.StatusNotFound, "SSH CA not found")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(record.PublicKey))
 }
 
 func (h *SSHCAHandler) listCertsByCA(w http.ResponseWriter, r *http.Request) {

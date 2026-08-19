@@ -369,7 +369,84 @@ Full CA chain in PEM format (the CA’s own certificate plus all ancestors up to
 
 ---
 
-## 1.10 ACME Endpoints
+## 1.10 SSH Certificate Authorities
+
+SSH CAs sign **user** and **host** certificates (OpenSSH `-cert.pub` format), distinct from the X.509 CAs above. An SSH CA is a flat signing key — no parent/child chain — and its public key is distributed for clients/servers to trust. Management endpoints require an API key; the public key endpoint under `/pki` does not.
+
+### `POST /api/v1/sshca/`
+Create a new SSH CA signing key.
+
+**Request body**
+```json
+{
+  "name": "my-ssh-ca",      // unique internal name
+  "key_algo": "ed25519"      // "ed25519" (default) or "ecdsa-p256"
+}
+```
+
+**Response (201 Created)**
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "my-ssh-ca",
+  "key_algo": "ssh-ed25519",
+  "public_key": "ssh-ed25519 AAAA... mint-ca",
+  "status": "active",
+  "created_at": "2025-01-01T00:00:00Z"
+}
+```
+
+### `GET /pki/sshca/{caID}/public-key`
+Public (no auth), plaintext `authorized_keys` line. Pipe it straight into `TrustedUserCAKeys` / `known_hosts` or an `@cert-authority` line.
+
+### `GET /api/v1/sshca/`
+List all SSH CAs.
+
+### `GET /api/v1/sshca/{caID}`
+Get a single SSH CA by ID.
+
+### `POST /api/v1/sshca/{caID}/issue` / `.../sign/user` / `.../sign/host`
+Issue (sign) an SSH certificate. `/sign/user` and `/sign/host` are fixed-type aliases of `/issue` (which takes `cert_type` in the body).
+
+**Request body** (all three share this shape)
+```json
+{
+  "provisioner_id": "provisioner-uuid",
+  "public_key": "ssh-ed25519 AAAA... mykey",   // authorized_keys line OR raw base64 wire format
+  "principals": ["alice", "ops"],              // usernames (user) or hostnames (host); at least one
+  "key_id": "alice",                            // free-text label in the certificate
+  "ttl_seconds": 28800                           // optional; default 8h user / 1y host
+}
+```
+
+**Response (201 Created)**
+```json
+{
+  "certificate": { "id": "...", "ca_id": "...", "serial": 12345, "cert_type": "user", ... },
+  "cert_data": "ssh-ed25519-cert-v01@openssh.com AAAA..."   // -cert.pub format, write to disk
+}
+```
+
+### `GET /api/v1/sshca/{caID}/certs`
+List all certificates issued by an SSH CA.
+
+### `GET /api/v1/sshca/certs/{certID}`
+Get a single SSH certificate by ID.
+
+### `GET /api/v1/sshca/certs/serial/{caID}/{serial}`
+Get an SSH certificate by its CA ID and decimal serial.
+
+### `PUT /api/v1/sshca/certs/{certID}/revoke`
+Revoke an SSH certificate. No request body.
+
+**Response (200 OK)**
+```json
+{ "status": "revoked" }
+```
+
+---
+
+## 1.11 ACME Endpoints
 
 ACME endpoints follow the **RFC 8555** protocol. All POST requests must be wrapped in a JWS.  
 The provisioner ID is part of the URL.  
@@ -392,7 +469,7 @@ The directory response contains URLs for all operations.
 
 ---
 
-## 1.11 Health & Setup
+## 1.12 Health & Setup
 
 ### `GET /healthz`
 Health check. In setup mode it returns a `status: "setup"` message.

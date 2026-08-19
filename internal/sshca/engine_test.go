@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"strings"
 	"testing"
+	"time"
 
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/storage"
@@ -157,6 +158,47 @@ func TestIssueCert_HostCert_TypeAndPrincipals(t *testing.T) {
 	// Host certs should carry no permit-* extensions.
 	if len(cert.Permissions.Extensions) != 0 {
 		t.Errorf("expected no extensions on host cert, got %v", cert.Permissions.Extensions)
+	}
+}
+
+func TestIssueCert_TTL_SetsValidBefore(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+
+	ca, err := engine.CreateCA(ctx, CreateCARequest{Name: "ttl-test", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+
+	clientAuthorizedKey := generateTestClientKey(t)
+	const ttl = int64(120) // 2 minutes
+
+	issued, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID:           ca.ID,
+		CertType:       storage.SSHCertTypeUser,
+		PublicKeyInput: clientAuthorizedKey,
+		Principals:     []string{"alice"},
+		TTLSeconds:     ttl,
+	})
+	if err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+
+	// The engine applies a 1-minute clock-skew buffer before validAfter, so
+	// the full window is ttl plus that buffer.
+	expected := time.Duration(ttl+60) * time.Second
+	if got := issued.Record.ValidBefore.Sub(issued.Record.ValidAfter); got != expected {
+		t.Errorf("expected ValidBefore-ValidAfter %s, got %s", expected, got)
+	}
+
+	// The signed certificate must encode the same window in OpenSSH uint32 ticks.
+	certPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(issued.CertData))
+	if err != nil {
+		t.Fatalf("parse issued cert: %v", err)
+	}
+	cert := certPub.(*ssh.Certificate)
+	if int64(cert.ValidBefore-cert.ValidAfter) != ttl+60 {
+		t.Errorf("expected cert validity %ds, got %d", ttl+60, cert.ValidBefore-cert.ValidAfter)
 	}
 }
 

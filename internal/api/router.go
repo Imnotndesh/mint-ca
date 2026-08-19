@@ -47,6 +47,7 @@ func BuildRouter(
 
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store).RegisterPublicRoutes(r)
 	})
 
 	r.Group(func(r chi.Router) {
