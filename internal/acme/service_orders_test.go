@@ -11,7 +11,7 @@ import (
 
 func TestListOrders(t *testing.T) {
 	ctx := context.Background()
-	store := newFakeStore()
+	store := NewFakeStore()
 
 	rootCA := &storage.CertificateAuthority{ID: uuid.New(), Name: "root"}
 	_ = store.CreateCA(ctx, rootCA)
@@ -82,7 +82,7 @@ func TestListOrders(t *testing.T) {
 }
 
 func TestOrderURLBuildsCorrectly(t *testing.T) {
-	store := newFakeStore()
+	store := NewFakeStore()
 	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
 
 	provID := uuid.New()

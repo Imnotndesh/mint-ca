@@ -14,7 +14,7 @@ import (
 
 func setupRevokeTestEnv(t *testing.T) (*fakeStore, *ca.Engine, *revocation.CRLManager, *storage.CertificateAuthority) {
 	t.Helper()
-	store := newFakeStore()
+	store := NewFakeStore()
 
 	masterKey := make([]byte, 32)
 	ks, err := mintcrypto.NewKeystore(masterKey)

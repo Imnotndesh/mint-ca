@@ -27,7 +27,7 @@ type fakeStore struct {
 	nonces         map[string]time.Time
 }
 
-func newFakeStore() *fakeStore {
+func NewFakeStore() *fakeStore {
 	return &fakeStore{
 		cas:            make(map[uuid.UUID]*storage.CertificateAuthority),
 		provisioners:   make(map[uuid.UUID]*storage.Provisioner),
