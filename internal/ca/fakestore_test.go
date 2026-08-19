@@ -327,3 +327,42 @@ func (f *caFakeStore) PruneExpiredNonces(ctx context.Context) error {
 	caNotImplemented("PruneExpiredNonces")
 	return nil
 }
+
+// ---- SSH CA (not exercised by X.509 CA engine tests) ----
+
+func (f *caFakeStore) CreateSSHCA(ctx context.Context, ca *storage.SSHCertificateAuthority) error {
+	caNotImplemented("CreateSSHCA")
+	return nil
+}
+func (f *caFakeStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*storage.SSHCertificateAuthority, error) {
+	caNotImplemented("GetSSHCA")
+	return nil, nil
+}
+func (f *caFakeStore) GetSSHCAByName(ctx context.Context, name string) (*storage.SSHCertificateAuthority, error) {
+	caNotImplemented("GetSSHCAByName")
+	return nil, nil
+}
+func (f *caFakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificateAuthority, error) {
+	caNotImplemented("ListSSHCAs")
+	return nil, nil
+}
+func (f *caFakeStore) CreateSSHCertificate(ctx context.Context, cert *storage.SSHCertificate) error {
+	caNotImplemented("CreateSSHCertificate")
+	return nil
+}
+func (f *caFakeStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*storage.SSHCertificate, error) {
+	caNotImplemented("GetSSHCertificate")
+	return nil, nil
+}
+func (f *caFakeStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*storage.SSHCertificate, error) {
+	caNotImplemented("GetSSHCertificateBySerial")
+	return nil, nil
+}
+func (f *caFakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
+	caNotImplemented("ListSSHCertificatesByCA")
+	return nil, nil
+}
+func (f *caFakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
+	caNotImplemented("RevokeSSHCertificate")
+	return nil
+}

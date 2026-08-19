@@ -93,6 +93,28 @@ const (
 	ACMEChallengeStatusInvalid ACMEChallengeStatus = "invalid"
 )
 
+type SSHKeyAlgo string
+
+const (
+	SSHKeyAlgoEd25519   SSHKeyAlgo = "ssh-ed25519"
+	SSHKeyAlgoECDSAP256 SSHKeyAlgo = "ecdsa-p256"
+)
+
+type SSHCertType string
+
+const (
+	SSHCertTypeUser SSHCertType = "user"
+	SSHCertTypeHost SSHCertType = "host"
+)
+
+type SSHCertStatus string
+
+const (
+	SSHCertStatusActive  SSHCertStatus = "active"
+	SSHCertStatusRevoked SSHCertStatus = "revoked"
+	SSHCertStatusExpired SSHCertStatus = "expired"
+)
+
 // SANs holds the Subject Alternative Names for a certificate.
 type SANs struct {
 	DNS   []string `json:"dns,omitempty"`
@@ -113,6 +135,37 @@ type CertificateAuthority struct {
 	NotBefore time.Time  `json:"not_before"`
 	NotAfter  time.Time  `json:"not_after"`
 	CreatedAt time.Time  `json:"created_at"`
+}
+
+// SSHCertificateAuthority is a signing key used to issue SSH user/host
+// certificates. Unlike X.509 CAs, SSH CAs are flat — no parent/child chain.
+type SSHCertificateAuthority struct {
+	ID        uuid.UUID  `json:"id"`
+	Name      string     `json:"name"`
+	KeyAlgo   SSHKeyAlgo `json:"key_algo"`
+	PublicKey string     `json:"public_key"` // OpenSSH authorized_keys format
+	KeyEnc    []byte     `json:"-"`
+	Status    CAStatus   `json:"status"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// SSHCertificate is an issued SSH user or host certificate.
+type SSHCertificate struct {
+	ID            uuid.UUID     `json:"id"`
+	CAID          uuid.UUID     `json:"ca_id"`
+	Serial        uint64        `json:"serial"`
+	CertType      SSHCertType   `json:"cert_type"`
+	KeyID         string        `json:"key_id"`
+	Principals    []string      `json:"principals"`
+	PublicKey     string        `json:"public_key"` // signed public key, OpenSSH format
+	CertData      string        `json:"cert_data"`  // full serialized -cert.pub
+	ValidAfter    time.Time     `json:"valid_after"`
+	ValidBefore   time.Time     `json:"valid_before"`
+	Status        SSHCertStatus `json:"status"`
+	RevokedAt     *time.Time    `json:"revoked_at,omitempty"`
+	ProvisionerID uuid.UUID     `json:"provisioner_id"`
+	Requester     string        `json:"requester"`
+	CreatedAt     time.Time     `json:"created_at"`
 }
 type ACMEAuthorizationStatus string
 
@@ -437,6 +490,33 @@ type Store interface {
 
 	// PruneExpiredNonces removes nonces past their expiry timestamp.
 	PruneExpiredNonces(ctx context.Context) error
+	// CreateSSHCA persists a new SSH signing CA. Key must already be encrypted.
+	CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error
+
+	// GetSSHCA returns the SSH CA with the given ID, or (nil, nil) if not found.
+	GetSSHCA(ctx context.Context, id uuid.UUID) (*SSHCertificateAuthority, error)
+
+	// GetSSHCAByName returns the SSH CA with the given name, or (nil, nil).
+	GetSSHCAByName(ctx context.Context, name string) (*SSHCertificateAuthority, error)
+
+	// ListSSHCAs returns all SSH CAs ordered by creation time ascending.
+	ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthority, error)
+
+	// CreateSSHCertificate persists a newly issued SSH certificate record.
+	CreateSSHCertificate(ctx context.Context, cert *SSHCertificate) error
+
+	// GetSSHCertificate returns the SSH certificate with the given ID, or (nil, nil).
+	GetSSHCertificate(ctx context.Context, id uuid.UUID) (*SSHCertificate, error)
+
+	// GetSSHCertificateBySerial returns the SSH certificate matching caID+serial, or (nil, nil).
+	GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*SSHCertificate, error)
+
+	// ListSSHCertificatesByCA returns all SSH certificates issued by caID, newest first.
+	ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error)
+
+	// RevokeSSHCertificate marks an SSH certificate revoked. Schema/plumbing
+	// only in phase 1 — no API endpoint wired up to it yet.
+	RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error
 	// Close releases all connections held by the store.
 	Close() error
 }

@@ -219,6 +219,35 @@ CREATE TABLE IF NOT EXISTS setup_state (
     state      TEXT        NOT NULL DEFAULT 'uninitialized',
     updated_at TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS ssh_certificate_authorities (
+	id         TEXT        NOT NULL PRIMARY KEY,
+	name       TEXT        NOT NULL UNIQUE,
+	key_algo   TEXT        NOT NULL,
+	public_key TEXT        NOT NULL,
+	key_enc    BYTEA       NOT NULL,
+	status     TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ssh_certificates (
+	id             TEXT        NOT NULL PRIMARY KEY,
+	ca_id          TEXT        NOT NULL REFERENCES ssh_certificate_authorities(id) ON DELETE RESTRICT,
+	serial         BIGINT      NOT NULL,
+	cert_type      TEXT        NOT NULL CHECK(cert_type IN ('user','host')),
+	key_id         TEXT        NOT NULL DEFAULT '',
+	principals     TEXT        NOT NULL DEFAULT '[]',
+	public_key     TEXT        NOT NULL,
+	cert_data      TEXT        NOT NULL,
+	valid_after    TIMESTAMPTZ NOT NULL,
+	valid_before   TIMESTAMPTZ NOT NULL,
+	status         TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	revoked_at     TIMESTAMPTZ,
+	provisioner_id TEXT        NOT NULL REFERENCES provisioners(id) ON DELETE RESTRICT,
+	requester      TEXT        NOT NULL DEFAULT '',
+	created_at     TIMESTAMPTZ NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pg_ssh_certs_ca_serial ON ssh_certificates(ca_id, serial);
 `
 
 func pgMarshalJSON(v interface{}) (string, error) {
@@ -1324,6 +1353,183 @@ func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 	k.CAID = pgSQLToUUID(caIDStr)
 	k.Scopes, _ = pgUnmarshalStringSlice(scopesStr)
 	return &k, nil
+}
+func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ssh_certificate_authorities
+			(id, name, key_algo, public_key, key_enc, status, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
+		ca.KeyEnc, string(ca.Status), ca.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateSSHCA: %w", err)
+	}
+	return nil
+}
+
+const pgSSHCASelectSQL = `
+	SELECT id, name, key_algo, public_key, key_enc, status, created_at
+	FROM ssh_certificate_authorities`
+
+func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
+	var ca SSHCertificateAuthority
+	var idStr string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ca.ID = uuid.MustParse(idStr)
+	return &ca, nil
+}
+
+func (s *postgresStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*SSHCertificateAuthority, error) {
+	row := s.db.QueryRowContext(ctx, pgSSHCASelectSQL+" WHERE id = $1", id.String())
+	ca, err := pgScanSSHCA(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetSSHCA: %w", err)
+	}
+	return ca, nil
+}
+
+func (s *postgresStore) GetSSHCAByName(ctx context.Context, name string) (*SSHCertificateAuthority, error) {
+	row := s.db.QueryRowContext(ctx, pgSSHCASelectSQL+" WHERE name = $1", name)
+	ca, err := pgScanSSHCA(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetSSHCAByName: %w", err)
+	}
+	return ca, nil
+}
+
+func (s *postgresStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthority, error) {
+	rows, err := s.db.QueryContext(ctx, pgSSHCASelectSQL+" ORDER BY created_at ASC")
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListSSHCAs: %w", err)
+	}
+	defer rows.Close()
+	var out []*SSHCertificateAuthority
+	for rows.Next() {
+		var ca SSHCertificateAuthority
+		var idStr string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt); err != nil {
+			return nil, err
+		}
+		ca.ID = uuid.MustParse(idStr)
+		out = append(out, &ca)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) CreateSSHCertificate(ctx context.Context, cert *SSHCertificate) error {
+	principals, err := pgMarshalStringSlice(cert.Principals)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateSSHCertificate: marshal principals: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO ssh_certificates
+			(id, ca_id, serial, cert_type, key_id, principals, public_key, cert_data,
+			 valid_after, valid_before, status, provisioner_id, requester, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		cert.ID.String(), cert.CAID.String(), int64(cert.Serial), string(cert.CertType),
+		cert.KeyID, principals, cert.PublicKey, cert.CertData,
+		cert.ValidAfter.UTC(), cert.ValidBefore.UTC(), string(cert.Status),
+		cert.ProvisionerID.String(), cert.Requester, cert.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateSSHCertificate: %w", err)
+	}
+	return nil
+}
+
+const pgSSHCertSelectSQL = `
+	SELECT id, ca_id, serial, cert_type, key_id, principals, public_key, cert_data,
+	       valid_after, valid_before, status, revoked_at, provisioner_id, requester, created_at
+	FROM ssh_certificates`
+
+func pgScanSSHCert(row *sql.Row) (*SSHCertificate, error) {
+	var c SSHCertificate
+	var idStr, caIDStr, provIDStr, principalsStr string
+	var serial int64
+	err := row.Scan(
+		&idStr, &caIDStr, &serial, &c.CertType, &c.KeyID, &principalsStr,
+		&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
+		&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.ID = uuid.MustParse(idStr)
+	c.CAID = uuid.MustParse(caIDStr)
+	c.ProvisionerID = uuid.MustParse(provIDStr)
+	c.Serial = uint64(serial)
+	c.Principals, _ = pgUnmarshalStringSlice(principalsStr)
+	return &c, nil
+}
+
+func (s *postgresStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*SSHCertificate, error) {
+	row := s.db.QueryRowContext(ctx, pgSSHCertSelectSQL+" WHERE id = $1", id.String())
+	c, err := pgScanSSHCert(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetSSHCertificate: %w", err)
+	}
+	return c, nil
+}
+
+func (s *postgresStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*SSHCertificate, error) {
+	row := s.db.QueryRowContext(ctx, pgSSHCertSelectSQL+" WHERE ca_id = $1 AND serial = $2", caID.String(), int64(serial))
+	c, err := pgScanSSHCert(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetSSHCertificateBySerial: %w", err)
+	}
+	return c, nil
+}
+
+func (s *postgresStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		pgSSHCertSelectSQL+" WHERE ca_id = $1 ORDER BY created_at DESC", caID.String())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListSSHCertificatesByCA: %w", err)
+	}
+	defer rows.Close()
+	var out []*SSHCertificate
+	for rows.Next() {
+		var c SSHCertificate
+		var idStr, caIDStr, provIDStr, principalsStr string
+		var serial int64
+		if err := rows.Scan(
+			&idStr, &caIDStr, &serial, &c.CertType, &c.KeyID, &principalsStr,
+			&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
+			&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		c.ID = uuid.MustParse(idStr)
+		c.CAID = uuid.MustParse(caIDStr)
+		c.ProvisionerID = uuid.MustParse(provIDStr)
+		c.Serial = uint64(serial)
+		c.Principals, _ = pgUnmarshalStringSlice(principalsStr)
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE ssh_certificates SET status = 'revoked', revoked_at = $1
+		WHERE id = $2 AND status = 'active'`, time.Now().UTC(), id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: RevokeSSHCertificate: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: RevokeSSHCertificate: certificate %s not found or already revoked", id)
+	}
+	return nil
 }
 
 // MigrateNonces runs the nonce schema migration for Postgres.
