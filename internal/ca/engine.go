@@ -1,4 +1,3 @@
-// internal/ca/engine.go
 package ca
 
 import (
@@ -8,8 +7,10 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -270,6 +271,34 @@ type Engine struct {
 func NewEngine(store storage.Store, keystore *mintcrypto.Keystore, baseUrl string) *Engine {
 	return &Engine{store: store, keystore: keystore, baseUrl: baseUrl}
 }
+func subjectKeyID(pub crypto.PublicKey) ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("subjectKeyID: marshal public key: %w", err)
+	}
+
+	var spki struct {
+		Algorithm        pkix.AlgorithmIdentifier
+		SubjectPublicKey asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(der, &spki); err != nil {
+		return nil, fmt.Errorf("subjectKeyID: parse SubjectPublicKeyInfo: %w", err)
+	}
+
+	sum := sha1.Sum(spki.SubjectPublicKey.Bytes)
+	return sum[:], nil
+}
+
+// ensureSKI returns cert.SubjectKeyId if already populated, or computes it
+// on the fly from cert.PublicKey otherwise. This makes AKI chaining work
+// correctly even against CA certificates that were issued before explicit
+// SKI/AKI support existed.
+func ensureSKI(cert *x509.Certificate) ([]byte, error) {
+	if len(cert.SubjectKeyId) > 0 {
+		return cert.SubjectKeyId, nil
+	}
+	return subjectKeyID(cert.PublicKey)
+}
 
 // CreateRootCA generates a self-signed root CA and persists it to the store.
 func (e *Engine) CreateRootCA(ctx context.Context, req CreateRootCARequest) (*storage.CertificateAuthority, error) {
@@ -307,6 +336,10 @@ func (e *Engine) CreateRootCA(ctx context.Context, req CreateRootCARequest) (*st
 		Province:     nonEmpty(req.State),
 		Locality:     nonEmpty(req.Locality),
 	}
+	ski, err := subjectKeyID(pubkey(privKey))
+	if err != nil {
+		return nil, fmt.Errorf("ca: CreateRootCA: compute subject key id: %w", err)
+	}
 
 	template := &x509.Certificate{
 		SerialNumber:          serial,
@@ -318,12 +351,13 @@ func (e *Engine) CreateRootCA(ctx context.Context, req CreateRootCARequest) (*st
 		BasicConstraintsValid: true,
 		MaxPathLen:            -1,
 		MaxPathLenZero:        false,
+		SubjectKeyId:          ski,
+		AuthorityKeyId:        ski,
 	}
 	certDER, err := x509.CreateCertificate(rand.Reader, template, template, pubkey(privKey), privKey)
 	if err != nil {
 		return nil, fmt.Errorf("ca: CreateRootCA: sign certificate: %w", err)
 	}
-
 	certPEM := encodeCertPEM(certDER)
 
 	encKey, err := e.keystore.EncryptPEM(privKeyPEM)
@@ -420,6 +454,15 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 	if maxPathLen == 0 {
 		maxPathLenZero = true
 	}
+	ski, err := subjectKeyID(pubkey(privKey))
+	if err != nil {
+		return nil, fmt.Errorf("ca: CreateIntermediateCA: compute subject key id: %w", err)
+	}
+	// Parent may predate explicit SKI support — fall back to recomputing it
+	aki, err := ensureSKI(parentCert)
+	if err != nil {
+		return nil, fmt.Errorf("ca: CreateIntermediateCA: compute parent authority key id: %w", err)
+	}
 
 	template := &x509.Certificate{
 		SerialNumber:          serial,
@@ -431,6 +474,8 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 		BasicConstraintsValid: true,
 		MaxPathLen:            maxPathLen,
 		MaxPathLenZero:        maxPathLenZero,
+		SubjectKeyId:          ski,
+		AuthorityKeyId:        aki,
 		CRLDistributionPoints: []string{
 			fmt.Sprintf("%s/v1/pki/ca/%s/crl", e.baseUrl, req.ParentCAID),
 		},
@@ -445,7 +490,6 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 	if err != nil {
 		return nil, fmt.Errorf("ca: CreateIntermediateCA: sign certificate: %w", err)
 	}
-
 	certPEM := encodeCertPEM(certDER)
 
 	encKey, err := e.keystore.EncryptPEM(privKeyPEM)
@@ -503,6 +547,16 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		notAfter = issuerCert.NotAfter
 	}
 
+	ski, err := subjectKeyID(pubkey(leafKey))
+	if err != nil {
+		return nil, fmt.Errorf("ca: IssueCert: compute subject key id: %w", err)
+	}
+	// Issuer may predate explicit SKI support — fall back to recomputing it.
+	aki, err := ensureSKI(issuerCert)
+	if err != nil {
+		return nil, fmt.Errorf("ca: IssueCert: compute authority key id: %w", err)
+	}
+
 	template := &x509.Certificate{
 		SerialNumber: serial,
 		Subject: pkix.Name{
@@ -517,14 +571,14 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		EmailAddresses:        req.SANsEmail,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
+		SubjectKeyId:          ski,
+		AuthorityKeyId:        aki,
 		CRLDistributionPoints: []string{
 			fmt.Sprintf("%s/v1/pki/ca/%s/crl", e.baseUrl, req.CAID),
 		},
-		// AIA (Authority Information Access) - OCSP tells the client where to send real-time OCSP status requests.
 		OCSPServer: []string{
 			fmt.Sprintf("%s/v1/pki/ocsp", e.baseUrl),
 		},
-		// AIA (Authority Information Access) - Issuing CA tells the client where to download the public certificate of the CA that signed this.
 		IssuingCertificateURL: []string{
 			fmt.Sprintf("%s/v1/pki/ca/%s/crt", e.baseUrl, req.CAID),
 		},
@@ -610,6 +664,15 @@ func (e *Engine) SignCSR(ctx context.Context, req SignCSRRequest) (*IssuedCertif
 	if notAfter.After(issuerCert.NotAfter) {
 		notAfter = issuerCert.NotAfter
 	}
+	ski, err := subjectKeyID(csr.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("ca: SignCSR: compute subject key id: %w", err)
+	}
+	// Issuer may predate explicit SKI support — fall back to recomputing it.
+	aki, err := ensureSKI(issuerCert)
+	if err != nil {
+		return nil, fmt.Errorf("ca: SignCSR: compute authority key id: %w", err)
+	}
 
 	// We honour the Subject and SANs from the CSR.
 	// Key usage is set to sensible TLS defaults — callers cannot inject
@@ -626,6 +689,8 @@ func (e *Engine) SignCSR(ctx context.Context, req SignCSRRequest) (*IssuedCertif
 		EmailAddresses:        csr.EmailAddresses,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
+		SubjectKeyId:          ski,
+		AuthorityKeyId:        aki,
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, csr.PublicKey, issuerKey)

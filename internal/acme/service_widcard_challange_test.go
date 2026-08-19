@@ -54,7 +54,7 @@ func TestValidateIdentifier(t *testing.T) {
 // config allows both.
 func TestNewOrderWildcardChallengeRestriction(t *testing.T) {
 	ctx := context.Background()
-	store := newFakeStore()
+	store := NewFakeStore()
 
 	rootCA := &storage.CertificateAuthority{ID: uuid.New(), Name: "root"}
 	_ = store.CreateCA(ctx, rootCA)
