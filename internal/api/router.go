@@ -11,6 +11,7 @@ import (
 	"mint-ca/internal/config"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
+	"mint-ca/internal/sshca"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -23,6 +24,7 @@ func BuildRouter(
 	cfg *config.Config,
 	store storage.Store,
 	caEngine *ca.Engine,
+	sshcaEngine *sshca.Engine,
 	crlMgr *revocation.CRLManager,
 	ocspResponder *revocation.OCSPResponder,
 	policyEngine *policy.Engine,
@@ -52,6 +54,7 @@ func BuildRouter(
 		r.Use(apimiddleware.Audit(store))
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store).RegisterRoutes(r)
 		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
