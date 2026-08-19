@@ -252,6 +252,35 @@ CREATE TABLE IF NOT EXISTS acme_authorizations (
     created_at       DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ssh_certificate_authorities (
+	id         TEXT    NOT NULL PRIMARY KEY,
+	name       TEXT    NOT NULL UNIQUE,
+	key_algo   TEXT    NOT NULL,
+	public_key TEXT    NOT NULL,
+	key_enc    BLOB    NOT NULL,
+	status     TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	created_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ssh_certificates (
+	id             TEXT    NOT NULL PRIMARY KEY,
+	ca_id          TEXT    NOT NULL REFERENCES ssh_certificate_authorities(id) ON DELETE RESTRICT,
+	serial         INTEGER NOT NULL,
+	cert_type      TEXT    NOT NULL CHECK(cert_type IN ('user','host')),
+	key_id         TEXT    NOT NULL DEFAULT '',
+	principals     TEXT    NOT NULL DEFAULT '[]',
+	public_key     TEXT    NOT NULL,
+	cert_data      TEXT    NOT NULL,
+	valid_after    DATETIME NOT NULL,
+	valid_before   DATETIME NOT NULL,
+	status         TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	revoked_at     DATETIME,
+	provisioner_id TEXT    NOT NULL REFERENCES provisioners(id) ON DELETE RESTRICT,
+	requester      TEXT    NOT NULL DEFAULT '',
+	created_at     DATETIME NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_certs_ca_serial ON ssh_certificates(ca_id, serial);
+
 `
 
 func marshalJSON(v interface{}) (string, error) {
@@ -1440,6 +1469,180 @@ func (s *sqliteStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey
 		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
 		FROM api_keys WHERE name = ?`, name)
 	return scanAPIKey(row)
+}
+func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ssh_certificate_authorities
+			(id, name, key_algo, public_key, key_enc, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
+		ca.KeyEnc, string(ca.Status), ca.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateSSHCA: %w", err)
+	}
+	return nil
+}
+
+const sqliteSSHCASelectSQL = `
+	SELECT id, name, key_algo, public_key, key_enc, status, created_at
+	FROM ssh_certificate_authorities`
+
+func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
+	var ca SSHCertificateAuthority
+	var idStr string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ca.ID = uuid.MustParse(idStr)
+	return &ca, nil
+}
+
+func (s *sqliteStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*SSHCertificateAuthority, error) {
+	row := s.db.QueryRowContext(ctx, sqliteSSHCASelectSQL+" WHERE id = ?", id.String())
+	ca, err := sqliteScanSSHCA(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetSSHCA: %w", err)
+	}
+	return ca, nil
+}
+
+func (s *sqliteStore) GetSSHCAByName(ctx context.Context, name string) (*SSHCertificateAuthority, error) {
+	row := s.db.QueryRowContext(ctx, sqliteSSHCASelectSQL+" WHERE name = ?", name)
+	ca, err := sqliteScanSSHCA(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetSSHCAByName: %w", err)
+	}
+	return ca, nil
+}
+
+func (s *sqliteStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthority, error) {
+	rows, err := s.db.QueryContext(ctx, sqliteSSHCASelectSQL+" ORDER BY created_at ASC")
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListSSHCAs: %w", err)
+	}
+	defer rows.Close()
+	var out []*SSHCertificateAuthority
+	for rows.Next() {
+		var ca SSHCertificateAuthority
+		var idStr string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt); err != nil {
+			return nil, err
+		}
+		ca.ID = uuid.MustParse(idStr)
+		out = append(out, &ca)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) CreateSSHCertificate(ctx context.Context, cert *SSHCertificate) error {
+	principals, err := marshalStringSlice(cert.Principals)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateSSHCertificate: marshal principals: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO ssh_certificates
+			(id, ca_id, serial, cert_type, key_id, principals, public_key, cert_data,
+			 valid_after, valid_before, status, provisioner_id, requester, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		cert.ID.String(), cert.CAID.String(), cert.Serial, string(cert.CertType),
+		cert.KeyID, principals, cert.PublicKey, cert.CertData,
+		cert.ValidAfter.UTC(), cert.ValidBefore.UTC(), string(cert.Status),
+		cert.ProvisionerID.String(), cert.Requester, cert.CreatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateSSHCertificate: %w", err)
+	}
+	return nil
+}
+
+const sqliteSSHCertSelectSQL = `
+	SELECT id, ca_id, serial, cert_type, key_id, principals, public_key, cert_data,
+	       valid_after, valid_before, status, revoked_at, provisioner_id, requester, created_at
+	FROM ssh_certificates`
+
+func sqliteScanSSHCert(row *sql.Row) (*SSHCertificate, error) {
+	var c SSHCertificate
+	var idStr, caIDStr, provIDStr, principalsStr string
+	err := row.Scan(
+		&idStr, &caIDStr, &c.Serial, &c.CertType, &c.KeyID, &principalsStr,
+		&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
+		&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.ID = uuid.MustParse(idStr)
+	c.CAID = uuid.MustParse(caIDStr)
+	c.ProvisionerID = uuid.MustParse(provIDStr)
+	c.Principals, _ = unmarshalStringSlice(principalsStr)
+	return &c, nil
+}
+
+func (s *sqliteStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*SSHCertificate, error) {
+	row := s.db.QueryRowContext(ctx, sqliteSSHCertSelectSQL+" WHERE id = ?", id.String())
+	c, err := sqliteScanSSHCert(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetSSHCertificate: %w", err)
+	}
+	return c, nil
+}
+
+func (s *sqliteStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*SSHCertificate, error) {
+	row := s.db.QueryRowContext(ctx, sqliteSSHCertSelectSQL+" WHERE ca_id = ? AND serial = ?", caID.String(), serial)
+	c, err := sqliteScanSSHCert(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetSSHCertificateBySerial: %w", err)
+	}
+	return c, nil
+}
+
+func (s *sqliteStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		sqliteSSHCertSelectSQL+" WHERE ca_id = ? ORDER BY created_at DESC", caID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListSSHCertificatesByCA: %w", err)
+	}
+	defer rows.Close()
+	var out []*SSHCertificate
+	for rows.Next() {
+		var c SSHCertificate
+		var idStr, caIDStr, provIDStr, principalsStr string
+		if err := rows.Scan(
+			&idStr, &caIDStr, &c.Serial, &c.CertType, &c.KeyID, &principalsStr,
+			&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
+			&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		c.ID = uuid.MustParse(idStr)
+		c.CAID = uuid.MustParse(caIDStr)
+		c.ProvisionerID = uuid.MustParse(provIDStr)
+		c.Principals, _ = unmarshalStringSlice(principalsStr)
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
+	now := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE ssh_certificates SET status = 'revoked', revoked_at = ?
+		WHERE id = ? AND status = 'active'`, now, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: RevokeSSHCertificate: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: RevokeSSHCertificate: certificate %s not found or already revoked", id)
+	}
+	return nil
 }
 func (s *sqliteStore) MigrateNonces(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx, sqliteNonceSchema)

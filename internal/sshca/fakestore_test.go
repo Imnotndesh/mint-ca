@@ -1,4 +1,4 @@
-package acme
+package sshca
 
 import (
 	"context"
@@ -11,54 +11,38 @@ import (
 	"github.com/google/uuid"
 )
 
-// fakeStore is an in-memory storage.Store covering only what ACME
-// service-layer tests exercise. Unimplemented methods panic with a clear
-// message so a missing case fails loudly instead of silently.
+// fakeStore is a minimal in-memory storage.Store covering only what the
+// sshca Engine touches. Everything else panics loudly so a missing case
+// fails fast instead of silently returning zero values.
 type fakeStore struct {
-	mu             sync.Mutex
-	cas            map[uuid.UUID]*storage.CertificateAuthority
-	provisioners   map[uuid.UUID]*storage.Provisioner
-	accounts       map[uuid.UUID]*storage.ACMEAccount
-	orders         map[uuid.UUID]*storage.ACMEOrder
-	authorizations map[uuid.UUID]*storage.ACMEAuthorization
-	challenges     map[uuid.UUID]*storage.ACMEChallenge
-	certsBySerial  map[string]*storage.Certificate
-	crls           map[uuid.UUID]*storage.CRLCache
-	nonces         map[string]time.Time
+	mu    sync.Mutex
+	cas   map[uuid.UUID]*storage.SSHCertificateAuthority
+	certs map[uuid.UUID]*storage.SSHCertificate
 }
 
-func NewFakeStore() *fakeStore {
+func newFakeStore() *fakeStore {
 	return &fakeStore{
-		cas:            make(map[uuid.UUID]*storage.CertificateAuthority),
-		provisioners:   make(map[uuid.UUID]*storage.Provisioner),
-		accounts:       make(map[uuid.UUID]*storage.ACMEAccount),
-		orders:         make(map[uuid.UUID]*storage.ACMEOrder),
-		authorizations: make(map[uuid.UUID]*storage.ACMEAuthorization),
-		challenges:     make(map[uuid.UUID]*storage.ACMEChallenge),
-		certsBySerial:  make(map[string]*storage.Certificate),
-		crls:           make(map[uuid.UUID]*storage.CRLCache),
-		nonces:         make(map[string]time.Time),
+		cas:   make(map[uuid.UUID]*storage.SSHCertificateAuthority),
+		certs: make(map[uuid.UUID]*storage.SSHCertificate),
 	}
 }
 
 func notImplemented(method string) {
-	panic(fmt.Sprintf("fakeStore: %s not implemented in fake — add it if your test needs it", method))
+	panic("sshca fakeStore: " + method + " not implemented in fake — add it if your test needs it")
 }
 
-// ---- CA ----
-
-func (f *fakeStore) CreateCA(ctx context.Context, ca *storage.CertificateAuthority) error {
+func (f *fakeStore) CreateSSHCA(ctx context.Context, ca *storage.SSHCertificateAuthority) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.cas[ca.ID] = ca
 	return nil
 }
-func (f *fakeStore) GetCA(ctx context.Context, id uuid.UUID) (*storage.CertificateAuthority, error) {
+func (f *fakeStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*storage.SSHCertificateAuthority, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cas[id], nil
 }
-func (f *fakeStore) GetCAByName(ctx context.Context, name string) (*storage.CertificateAuthority, error) {
+func (f *fakeStore) GetSSHCAByName(ctx context.Context, name string) (*storage.SSHCertificateAuthority, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, c := range f.cas {
@@ -66,6 +50,69 @@ func (f *fakeStore) GetCAByName(ctx context.Context, name string) (*storage.Cert
 			return c, nil
 		}
 	}
+	return nil, nil
+}
+func (f *fakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificateAuthority, error) {
+	notImplemented("ListSSHCAs")
+	return nil, nil
+}
+func (f *fakeStore) CreateSSHCertificate(ctx context.Context, cert *storage.SSHCertificate) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.certs[cert.ID] = cert
+	return nil
+}
+func (f *fakeStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*storage.SSHCertificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.certs[id], nil
+}
+func (f *fakeStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*storage.SSHCertificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.certs {
+		if c.CAID == caID && c.Serial == serial {
+			return c, nil
+		}
+	}
+	return nil, nil
+}
+func (f *fakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.SSHCertificate
+	for _, c := range f.certs {
+		if c.CAID == caID {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.certs[id]
+	if !ok {
+		return errNotFound
+	}
+	now := time.Now().UTC()
+	c.Status = storage.SSHCertStatusRevoked
+	c.RevokedAt = &now
+	return nil
+}
+
+// --- everything below is unused by sshca but required to satisfy storage.Store ---
+
+func (f *fakeStore) CreateCA(ctx context.Context, ca *storage.CertificateAuthority) error {
+	notImplemented("CreateCA")
+	return nil
+}
+func (f *fakeStore) GetCA(ctx context.Context, id uuid.UUID) (*storage.CertificateAuthority, error) {
+	notImplemented("GetCA")
+	return nil, nil
+}
+func (f *fakeStore) GetCAByName(ctx context.Context, name string) (*storage.CertificateAuthority, error) {
+	notImplemented("GetCAByName")
 	return nil, nil
 }
 func (f *fakeStore) ListCAs(ctx context.Context) ([]*storage.CertificateAuthority, error) {
@@ -80,73 +127,37 @@ func (f *fakeStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status sto
 	notImplemented("UpdateCAStatus")
 	return nil
 }
-
-// ---- Certificates ----
-
 func (f *fakeStore) CreateCertificate(ctx context.Context, cert *storage.Certificate) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.certsBySerial[cert.Serial] = cert
+	notImplemented("CreateCertificate")
 	return nil
 }
 func (f *fakeStore) GetCertificate(ctx context.Context, id uuid.UUID) (*storage.Certificate, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, c := range f.certsBySerial {
-		if c.ID == id {
-			return c, nil
-		}
-	}
+	notImplemented("GetCertificate")
 	return nil, nil
 }
 func (f *fakeStore) GetCertificateBySerial(ctx context.Context, serial string) (*storage.Certificate, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.certsBySerial[serial], nil
+	notImplemented("GetCertificateBySerial")
+	return nil, nil
 }
 func (f *fakeStore) ListCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.Certificate, error) {
 	notImplemented("ListCertificatesByCA")
 	return nil, nil
 }
 func (f *fakeStore) ListRevokedByCA(ctx context.Context, caID uuid.UUID) ([]*storage.Certificate, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []*storage.Certificate
-	for _, c := range f.certsBySerial {
-		if c.CAID == caID && c.Status == storage.CertStatusRevoked {
-			out = append(out, c)
-		}
-	}
-	return out, nil
+	notImplemented("ListRevokedByCA")
+	return nil, nil
 }
 func (f *fakeStore) RevokeCertificate(ctx context.Context, id uuid.UUID, reason int) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, c := range f.certsBySerial {
-		if c.ID == id {
-			if c.Status == storage.CertStatusRevoked {
-				return fmt.Errorf("already revoked")
-			}
-			c.Status = storage.CertStatusRevoked
-			c.RevokeReason = &reason
-			return nil
-		}
-	}
-	return fmt.Errorf("certificate not found")
+	notImplemented("RevokeCertificate")
+	return nil
 }
-
-// ---- Provisioners ----
-
 func (f *fakeStore) CreateProvisioner(ctx context.Context, p *storage.Provisioner) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.provisioners[p.ID] = p
+	notImplemented("CreateProvisioner")
 	return nil
 }
 func (f *fakeStore) GetProvisioner(ctx context.Context, id uuid.UUID) (*storage.Provisioner, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.provisioners[id], nil
+	notImplemented("GetProvisioner")
+	return nil, nil
 }
 func (f *fakeStore) ListProvisionersByCA(ctx context.Context, caID uuid.UUID) ([]*storage.Provisioner, error) {
 	notImplemented("ListProvisionersByCA")
@@ -156,9 +167,6 @@ func (f *fakeStore) UpdateProvisionerStatus(ctx context.Context, id uuid.UUID, s
 	notImplemented("UpdateProvisionerStatus")
 	return nil
 }
-
-// ---- Policies ----
-
 func (f *fakeStore) CreatePolicy(ctx context.Context, p *storage.Policy) error {
 	notImplemented("CreatePolicy")
 	return nil
@@ -179,29 +187,17 @@ func (f *fakeStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
 	notImplemented("DeletePolicy")
 	return nil
 }
-
-// ---- ACME accounts ----
-
 func (f *fakeStore) CreateACMEAccount(ctx context.Context, a *storage.ACMEAccount) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.accounts[a.ID] = a
+	notImplemented("CreateACMEAccount")
 	return nil
 }
 func (f *fakeStore) GetACMEAccountByKeyID(ctx context.Context, keyID string) (*storage.ACMEAccount, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, a := range f.accounts {
-		if a.KeyID == keyID {
-			return a, nil
-		}
-	}
+	notImplemented("GetACMEAccountByKeyID")
 	return nil, nil
 }
 func (f *fakeStore) GetACMEAccount(ctx context.Context, id uuid.UUID) (*storage.ACMEAccount, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.accounts[id], nil
+	notImplemented("GetACMEAccount")
+	return nil, nil
 }
 func (f *fakeStore) UpdateACMEAccountStatus(ctx context.Context, id uuid.UUID, status storage.ACMEAccountStatus) error {
 	notImplemented("UpdateACMEAccountStatus")
@@ -211,9 +207,6 @@ func (f *fakeStore) UpdateACMEAccountContact(ctx context.Context, id uuid.UUID, 
 	notImplemented("UpdateACMEAccountContact")
 	return nil
 }
-
-// ---- EAB ----
-
 func (f *fakeStore) CreateEABCredential(ctx context.Context, e *storage.EABCredential) error {
 	notImplemented("CreateEABCredential")
 	return nil
@@ -226,122 +219,63 @@ func (f *fakeStore) MarkEABUsed(ctx context.Context, id uuid.UUID) error {
 	notImplemented("MarkEABUsed")
 	return nil
 }
-
-// ---- ACME orders ----
-
 func (f *fakeStore) CreateACMEOrder(ctx context.Context, o *storage.ACMEOrder) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.orders[o.ID] = o
+	notImplemented("CreateACMEOrder")
 	return nil
 }
 func (f *fakeStore) GetACMEOrder(ctx context.Context, id uuid.UUID) (*storage.ACMEOrder, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.orders[id], nil
+	notImplemented("GetACMEOrder")
+	return nil, nil
 }
 func (f *fakeStore) ListACMEOrdersByAccount(ctx context.Context, accountID uuid.UUID) ([]*storage.ACMEOrder, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []*storage.ACMEOrder
-	for _, o := range f.orders {
-		if o.AccountID == accountID {
-			out = append(out, o)
-		}
-	}
-	return out, nil
+	notImplemented("ListACMEOrdersByAccount")
+	return nil, nil
 }
 func (f *fakeStore) UpdateACMEOrderStatus(ctx context.Context, id uuid.UUID, status storage.ACMEOrderStatus) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if o, ok := f.orders[id]; ok {
-		o.Status = status
-	}
+	notImplemented("UpdateACMEOrderStatus")
 	return nil
 }
 func (f *fakeStore) FinalizeACMEOrder(ctx context.Context, orderID uuid.UUID, certID uuid.UUID) error {
 	notImplemented("FinalizeACMEOrder")
 	return nil
 }
-
-// ---- ACME challenges ----
-
 func (f *fakeStore) CreateACMEChallenge(ctx context.Context, c *storage.ACMEChallenge) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.challenges[c.ID] = c
+	notImplemented("CreateACMEChallenge")
 	return nil
 }
 func (f *fakeStore) GetACMEChallenge(ctx context.Context, id uuid.UUID) (*storage.ACMEChallenge, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.challenges[id], nil
+	notImplemented("GetACMEChallenge")
+	return nil, nil
 }
 func (f *fakeStore) ListChallengesByOrder(ctx context.Context, orderID uuid.UUID) ([]*storage.ACMEChallenge, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []*storage.ACMEChallenge
-	for _, c := range f.challenges {
-		if c.OrderID == orderID {
-			out = append(out, c)
-		}
-	}
-	return out, nil
+	notImplemented("ListChallengesByOrder")
+	return nil, nil
 }
 func (f *fakeStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID, status storage.ACMEChallengeStatus, validatedAt *time.Time) error {
 	notImplemented("UpdateChallengeStatus")
 	return nil
 }
 func (f *fakeStore) ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*storage.ACMEChallenge, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []*storage.ACMEChallenge
-	for _, c := range f.challenges {
-		if c.AuthorizationID != nil && *c.AuthorizationID == authID {
-			out = append(out, c)
-		}
-	}
-	return out, nil
+	notImplemented("ListChallengesByAuthorization")
+	return nil, nil
 }
-
-// ---- ACME authorizations ----
-
 func (f *fakeStore) CreateACMEAuthorization(ctx context.Context, a *storage.ACMEAuthorization) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.authorizations[a.ID] = a
+	notImplemented("CreateACMEAuthorization")
 	return nil
 }
 func (f *fakeStore) GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*storage.ACMEAuthorization, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.authorizations[id], nil
+	notImplemented("GetACMEAuthorization")
+	return nil, nil
 }
 func (f *fakeStore) UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status storage.ACMEAuthorizationStatus) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if a, ok := f.authorizations[id]; ok {
-		a.Status = status
-	}
+	notImplemented("UpdateACMEAuthorizationStatus")
 	return nil
 }
 func (f *fakeStore) ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*storage.ACMEAuthorization, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var out []*storage.ACMEAuthorization
-	for _, a := range f.authorizations {
-		if a.OrderID == orderID {
-			out = append(out, a)
-		}
-	}
-	return out, nil
+	notImplemented("ListAuthorizationsByOrder")
+	return nil, nil
 }
-
-// ---- Audit ----
-
-func (f *fakeStore) WriteAuditLog(ctx context.Context, entry *storage.AuditLog) error {
-	return nil // silently accept; tests here don't assert on audit trail
-}
+func (f *fakeStore) WriteAuditLog(ctx context.Context, entry *storage.AuditLog) error { return nil }
 func (f *fakeStore) ListAuditLogs(ctx context.Context, limit, offset int) ([]*storage.AuditLog, error) {
 	notImplemented("ListAuditLogs")
 	return nil, nil
@@ -350,26 +284,14 @@ func (f *fakeStore) ListAuditLogsByCA(ctx context.Context, caID uuid.UUID, limit
 	notImplemented("ListAuditLogsByCA")
 	return nil, nil
 }
-
-// ---- CRL ----
-
 func (f *fakeStore) UpsertCRL(ctx context.Context, crl *storage.CRLCache) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.crls == nil {
-		f.crls = make(map[uuid.UUID]*storage.CRLCache)
-	}
-	f.crls[crl.CAID] = crl
+	notImplemented("UpsertCRL")
 	return nil
 }
 func (f *fakeStore) GetCRL(ctx context.Context, caID uuid.UUID) (*storage.CRLCache, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.crls[caID], nil
+	notImplemented("GetCRL")
+	return nil, nil
 }
-
-// ---- API keys ----
-
 func (f *fakeStore) CreateAPIKey(ctx context.Context, k *storage.APIKey) error {
 	notImplemented("CreateAPIKey")
 	return nil
@@ -394,9 +316,6 @@ func (f *fakeStore) GetAPIKeyByName(ctx context.Context, name string) (*storage.
 	notImplemented("GetAPIKeyByName")
 	return nil, nil
 }
-
-// ---- Setup / misc ----
-
 func (f *fakeStore) Migrate(ctx context.Context) error { return nil }
 func (f *fakeStore) GetSetupState(ctx context.Context) (storage.SetupState, error) {
 	notImplemented("GetSetupState")
@@ -407,65 +326,17 @@ func (f *fakeStore) SetSetupState(ctx context.Context, state storage.SetupState)
 	return nil
 }
 func (f *fakeStore) Close() error { return nil }
-
-// ---- Nonces ----
-
 func (f *fakeStore) CreateNonce(ctx context.Context, nonce string, expiresAt time.Time) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.nonces[nonce] = expiresAt
+	notImplemented("CreateNonce")
 	return nil
 }
 func (f *fakeStore) ConsumeNonce(ctx context.Context, nonce string) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	exp, ok := f.nonces[nonce]
-	if !ok {
-		return false, nil
-	}
-	delete(f.nonces, nonce)
-	return time.Now().UTC().Before(exp), nil
+	notImplemented("ConsumeNonce")
+	return false, nil
 }
 func (f *fakeStore) PruneExpiredNonces(ctx context.Context) error {
 	notImplemented("PruneExpiredNonces")
 	return nil
 }
 
-// ---- SSH CA (not exercised by ACME tests) ----
-
-func (f *fakeStore) CreateSSHCA(ctx context.Context, ca *storage.SSHCertificateAuthority) error {
-	notImplemented("CreateSSHCA")
-	return nil
-}
-func (f *fakeStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*storage.SSHCertificateAuthority, error) {
-	notImplemented("GetSSHCA")
-	return nil, nil
-}
-func (f *fakeStore) GetSSHCAByName(ctx context.Context, name string) (*storage.SSHCertificateAuthority, error) {
-	notImplemented("GetSSHCAByName")
-	return nil, nil
-}
-func (f *fakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificateAuthority, error) {
-	notImplemented("ListSSHCAs")
-	return nil, nil
-}
-func (f *fakeStore) CreateSSHCertificate(ctx context.Context, cert *storage.SSHCertificate) error {
-	notImplemented("CreateSSHCertificate")
-	return nil
-}
-func (f *fakeStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*storage.SSHCertificate, error) {
-	notImplemented("GetSSHCertificate")
-	return nil, nil
-}
-func (f *fakeStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*storage.SSHCertificate, error) {
-	notImplemented("GetSSHCertificateBySerial")
-	return nil, nil
-}
-func (f *fakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
-	notImplemented("ListSSHCertificatesByCA")
-	return nil, nil
-}
-func (f *fakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
-	notImplemented("RevokeSSHCertificate")
-	return nil
-}
+var errNotFound = fmt.Errorf("sshca fakeStore: record not found")
