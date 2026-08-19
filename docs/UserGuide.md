@@ -273,7 +273,123 @@ The revocation is immediately reflected in the next CRL (which is regenerated au
 
 ---
 
-## 3.10 Additional Management Tasks
+## 3.10 SSH Certificate Authorities (User & Host Certificates)
+
+SSH CAs let you sign **user** and **host** SSH certificates instead of distributing raw public keys. This walkthrough mirrors Steps 4–9 but for SSH certificates.
+
+### Step 10a: Create an SSH Signing CA
+
+```bash
+export API_KEY="mca_987zyx..."
+
+curl -X POST http://localhost:8080/api/v1/sshca/ \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-ssh-ca", "key_algo": "ed25519"}'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "id": "ssh-ca-uuid",
+  "name": "my-ssh-ca",
+  "key_algo": "ssh-ed25519",
+  "public_key": "ssh-ed25519 AAAA... mint-ca",
+  "status": "active"
+}
+```
+
+Save the `id` and the `public_key`.
+
+### Step 10b: Fetch the CA Public Key
+
+The public key is served unauthenticated so it is safe to fetch from any host you want to trust:
+
+```bash
+export SSH_CA_ID="ssh-ca-uuid"
+curl http://localhost:8080/pki/sshca/$SSH_CA_ID/public-key
+```
+
+This prints a single `ssh-ed25519 AAAA... mint-ca` line.
+
+### Step 10c: Configure Trust on a Server
+
+As root on the target server, add the CA public key so it trusts **user** certificates it signs:
+
+```bash
+curl http://localhost:8080/pki/sshca/$SSH_CA_ID/public-key \
+  > /etc/ssh/trusted-user-ca-keys.pem
+# add to /etc/ssh/sshd_config:
+#   TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem
+systemctl restart ssh
+```
+
+For **host** certificates, put the same line into each client's `known_hosts` as an `@cert-authority` entry:
+
+```
+@cert-authority *.example.com ssh-ed25519 AAAA... mint-ca
+```
+
+### Step 10d: Generate a Local Keypair and Sign It
+
+Keep the private key locally and submit only the public key to mint-ca. First generate a keypair on your workstation:
+
+```bash
+ssh-keygen -t ed25519 -f alice_id_ed25519 -N '' -C alice@example.com
+```
+
+Now request a **user** certificate signed by the CA. `provisioner_id` can be an existing approved provisioner, and principals are the usernames the cert is valid for:
+
+```bash
+export PROVISIONER_ID="your-provisioner-uuid"
+
+curl -X POST http://localhost:8080/api/v1/sshca/$SSH_CA_ID/sign/user \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provisioner_id": "'"$PROVISIONER_ID"'",
+    "public_key": "$(cut -d' ' -f1-2 alice_id_ed25519.pub)",
+    "principals": ["alice", "ops"],
+    "key_id": "alice",
+    "ttl_seconds": 28800
+  }'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "certificate": { "id": "cert-uuid", "ca_id": "ssh-ca-uuid", "serial": 42, "cert_type": "user", ... },
+  "cert_data": "ssh-ed25519-cert-v01@openssh.com AAAA..."
+}
+```
+
+Save `cert_data` to `alice_id_ed25519-cert.pub` (this is the OpenSSH `-cert.pub` file). The provided key is automatically-detected whether pasted as a full `authorized_keys` line or raw base64 wire format.
+
+### Step 10e: Connect Using the Certificate
+
+```bash
+ssh -i alice_id_ed25519 -o CertificateFile=alice_id_ed25519-cert.pub alice@somewhere
+```
+
+OpenSSH pairs the certificate with your private key and the server validates it against the CA trust configured in Step 10c.
+
+### Step 10f: List and Revoke SSH Certificates
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8080/api/v1/sshca/$SSH_CA_ID/certs
+
+curl -X PUT http://localhost:8080/api/v1/sshca/certs/cert-uuid/revoke \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Revoked SSH certificates are marked so servers can stop accepting them.
+
+---
+
+## 3.11 Additional Management Tasks
 
 ### Create an API Key for another user
 
@@ -314,7 +430,7 @@ curl http://localhost:8080/metrics
 
 ---
 
-## 3.11 Using ACME (Optional)
+## 3.12 Using ACME (Optional)
 
 If you enabled ACME (`MINT_ACME_ENABLED=true`), you can use any ACME client (like Certbot) with your mint‑ca instance.  
 The ACME endpoint is `/acme/{provisionerID}/directory`.  
@@ -348,7 +464,7 @@ certbot certonly --standalone --server http://localhost:8080/acme/provisioner-uu
 
 ---
 
-## 3.12 Troubleshooting Common Issues
+## 3.13 Troubleshooting Common Issues
 
 - **`401 Unauthorized`** – Check your `Authorization` header; it must be `Bearer <key>`.
 - **`403 Forbidden`** – Your API key may not have the required scope. Use `scopes: ["*"]` for full access.
@@ -359,7 +475,7 @@ certbot certonly --standalone --server http://localhost:8080/acme/provisioner-uu
 
 ---
 
-## 3.13 Next Steps
+## 3.14 Next Steps
 
 - Explore the full API using the [API Reference](Api.md).
 - Set up monitoring with Prometheus and Grafana.
