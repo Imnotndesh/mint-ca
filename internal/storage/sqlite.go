@@ -202,7 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_account_id ON acme_orders(account_id);
 
 CREATE TABLE IF NOT EXISTS acme_challenges (
 	id           TEXT NOT NULL PRIMARY KEY,
-	order_id     TEXT NOT NULL REFERENCES acme_orders(id) ON DELETE CASCADE,
+	order_id     TEXT REFERENCES acme_orders(id) ON DELETE CASCADE,
 	type         TEXT NOT NULL CHECK(type IN ('http-01','dns-01','tls-alpn-01')),
 	token        TEXT NOT NULL,
 	status       TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','valid','invalid')),
@@ -261,7 +261,18 @@ CREATE TABLE IF NOT EXISTS ssh_certificate_authorities (
 	status     TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
 	created_at DATETIME NOT NULL
 );
-
+CREATE TABLE IF NOT EXISTS acme_authorizations (
+    id               TEXT    NOT NULL PRIMARY KEY,
+    order_id         TEXT    REFERENCES acme_orders(id) ON DELETE CASCADE,
+    account_id       TEXT    REFERENCES acme_accounts(id) ON DELETE CASCADE,
+    identifier_type  TEXT    NOT NULL CHECK(identifier_type IN ('dns')),
+    identifier_value TEXT    NOT NULL,
+    status           TEXT    NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','valid','invalid')),
+    expires_at       DATETIME NOT NULL,
+    created_at       DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_authz_account_identifier
+    ON acme_authorizations(account_id, identifier_type, identifier_value);
 CREATE TABLE IF NOT EXISTS ssh_certificates (
 	id             TEXT    NOT NULL PRIMARY KEY,
 	ca_id          TEXT    NOT NULL REFERENCES ssh_certificate_authorities(id) ON DELETE RESTRICT,
@@ -339,6 +350,27 @@ func sqlToUUID(s *string) *uuid.UUID {
 		return nil
 	}
 	return &id
+}
+
+// uuidNullable converts a UUID to a nullable SQL value, treating uuid.Nil as NULL.
+func uuidNullable(id uuid.UUID) interface{} {
+	if id == uuid.Nil {
+		return nil
+	}
+	return id.String()
+}
+
+// sqlToUUIDValue parses a nullable string column back to a uuid.UUID,
+// returning uuid.Nil for NULL or invalid values.
+func sqlToUUIDValue(s *string) uuid.UUID {
+	if s == nil {
+		return uuid.Nil
+	}
+	id, err := uuid.Parse(*s)
+	if err != nil {
+		return uuid.Nil
+	}
+	return id
 }
 
 func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) error {
@@ -1115,7 +1147,7 @@ func (s *sqliteStore) CreateACMEChallenge(ctx context.Context, c *ACMEChallenge)
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO acme_challenges (id, order_id, authorization_id, type, token, status)
         VALUES (?, ?, ?, ?, ?, ?)`,
-		c.ID.String(), c.OrderID.String(), uuidToSQL(c.AuthorizationID),
+		c.ID.String(), uuidNullable(c.OrderID), uuidToSQL(c.AuthorizationID),
 		string(c.Type), c.Token, string(c.Status),
 	)
 	if err != nil {
@@ -1124,21 +1156,12 @@ func (s *sqliteStore) CreateACMEChallenge(ctx context.Context, c *ACMEChallenge)
 	return nil
 }
 
-func (s *sqliteStore) GetACMEChallenge(ctx context.Context, id uuid.UUID) (*ACMEChallenge, error) {
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, order_id, authorization_id, type, token, status, validated_at FROM acme_challenges WHERE id = ?`, id.String())
-	c, err := scanChallenge(row)
-	if err != nil {
-		return nil, fmt.Errorf("sqlite: GetACMEChallenge: %w", err)
-	}
-	return c, nil
-}
 func (s *sqliteStore) CreateACMEAuthorization(ctx context.Context, a *ACMEAuthorization) error {
 	_, err := s.db.ExecContext(ctx, `
         INSERT INTO acme_authorizations
-            (id, order_id, identifier_type, identifier_value, status, expires_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		a.ID.String(), a.OrderID.String(),
+            (id, order_id, account_id, identifier_type, identifier_value, status, expires_at, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.ID.String(), uuidNullable(a.OrderID), uuidNullable(a.AccountID),
 		a.IdentifierType, a.IdentifierValue,
 		string(a.Status), a.ExpiresAt.UTC(), a.CreatedAt.UTC(),
 	)
@@ -1148,22 +1171,47 @@ func (s *sqliteStore) CreateACMEAuthorization(ctx context.Context, a *ACMEAuthor
 	return nil
 }
 
-func (s *sqliteStore) GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*ACMEAuthorization, error) {
-	row := s.db.QueryRowContext(ctx, `
-        SELECT id, order_id, identifier_type, identifier_value, status, expires_at, created_at
-        FROM acme_authorizations WHERE id = ?`, id.String())
+const sqliteACMEAuthorizationSelect = `
+	SELECT id, order_id, account_id, identifier_type, identifier_value, status, expires_at, created_at
+	FROM acme_authorizations`
+
+func sqliteScanACMEAuthorization(row *sql.Row) (*ACMEAuthorization, error) {
 	var a ACMEAuthorization
-	var idStr, orderIDStr string
-	err := row.Scan(&idStr, &orderIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt)
+	var idStr string
+	var orderIDStr, accountIDStr *string
+	err := row.Scan(&idStr, &orderIDStr, &accountIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("sqlite: GetACMEAuthorization: %w", err)
+		return nil, err
 	}
 	a.ID = uuid.MustParse(idStr)
-	a.OrderID = uuid.MustParse(orderIDStr)
+	a.OrderID = sqlToUUIDValue(orderIDStr)
+	a.AccountID = sqlToUUIDValue(accountIDStr)
 	return &a, nil
+}
+
+func sqliteScanACMEAuthorizationRows(rows *sql.Rows) (*ACMEAuthorization, error) {
+	var a ACMEAuthorization
+	var idStr string
+	var orderIDStr, accountIDStr *string
+	if err := rows.Scan(&idStr, &orderIDStr, &accountIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt); err != nil {
+		return nil, err
+	}
+	a.ID = uuid.MustParse(idStr)
+	a.OrderID = sqlToUUIDValue(orderIDStr)
+	a.AccountID = sqlToUUIDValue(accountIDStr)
+	return &a, nil
+}
+
+func (s *sqliteStore) GetACMEAuthorization(ctx context.Context, id uuid.UUID) (*ACMEAuthorization, error) {
+	row := s.db.QueryRowContext(ctx, sqliteACMEAuthorizationSelect+" WHERE id = ?", id.String())
+	a, err := sqliteScanACMEAuthorization(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetACMEAuthorization: %w", err)
+	}
+	return a, nil
 }
 
 func (s *sqliteStore) UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status ACMEAuthorizationStatus) error {
@@ -1177,26 +1225,100 @@ func (s *sqliteStore) UpdateACMEAuthorizationStatus(ctx context.Context, id uuid
 }
 
 func (s *sqliteStore) ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEAuthorization, error) {
-	rows, err := s.db.QueryContext(ctx, `
-        SELECT id, order_id, identifier_type, identifier_value, status, expires_at, created_at
-        FROM acme_authorizations WHERE order_id = ?`, orderID.String())
+	rows, err := s.db.QueryContext(ctx,
+		sqliteACMEAuthorizationSelect+" WHERE order_id = ?", orderID.String())
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: ListAuthorizationsByOrder: %w", err)
 	}
 	defer rows.Close()
 	var out []*ACMEAuthorization
 	for rows.Next() {
-		var a ACMEAuthorization
-		var idStr, orderIDStr string
-		if err := rows.Scan(&idStr, &orderIDStr, &a.IdentifierType, &a.IdentifierValue, &a.Status, &a.ExpiresAt, &a.CreatedAt); err != nil {
+		a, err := sqliteScanACMEAuthorizationRows(rows)
+		if err != nil {
 			return nil, err
 		}
-		a.ID = uuid.MustParse(idStr)
-		a.OrderID = uuid.MustParse(orderIDStr)
-		out = append(out, &a)
+		out = append(out, a)
 	}
 	return out, rows.Err()
 }
+
+// GetACMEAuthorizationByIdentifier returns the most recent standalone
+// (order_id IS NULL) authorization for the given account + identifier.
+func (s *sqliteStore) GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*ACMEAuthorization, error) {
+	row := s.db.QueryRowContext(ctx,
+		sqliteACMEAuthorizationSelect+`
+		 WHERE order_id IS NULL AND account_id = ? AND identifier_type = ? AND identifier_value = ?
+		 ORDER BY created_at DESC LIMIT 1`,
+		accountID.String(), identifierType, identifierValue)
+	a, err := sqliteScanACMEAuthorization(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetACMEAuthorizationByIdentifier: %w", err)
+	}
+	return a, nil
+}
+
+// ListAuthorizationsByAccount returns standalone pre-authorizations for an
+// account, newest first.
+func (s *sqliteStore) ListAuthorizationsByAccount(ctx context.Context, accountID uuid.UUID) ([]*ACMEAuthorization, error) {
+	rows, err := s.db.QueryContext(ctx,
+		sqliteACMEAuthorizationSelect+`
+		 WHERE order_id IS NULL AND account_id = ?
+		 ORDER BY created_at DESC`,
+		accountID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListAuthorizationsByAccount: %w", err)
+	}
+	defer rows.Close()
+	var out []*ACMEAuthorization
+	for rows.Next() {
+		a, err := sqliteScanACMEAuthorizationRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+func (s *sqliteStore) GetACMEChallenge(ctx context.Context, id uuid.UUID) (*ACMEChallenge, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, order_id, authorization_id, type, token, status, validated_at FROM acme_challenges WHERE id = ?`, id.String())
+	c, err := scanChallenge(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetACMEChallenge: %w", err)
+	}
+	return c, nil
+}
+
+func scanChallenge(row *sql.Row) (*ACMEChallenge, error) {
+	var c ACMEChallenge
+	var idStr string
+	var orderIDStr, authIDStr *string
+	err := row.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.ID = uuid.MustParse(idStr)
+	c.OrderID = sqlToUUIDValue(orderIDStr)
+	c.AuthorizationID = sqlToUUID(authIDStr)
+	return &c, nil
+}
+
+func scanChallengeRows(rows *sql.Rows) (*ACMEChallenge, error) {
+	var c ACMEChallenge
+	var idStr string
+	var orderIDStr, authIDStr *string
+	if err := rows.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt); err != nil {
+		return nil, err
+	}
+	c.ID = uuid.MustParse(idStr)
+	c.OrderID = sqlToUUIDValue(orderIDStr)
+	c.AuthorizationID = sqlToUUID(authIDStr)
+	return &c, nil
+}
+
 func (s *sqliteStore) ListChallengesByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEChallenge, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, order_id, authorization_id, type, token, status, validated_at FROM acme_challenges WHERE order_id = ?`, orderID.String())
@@ -1214,19 +1336,6 @@ func (s *sqliteStore) ListChallengesByOrder(ctx context.Context, orderID uuid.UU
 	}
 	return out, rows.Err()
 }
-func scanChallengeRows(rows *sql.Rows) (*ACMEChallenge, error) {
-	var c ACMEChallenge
-	var idStr, orderIDStr string
-	var authIDStr *string
-	if err := rows.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt); err != nil {
-		return nil, err
-	}
-	c.ID = uuid.MustParse(idStr)
-	c.OrderID = uuid.MustParse(orderIDStr)
-	c.AuthorizationID = sqlToUUID(authIDStr)
-	return &c, nil
-}
-
 func (s *sqliteStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID, status ACMEChallengeStatus, validatedAt *time.Time) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE acme_challenges SET status = ?, validated_at = ? WHERE id = ?`,
@@ -1235,23 +1344,6 @@ func (s *sqliteStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID, s
 		return fmt.Errorf("sqlite: UpdateChallengeStatus: %w", err)
 	}
 	return nil
-}
-
-func scanChallenge(row *sql.Row) (*ACMEChallenge, error) {
-	var c ACMEChallenge
-	var idStr, orderIDStr string
-	var authIDStr *string
-	err := row.Scan(&idStr, &orderIDStr, &authIDStr, &c.Type, &c.Token, &c.Status, &c.ValidatedAt)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	c.ID = uuid.MustParse(idStr)
-	c.OrderID = uuid.MustParse(orderIDStr)
-	c.AuthorizationID = sqlToUUID(authIDStr)
-	return &c, nil
 }
 func (s *sqliteStore) WriteAuditLog(ctx context.Context, entry *AuditLog) error {
 	payload, _ := marshalJSON(entry.Payload)

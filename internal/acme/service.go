@@ -135,6 +135,85 @@ func NewService(
 	}
 }
 
+// preAuthExpiry is how long a standalone (pre-)authorization remains valid
+// before it must be re-created. Matches the order/authz TTL used in NewOrder.
+const preAuthExpiry = 24 * time.Hour
+
+// NewPreAuth creates (or reuses) a standalone authorization for a single
+// identifier, independent of any order — RFC 8555 §7.4.1.
+func (s *Service) NewPreAuth(
+	ctx context.Context,
+	account *storage.ACMEAccount,
+	provisioner *storage.Provisioner,
+	identifier Identifier,
+) (*storage.ACMEAuthorization, []*storage.ACMEChallenge, *Problem) {
+
+	if err := validateIdentifier(identifier); err != nil {
+		return nil, nil, NewProblem(ErrRejectedIdentifier, 400, err.Error())
+	}
+
+	var cfg ProvisionerConfig
+	_ = json.Unmarshal(mustMarshalJSON(provisioner.Config), &cfg)
+	cfg.SetDefaults()
+
+	now := time.Now().UTC()
+
+	// Reuse an existing valid, unexpired standalone authz for this
+	// account + identifier if one exists.
+	existing, err := s.store.GetACMEAuthorizationByIdentifier(ctx, account.ID, identifier.Type, identifier.Value)
+	if err != nil {
+		return nil, nil, ErrServerInternalProblem("look up existing pre-authorization: " + err.Error())
+	}
+	if existing != nil && existing.Status == storage.ACMEAuthorizationStatusValid && existing.ExpiresAt.After(now) {
+		challenges, err := s.store.ListChallengesByAuthorization(ctx, existing.ID)
+		if err != nil {
+			return nil, nil, ErrServerInternalProblem("list existing challenges: " + err.Error())
+		}
+		return existing, challenges, nil
+	}
+
+	expiresAt := now.Add(preAuthExpiry)
+	authID := uuid.New()
+	auth := &storage.ACMEAuthorization{
+		ID:              authID,
+		OrderID:         uuid.Nil, // standalone pre-authorization
+		AccountID:       account.ID,
+		IdentifierType:  identifier.Type,
+		IdentifierValue: identifier.Value,
+		Status:          storage.ACMEAuthorizationStatusPending,
+		ExpiresAt:       expiresAt,
+		CreatedAt:       now,
+	}
+	if err := s.store.CreateACMEAuthorization(ctx, auth); err != nil {
+		return nil, nil, ErrServerInternalProblem("create pre-authorization: " + err.Error())
+	}
+
+	var challenges []*storage.ACMEChallenge
+	for _, challType := range cfg.AllowedChallengeTypes {
+		if IsWildcardIdentifier(identifier.Value) && challType != string(storage.ACMEChallengeTypeDNS01) {
+			continue
+		}
+		token, err := generateToken()
+		if err != nil {
+			return nil, nil, ErrServerInternalProblem("generate challenge token: " + err.Error())
+		}
+		ch := &storage.ACMEChallenge{
+			ID:              uuid.New(),
+			OrderID:         uuid.Nil, // standalone pre-authorization challenge
+			AuthorizationID: &authID,
+			Type:            storage.ACMEChallengeType(challType),
+			Token:           token,
+			Status:          storage.ACMEChallengeStatusPending,
+		}
+		if err := s.store.CreateACMEChallenge(ctx, ch); err != nil {
+			return nil, nil, ErrServerInternalProblem("create challenge: " + err.Error())
+		}
+		challenges = append(challenges, ch)
+	}
+
+	return auth, challenges, nil
+}
+
 // IssueNonce generates and persists a fresh nonce.
 func (s *Service) IssueNonce(ctx context.Context) (string, error) {
 	return s.nonces.Issue(ctx)
@@ -516,14 +595,30 @@ func (s *Service) NewOrder(
 		return nil, nil, ErrServerInternalProblem("create order: " + err.Error())
 	}
 
-	// Create authorizations and challenges.
+	// Create authorizations and challenges — reusing any valid, unexpired
+	// standalone pre-authorization for this account+identifier if present.
 	var allChallenges []*storage.ACMEChallenge
 	for _, id := range identifiers {
+		existing, err := s.store.GetACMEAuthorizationByIdentifier(ctx, account.ID, id.Type, id.Value)
+		if err != nil {
+			return nil, nil, ErrServerInternalProblem("look up pre-authorization: " + err.Error())
+		}
+		if existing != nil && existing.Status == storage.ACMEAuthorizationStatusValid && existing.ExpiresAt.After(now) {
+			// Reuse: no new pending authz/challenges needed for this identifier.
+			existingChallenges, err := s.store.ListChallengesByAuthorization(ctx, existing.ID)
+			if err != nil {
+				return nil, nil, ErrServerInternalProblem("list reused challenges: " + err.Error())
+			}
+			allChallenges = append(allChallenges, existingChallenges...)
+			continue
+		}
+
 		// Create authorization for this identifier.
 		authID := uuid.New()
 		auth := &storage.ACMEAuthorization{
 			ID:              authID,
 			OrderID:         order.ID,
+			AccountID:       account.ID,
 			IdentifierType:  id.Type,
 			IdentifierValue: id.Value,
 			Status:          storage.ACMEAuthorizationStatusPending,
@@ -597,6 +692,32 @@ func (s *Service) ValidateChallenge(
 		return ch, nil
 	}
 
+	if ch.OrderID == uuid.Nil {
+		// Standalone pre-authorization challenge — resolve ownership via the
+		// authorization instead of an order.
+		if ch.AuthorizationID == nil {
+			return nil, ErrServerInternalProblem("standalone challenge has no authorization")
+		}
+		auth, err := s.store.GetACMEAuthorization(ctx, *ch.AuthorizationID)
+		if err != nil {
+			return nil, ErrServerInternalProblem("load authorization: " + err.Error())
+		}
+		if auth == nil {
+			return nil, NewProblem(ErrMalformed, 404, "authorization not found")
+		}
+		if auth.AccountID != account.ID {
+			return nil, ErrUnauthorizedProblem("challenge does not belong to your account")
+		}
+
+		go func() {
+			time.Sleep(1 * time.Second)
+			bgCtx := context.Background()
+			s.performPreAuthValidation(bgCtx, account, ch, auth)
+		}()
+
+		return ch, nil
+	}
+
 	order, err := s.store.GetACMEOrder(ctx, ch.OrderID)
 	if err != nil {
 		return nil, ErrServerInternalProblem("load order: " + err.Error())
@@ -612,6 +733,61 @@ func (s *Service) ValidateChallenge(
 	}()
 
 	return ch, nil
+}
+
+// performPreAuthValidation validates a standalone pre-authorization
+// challenge. Unlike performValidation, there is no order to update — only
+// the challenge and its authorization.
+func (s *Service) performPreAuthValidation(
+	ctx context.Context,
+	account *storage.ACMEAccount,
+	ch *storage.ACMEChallenge,
+	auth *storage.ACMEAuthorization,
+) {
+	domain := auth.IdentifierValue
+
+	acctJWKRaw, err := json.Marshal(account.KeyJWK)
+	if err != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+	keyAuth, err := KeyAuthorization(ch.Token, acctJWKRaw)
+	if err != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+
+	var valErr error
+	switch ch.Type {
+	case storage.ACMEChallengeTypeHTTP01:
+		valErr = s.http01.Validate(ctx, domain, ch.Token, keyAuth)
+	case storage.ACMEChallengeTypeDNS01:
+		digest := DNS01DigestAuthorization(keyAuth)
+		valErr = s.dns01.Validate(ctx, domain, digest)
+	default:
+		valErr = fmt.Errorf("unsupported challenge type %q", ch.Type)
+	}
+
+	now := time.Now().UTC()
+	if valErr != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+
+	if err := s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusValid, &now); err != nil {
+		slog.Error("failed to update challenge status", "challenge_id", ch.ID, "err", err)
+		return
+	}
+
+	if err := s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusValid); err != nil {
+		slog.Error("failed to update authorization status", "auth_id", auth.ID, "err", err)
+		return
+	}
+
+	slog.Info("pre-authorization challenge validated", "challenge_id", ch.ID, "auth_id", auth.ID)
 }
 func (s *Service) performValidation(
 	ctx context.Context,

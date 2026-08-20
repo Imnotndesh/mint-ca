@@ -366,3 +366,11 @@ func (f *caFakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) er
 	caNotImplemented("RevokeSSHCertificate")
 	return nil
 }
+func (f *caFakeStore) GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*storage.ACMEAuthorization, error) {
+	caNotImplemented("GetACMEAuthorizationByIdentifier")
+	return nil, nil
+}
+func (f *caFakeStore) ListAuthorizationsByAccount(ctx context.Context, accountID uuid.UUID) ([]*storage.ACMEAuthorization, error) {
+	caNotImplemented("ListAuthorizationsByAccount")
+	return nil, nil
+}
