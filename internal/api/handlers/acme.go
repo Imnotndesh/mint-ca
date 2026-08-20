@@ -48,6 +48,7 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/new-account", h.newAccount)
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/new-order", h.newOrder)
+		r.Post("/new-authz", h.newAuthz)
 		r.Post("/order/{orderID}", h.getOrder)
 		r.Post("/order/{orderID}/authz/{index}", h.getAuthorization)
 		r.Post("/order/{orderID}/finalize", h.finalizeOrder)
@@ -91,7 +92,6 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse JWS to authenticate the account (POST-as-GET)
 	jws, hdr, prob := parseJWS(r)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
@@ -111,7 +111,6 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load the authorization
 	auth, err := h.store.GetACMEAuthorization(ctx, authID)
 	if err != nil {
 		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load authorization: "+err.Error()))
@@ -122,48 +121,32 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the authorization belongs to an order of this account
-	order, err := h.store.GetACMEOrder(ctx, auth.OrderID)
-	if err != nil {
-		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load order: "+err.Error()))
-		return
-	}
-	if order == nil || order.AccountID != account.ID {
-		h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("authorization does not belong to your account"))
-		return
+	// Ownership check: standalone pre-auths carry AccountID directly;
+	// order-bound authz ownership is verified via the parent order.
+	if auth.OrderID == uuid.Nil {
+		if auth.AccountID != account.ID {
+			h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("authorization does not belong to your account"))
+			return
+		}
+	} else {
+		order, err := h.store.GetACMEOrder(ctx, auth.OrderID)
+		if err != nil {
+			h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load order: "+err.Error()))
+			return
+		}
+		if order == nil || order.AccountID != account.ID {
+			h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("authorization does not belong to your account"))
+			return
+		}
 	}
 
-	// Fetch challenges for this authorization
 	challenges, err := h.store.ListChallengesByAuthorization(ctx, auth.ID)
 	if err != nil {
 		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("list challenges: "+err.Error()))
 		return
 	}
 
-	// Build challenge objects
-	challengeObjs := make([]map[string]interface{}, len(challenges))
-	for i, c := range challenges {
-		challengeObjs[i] = map[string]interface{}{
-			"type":   string(c.Type),
-			"url":    h.service.ChallengeURL(prov.ID, c.ID),
-			"token":  c.Token,
-			"status": string(c.Status),
-		}
-	}
-
-	// Build response
-	resp := map[string]interface{}{
-		"status":  string(auth.Status),
-		"expires": auth.ExpiresAt.Format(time.RFC3339),
-		"identifier": map[string]string{
-			"type":  auth.IdentifierType,
-			"value": auth.IdentifierValue,
-		},
-		"challenges": challengeObjs,
-		"wildcard":   internalacme.IsWildcardIdentifier(auth.IdentifierValue),
-	}
-
-	h.acmeWriteJSON(w, r, http.StatusOK, resp)
+	h.acmeWriteJSON(w, r, http.StatusOK, h.authzResponse(prov.ID, auth, challenges))
 }
 func (h *ACMEHandler) listOrders(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
@@ -348,13 +331,86 @@ func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 		"newNonce":   base + "/new-nonce",
 		"newAccount": base + "/new-account",
 		"newOrder":   base + "/new-order",
+		"newAuthz":   base + "/new-authz",
 		"meta": map[string]interface{}{
 			"externalAccountRequired": cfg.EABRequired,
 			"website":                 h.cfg.BaseURL,
 		},
 	})
 }
+func (h *ACMEHandler) newAuthz(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
 
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	payloadBytes, err := jws.PayloadBytes()
+	if err != nil || payloadBytes == nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("new-authz requires a payload"))
+		return
+	}
+	var payload struct {
+		Identifier internalacme.Identifier `json:"identifier"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode new-authz payload: "+err.Error()))
+		return
+	}
+
+	auth, challenges, prob := h.service.NewPreAuth(ctx, account, prov, payload.Identifier)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	authURL := h.service.AuthorizationURL(prov.ID, auth.ID)
+	w.Header().Set("Location", authURL)
+	h.acmeWriteJSON(w, r, http.StatusCreated, h.authzResponse(prov.ID, auth, challenges))
+}
+
+func (h *ACMEHandler) authzResponse(provisionerID uuid.UUID, auth *storage.ACMEAuthorization, challenges []*storage.ACMEChallenge) map[string]interface{} {
+	challengeObjs := make([]map[string]interface{}, len(challenges))
+	for i, c := range challenges {
+		challengeObjs[i] = map[string]interface{}{
+			"type":   string(c.Type),
+			"url":    h.service.ChallengeURL(provisionerID, c.ID),
+			"token":  c.Token,
+			"status": string(c.Status),
+		}
+	}
+	return map[string]interface{}{
+		"status":  string(auth.Status),
+		"expires": auth.ExpiresAt.Format(time.RFC3339),
+		"identifier": map[string]string{
+			"type":  auth.IdentifierType,
+			"value": auth.IdentifierValue,
+		},
+		"challenges": challengeObjs,
+		"wildcard":   internalacme.IsWildcardIdentifier(auth.IdentifierValue),
+	}
+}
 func (h *ACMEHandler) newNonce(w http.ResponseWriter, r *http.Request) {
 	nonce, err := h.service.IssueNonce(r.Context())
 	if err != nil {

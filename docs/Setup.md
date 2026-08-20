@@ -18,7 +18,7 @@ It covers both Docker and single‑binary deployment, all environment variables,
 Pull the image from the container registry (replace with your actual registry):
 
 ```bash
-docker pull ghcr.io/your-org/mint-ca:latest
+docker pull ghcr.io/imnotndesh/mint-ca:latest
 ```
 
 Run a container:
@@ -33,7 +33,7 @@ docker run -d \
   -e MINT_ACME_BASE_URL=https://ca.example.com:8443 \
   -e MINT_TLS_CERT=/data/server.crt \
   -e MINT_TLS_KEY=/data/server.key \
-  ghcr.io/your-org/mint-ca:latest
+  ghcr.io/imnotndesh/mint-ca:latest
 ```
 
 **Explanation of flags**:
@@ -44,7 +44,7 @@ docker run -d \
 
 **Upgrading**:
 ```bash
-docker pull ghcr.io/your-org/mint-ca:latest
+docker pull ghcr.io/imnotndesh/mint-ca:latest
 docker stop mint-ca && docker rm mint-ca
 docker run ...   # same arguments as before
 ```
@@ -54,7 +54,7 @@ docker run ...   # same arguments as before
 Download the binary from the [GitHub Releases](https://github.com/imnotndesh/mint-ca/releases) page:
 
 ```bash
-wget https://github.com/your-org/mint-ca/releases/download/v0.1.0/mint-ca-linux-amd64
+wget https://github.com/imnotndesh/mint-ca/releases/download/v0.1.0/mint-ca-linux-amd64
 chmod +x mint-ca-linux-amd64
 ```
 

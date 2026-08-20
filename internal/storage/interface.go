@@ -178,6 +178,7 @@ const (
 type ACMEAuthorization struct {
 	ID              uuid.UUID               `json:"id"`
 	OrderID         uuid.UUID               `json:"order_id"`
+	AccountID       uuid.UUID               `json:"account_id"`
 	IdentifierType  string                  `json:"identifier_type"`
 	IdentifierValue string                  `json:"identifier_value"`
 	Status          ACMEAuthorizationStatus `json:"status"`
@@ -485,7 +486,8 @@ type Store interface {
 	UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status ACMEAuthorizationStatus) error
 	ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEAuthorization, error)
 	ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*ACMEChallenge, error)
-
+	GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*ACMEAuthorization, error)
+	ListAuthorizationsByAccount(ctx context.Context, accountID uuid.UUID) ([]*ACMEAuthorization, error)
 	// (Update CreateACMEChallenge to use the new struct)
 
 	// PruneExpiredNonces removes nonces past their expiry timestamp.
@@ -517,6 +519,7 @@ type Store interface {
 	// RevokeSSHCertificate marks an SSH certificate revoked. Schema/plumbing
 	// only in phase 1 — no API endpoint wired up to it yet.
 	RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error
+
 	// Close releases all connections held by the store.
 	Close() error
 }

@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -468,4 +469,42 @@ func (f *fakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID)
 func (f *fakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
 	notImplemented("RevokeSSHCertificate")
 	return nil
+}
+
+// GetACMEAuthorizationByIdentifier returns the most recent standalone
+// (OrderID == uuid.Nil) authorization for the given account + identifier.
+func (f *fakeStore) GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*storage.ACMEAuthorization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var best *storage.ACMEAuthorization
+	for _, a := range f.authorizations {
+		if a.OrderID != uuid.Nil {
+			continue
+		}
+		if a.AccountID != accountID {
+			continue
+		}
+		if a.IdentifierType != identifierType || a.IdentifierValue != identifierValue {
+			continue
+		}
+		if best == nil || a.CreatedAt.After(best.CreatedAt) {
+			best = a
+		}
+	}
+	return best, nil
+}
+
+// ListAuthorizationsByAccount returns standalone pre-authorizations for an
+// account, newest first.
+func (f *fakeStore) ListAuthorizationsByAccount(ctx context.Context, accountID uuid.UUID) ([]*storage.ACMEAuthorization, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.ACMEAuthorization
+	for _, a := range f.authorizations {
+		if a.OrderID == uuid.Nil && a.AccountID == accountID {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
+	return out, nil
 }

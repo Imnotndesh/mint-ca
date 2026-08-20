@@ -338,5 +338,13 @@ func (f *fakeStore) PruneExpiredNonces(ctx context.Context) error {
 	notImplemented("PruneExpiredNonces")
 	return nil
 }
+func (f *fakeStore) GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*storage.ACMEAuthorization, error) {
+	notImplemented("GetACMEAuthorizationByIdentifier")
+	return nil, nil
+}
+func (f *fakeStore) ListAuthorizationsByAccount(ctx context.Context, accountID uuid.UUID) ([]*storage.ACMEAuthorization, error) {
+	notImplemented("ListAuthorizationsByAccount")
+	return nil, nil
+}
 
 var errNotFound = fmt.Errorf("sshca fakeStore: record not found")
