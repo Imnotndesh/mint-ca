@@ -242,16 +242,6 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	created_at DATETIME NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS acme_authorizations (
-    id               TEXT    NOT NULL PRIMARY KEY,
-    order_id         TEXT    NOT NULL REFERENCES acme_orders(id) ON DELETE CASCADE,
-    identifier_type  TEXT    NOT NULL CHECK(identifier_type IN ('dns')),
-    identifier_value TEXT    NOT NULL,
-    status           TEXT    NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','valid','invalid')),
-    expires_at       DATETIME NOT NULL,
-    created_at       DATETIME NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS ssh_certificate_authorities (
 	id         TEXT    NOT NULL PRIMARY KEY,
 	name       TEXT    NOT NULL UNIQUE,
