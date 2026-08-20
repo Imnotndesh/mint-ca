@@ -457,7 +457,36 @@ curl -X POST http://localhost:8080/api/v1/provisioners \
 
 After creation, the directory URL becomes `http://localhost:8080/acme/{provisioner-uuid}/directory`.  
 You can then use Certbot:
+## 3.12a Rolling Over an ACME Account Key
 
+If a client's account key is compromised or being rotated on a schedule, use `keyChange` instead of creating a new account. This preserves the account's order/authorization history.
+
+The outer request is signed with the **current** key (like any authenticated ACME call); it wraps an inner JWS signed with the **new** key:
+
+```bash
+# Pseudocode — most ACME client libraries (certbot, acme.sh, etc.) implement
+# this automatically via an "account key rollover" command.
+POST /acme/{provisionerID}/key-change
+{
+  "protected": "<base64url: {alg, nonce, url, kid: accountURL}>",
+  "payload": "<base64url of the INNER JWS object below>",
+  "signature": "<signed with OLD key>"
+}
+
+# inner JWS (embedded as the outer payload, base64url-encoded):
+{
+  "protected": "<base64url: {alg, jwk: NEW_PUBLIC_KEY}>",
+  "payload": "<base64url: {\"account\": \"<accountURL>\", \"oldKey\": <OLD_PUBLIC_KEY_JWK>}>",
+  "signature": "<signed with NEW key>"
+}
+```
+
+**Response (200 OK):** empty body — the account's key is now the new key.
+
+**Notes:**
+- The old key is permanently retired: it can never be used as a *new* account key again, by this account or any other, even after this rollover.
+- Rolling to a key already registered on another account is rejected (`409`-style malformed problem).
+- Limited to 5 rollovers/hour per account.
 ```bash
 certbot certonly --standalone --server http://localhost:8080/acme/provisioner-uuid/directory -d example.com
 ```

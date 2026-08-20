@@ -104,6 +104,11 @@ Default values are shown; variables marked **Required** must be set.
 | **Logging** | | | |
 | `MINT_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error`. | `info` | No |
 | `MINT_LOG_JSON` | Output logs as JSON (structured) instead of human‑readable. | `false` | No |
+| **Rate Limiting** (first-boot only — ignored after DB row exists) | | | |
+| `MINT_RATELIMIT_NEW_ACCOUNT_WINDOW_SECONDS` / `MINT_RATELIMIT_NEW_ACCOUNT_MAX` | Override for `acme_new_account_per_ip` | 3600s / 10 | No |
+| `MINT_RATELIMIT_NEW_ORDER_WINDOW_SECONDS` / `MINT_RATELIMIT_NEW_ORDER_MAX` | Override for `acme_new_order_per_account` | 3600s / 50 | No |
+| `MINT_RATELIMIT_NEW_AUTHZ_WINDOW_SECONDS` / `MINT_RATELIMIT_NEW_AUTHZ_MAX` | Override for `acme_new_authz_per_account` | 3600s / 50 | No |
+| `MINT_RATELIMIT_APIKEY_WINDOW_SECONDS` / `MINT_RATELIMIT_APIKEY_MAX` | Override for `apikey_requests_per_key` | 60s / 300 | No |
 
 \* Required when `MINT_TLS_DISABLED` is `false` (the default). If you set `MINT_TLS_DISABLED=true`, these become optional.
 
@@ -202,8 +207,17 @@ export MINT_ACME_BASE_URL=http://localhost:8080   # note: http for dev
 
 The server will start in setup mode; follow the steps to create the root CA and a permanent API key.  
 After that, you can use `curl` with the new key to manage certificates.
+## 2.7 Rate Limiting
 
-## 2.7 Production Considerations
+On first boot, mint-ca seeds four default rate limiters into the database (see Api.md §1.13). The `MINT_RATELIMIT_*` env vars above only take effect the very first time — they seed the initial row and are never re-applied, so a value edited later (directly in the DB, or via a future web UI) is never clobbered by a container restart with different env vars.
+
+To adjust limits after first boot, update the `rate_limit_configs` table directly:
+```sql
+UPDATE rate_limit_configs SET max_requests = 20, window_seconds = 3600
+WHERE name = 'acme_new_account_per_ip';
+```
+Changes take effect on the next process restart (configs are loaded into memory at boot).
+## 2.8 Production Considerations
 
 - **TLS**: Always run with TLS enabled (`MINT_TLS_DISABLED=false`, the default). Provide a valid certificate and key (from a trusted CA or your own root).  
   mint‑ca will use these files to serve HTTPS. If they are missing during the first boot, it generates a self‑signed certificate to get through setup, but you must replace it after the root CA is created.
@@ -214,7 +228,7 @@ After that, you can use `curl` with the new key to manage certificates.
 - **Monitoring**: The `/metrics` endpoint provides Prometheus metrics. Scrape it from your monitoring system.
 - **Logging**: Use `MINT_LOG_JSON=true` and forward logs to a central system.
 
-## 2.8 Troubleshooting
+## 2.9 Troubleshooting
 
 - **“missing Authorization header”** when accessing `/api/v1` → you forgot the `Bearer` token.
 - **“invalid API key”** → the key is wrong or expired. Generate a new one via `/api/v1/apikeys`.

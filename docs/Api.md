@@ -463,9 +463,10 @@ Authentication is done via the JWS signature.
 | `/acme/{provisionerID}/order/{orderID}/finalize` | POST | Finalize order with CSR |
 | `/acme/{provisionerID}/challenge/{challengeID}` | POST | Notify server that challenge is ready |
 | `/acme/{provisionerID}/certificate/{certID}` | POST | Download issued certificate |
+| `/acme/{provisionerID}/key-change` | POST | Roll account over to a new key (RFC 8555 §7.3.5) |
 
 See [RFC 8555](https://tools.ietf.org/html/rfc8555) for the exact JWS payloads.  
-The directory response contains URLs for all operations.
+The directory response also includes `"keyChange"` alongside `newNonce`, `newAccount`, `newOrder`, `newAuthz`.
 
 ---
 
@@ -485,3 +486,45 @@ Request body:
 { "name": "admin", "scopes": ["*"] }
 ```
 Response includes the new API key (store it) and CA chain URL.
+### ACME Key Rollover
+
+`POST /acme/{provisionerID}/key-change`
+
+Outer JWS is signed with the account's **current** key and authenticated via `kid` (same as any other authenticated ACME request). The outer payload is itself a JWS, signed with the **new** key using an inline `jwk` header (no `kid`):
+
+**Inner JWS payload**
+```json
+{
+  "account": "https://ca.example.com/acme/{provisionerID}/account/{accountID}",
+  "oldKey": { "kty": "EC", "crv": "P-256", "x": "...", "y": "..." }
+}
+```
+
+**Response (200 OK)** — empty body, standard ACME headers (`Replay-Nonce`).
+
+Rejected with `urn:ietf:params:acme:error:malformed` if:
+- inner `account` URL doesn't match the authenticated account,
+- inner `oldKey` doesn't match the account's current key,
+- the new key is already registered to another account,
+- the new key was previously retired by any account's rollover (once a key is rolled off, it can never be reused — standard CA practice).
+
+Subject to the `acme_key_change_per_account` rate limiter (default: 5/hour).
+## 1.13 Rate Limiting
+
+mint-ca enforces per-limiter request quotas using a fixed-window algorithm. Limits apply to:
+
+| Limiter | Scope | Default | Purpose |
+|---|---|---|---|
+| `acme_new_account_per_ip` | client IP | 10/hour | ACME `new-account` |
+| `acme_new_order_per_account` | ACME account | 50/hour | ACME `new-order`, `new-authz` |
+| `acme_new_authz_per_account` | ACME account | 50/hour | reserved (currently shares the new-order limiter at call sites) |
+| `acme_key_change_per_account` | ACME account | 5/hour | ACME `key-change` |
+| `apikey_requests_per_key` | API key | 300/min | all `/api/v1/*` management endpoints |
+
+When a limit is exceeded:
+- ACME endpoints return an RFC 8555 `urn:ietf:params:acme:error:rateLimited` problem, HTTP 429, with a `Retry-After` header.
+- Management API endpoints return `{"error":"rate limit exceeded","retry_after_seconds":N}`, HTTP 429, with `Retry-After`.
+
+Every rejection is written to the audit log as event type `rate_limit_exceeded`.
+
+Defaults can be overridden on **first boot only** (a value is never overwritten once a database row exists — see Setup.md). After first boot, editing limiter configs requires direct database access; a management API for this is planned but not yet implemented.
