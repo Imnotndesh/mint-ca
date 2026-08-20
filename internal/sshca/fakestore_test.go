@@ -346,5 +346,29 @@ func (f *fakeStore) ListAuthorizationsByAccount(ctx context.Context, accountID u
 	notImplemented("ListAuthorizationsByAccount")
 	return nil, nil
 }
+func (f *fakeStore) GetRateLimitConfig(ctx context.Context, name string) (*storage.RateLimitConfig, error) {
+	notImplemented("GetRateLimitConfig")
+	return nil, nil
+}
+func (f *fakeStore) ListRateLimitConfigs(ctx context.Context) ([]*storage.RateLimitConfig, error) {
+	notImplemented("ListRateLimitConfigs")
+	return nil, nil
+}
+func (f *fakeStore) UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	notImplemented("UpsertRateLimitConfigIfAbsent")
+	return nil
+}
+func (f *fakeStore) UpdateRateLimitConfig(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	notImplemented("UpdateRateLimitConfig")
+	return nil
+}
+func (f *fakeStore) IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error {
+	notImplemented("IncrementRateLimitCounter")
+	return nil
+}
+func (f *fakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
+	notImplemented("PruneExpiredRateLimitCounters")
+	return nil
+}
 
 var errNotFound = fmt.Errorf("sshca fakeStore: record not found")

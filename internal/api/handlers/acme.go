@@ -5,7 +5,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	apimiddleware "mint-ca/internal/api/middleware"
+	"mint-ca/internal/ratelimit"
 	"net/http"
+	"strconv"
 	"time"
 
 	internalacme "mint-ca/internal/acme"
@@ -23,6 +26,7 @@ type ACMEHandler struct {
 	engine  *ca.Engine
 	service *internalacme.Service
 	cfg     config.ACMEConfig
+	rl      *ratelimit.Engine
 }
 
 func NewACMEHandler(
@@ -30,12 +34,14 @@ func NewACMEHandler(
 	engine *ca.Engine,
 	svc *internalacme.Service,
 	cfg config.ACMEConfig,
+	rl *ratelimit.Engine,
 ) *ACMEHandler {
 	return &ACMEHandler{
 		store:   store,
 		engine:  engine,
 		service: svc,
 		cfg:     cfg,
+		rl:      rl,
 	}
 }
 
@@ -312,6 +318,30 @@ func requestURL(r *http.Request, cfg config.ACMEConfig) string {
 	return cfg.BaseURL + r.URL.Path
 }
 
+// checkRateLimit evaluates a limiter and, if exceeded, writes the ACME
+// rateLimited problem response (RFC 8555 §6.7 / §8.7) with Retry-After.
+// Returns true if the request was rejected (caller should return
+// immediately without further processing).
+func (h *ACMEHandler) checkRateLimit(w http.ResponseWriter, r *http.Request, limiterName, bucketKey, actor string) bool {
+	allowed, retryAfter, err := h.rl.Check(r.Context(), limiterName, bucketKey)
+	if err != nil {
+		// Misconfigured limiter — fail open, already logged inside Check's
+		// caller responsibility; don't block ACME traffic on a config bug.
+		return false
+	}
+	if !allowed {
+		apimiddleware.WriteRateLimitAudit(h.store, actor, limiterName, bucketKey)
+		nonce, _ := h.service.IssueNonce(r.Context())
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		internalacme.WriteProblem(w, nonce, internalacme.NewProblem(
+			internalacme.ErrRateLimited,
+			http.StatusTooManyRequests,
+			fmt.Sprintf("rate limit exceeded for %s; retry after %d seconds", limiterName, int(retryAfter.Seconds())),
+		))
+		return true
+	}
+	return false
+}
 func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 	prov, prob := h.loadProvisioner(r)
 	if prob != nil {
@@ -363,6 +393,9 @@ func (h *ACMEHandler) newAuthz(w http.ResponseWriter, r *http.Request) {
 	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_new_order_per_account", account.ID.String(), account.ID.String()) {
 		return
 	}
 
@@ -431,6 +464,9 @@ func (h *ACMEHandler) newAccount(w http.ResponseWriter, r *http.Request) {
 	prov, prob := h.loadProvisioner(r)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_new_account_per_ip", r.RemoteAddr, r.RemoteAddr) {
 		return
 	}
 
@@ -586,6 +622,9 @@ func (h *ACMEHandler) newOrder(w http.ResponseWriter, r *http.Request) {
 	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_new_order_per_account", account.ID.String(), account.ID.String()) {
 		return
 	}
 

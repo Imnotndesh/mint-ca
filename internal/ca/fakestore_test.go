@@ -374,3 +374,27 @@ func (f *caFakeStore) ListAuthorizationsByAccount(ctx context.Context, accountID
 	caNotImplemented("ListAuthorizationsByAccount")
 	return nil, nil
 }
+func (f *caFakeStore) GetRateLimitConfig(ctx context.Context, name string) (*storage.RateLimitConfig, error) {
+	caNotImplemented("GetRateLimitConfig")
+	return nil, nil
+}
+func (f *caFakeStore) ListRateLimitConfigs(ctx context.Context) ([]*storage.RateLimitConfig, error) {
+	caNotImplemented("ListRateLimitConfigs")
+	return nil, nil
+}
+func (f *caFakeStore) UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	caNotImplemented("UpsertRateLimitConfigIfAbsent")
+	return nil
+}
+func (f *caFakeStore) UpdateRateLimitConfig(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	caNotImplemented("UpdateRateLimitConfig")
+	return nil
+}
+func (f *caFakeStore) IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error {
+	caNotImplemented("IncrementRateLimitCounter")
+	return nil
+}
+func (f *caFakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
+	caNotImplemented("PruneExpiredRateLimitCounters")
+	return nil
+}

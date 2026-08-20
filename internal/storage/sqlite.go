@@ -290,6 +290,24 @@ CREATE TABLE IF NOT EXISTS ssh_certificates (
 	requester      TEXT    NOT NULL DEFAULT '',
 	created_at     DATETIME NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rate_limit_configs (
+    name           TEXT NOT NULL PRIMARY KEY,
+    scope          TEXT NOT NULL,
+    algorithm      TEXT NOT NULL DEFAULT 'fixed_window',
+    window_seconds INTEGER NOT NULL,
+    max_requests   INTEGER NOT NULL,
+    enabled        INTEGER NOT NULL DEFAULT 1,
+    updated_at     DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rate_limit_counters (
+    limiter_name TEXT NOT NULL,
+    bucket_key   TEXT NOT NULL,
+    window_start DATETIME NOT NULL,
+    count        INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (limiter_name, bucket_key, window_start)
+);
+CREATE INDEX IF NOT EXISTS idx_rl_counters_window_start ON rate_limit_counters(window_start);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_certs_ca_serial ON ssh_certificates(ca_id, serial);
 
 `
@@ -1782,6 +1800,113 @@ func (s *sqliteStore) ConsumeNonce(ctx context.Context, nonce string) (bool, err
 		return false, fmt.Errorf("sqlite: ConsumeNonce: commit: %w", err)
 	}
 	return true, nil
+}
+func (s *sqliteStore) GetRateLimitConfig(ctx context.Context, name string) (*RateLimitConfig, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT name, scope, algorithm, window_seconds, max_requests, enabled, updated_at
+		FROM rate_limit_configs WHERE name = ?`, name)
+	c, err := scanRateLimitConfig(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetRateLimitConfig: %w", err)
+	}
+	return c, nil
+}
+
+func (s *sqliteStore) ListRateLimitConfigs(ctx context.Context) ([]*RateLimitConfig, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, scope, algorithm, window_seconds, max_requests, enabled, updated_at
+		FROM rate_limit_configs ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListRateLimitConfigs: %w", err)
+	}
+	defer rows.Close()
+	var out []*RateLimitConfig
+	for rows.Next() {
+		var c RateLimitConfig
+		var enabledInt int
+		if err := rows.Scan(&c.Name, &c.Scope, &c.Algorithm, &c.WindowSeconds, &c.MaxRequests, &enabledInt, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		c.Enabled = enabledInt == 1
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *RateLimitConfig) error {
+	enabled := 0
+	if cfg.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO rate_limit_configs
+			(name, scope, algorithm, window_seconds, max_requests, enabled, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(name) DO NOTHING`,
+		cfg.Name, cfg.Scope, cfg.Algorithm, cfg.WindowSeconds, cfg.MaxRequests, enabled, cfg.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpsertRateLimitConfigIfAbsent: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) UpdateRateLimitConfig(ctx context.Context, cfg *RateLimitConfig) error {
+	enabled := 0
+	if cfg.Enabled {
+		enabled = 1
+	}
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE rate_limit_configs SET
+			scope = ?, algorithm = ?, window_seconds = ?, max_requests = ?, enabled = ?, updated_at = ?
+		WHERE name = ?`,
+		cfg.Scope, cfg.Algorithm, cfg.WindowSeconds, cfg.MaxRequests, enabled, cfg.UpdatedAt.UTC(),
+		cfg.Name,
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateRateLimitConfig: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateRateLimitConfig: limiter %q not found", cfg.Name)
+	}
+	return nil
+}
+
+func scanRateLimitConfig(row *sql.Row) (*RateLimitConfig, error) {
+	var c RateLimitConfig
+	var enabledInt int
+	err := row.Scan(&c.Name, &c.Scope, &c.Algorithm, &c.WindowSeconds, &c.MaxRequests, &enabledInt, &c.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	c.Enabled = enabledInt == 1
+	return &c, nil
+}
+
+func (s *sqliteStore) IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO rate_limit_counters (limiter_name, bucket_key, window_start, count)
+		VALUES (?, ?, ?, 1)
+		ON CONFLICT(limiter_name, bucket_key, window_start) DO UPDATE SET
+			count = count + 1`,
+		limiterName, bucketKey, windowStart.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: IncrementRateLimitCounter: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM rate_limit_counters WHERE window_start < ?`, olderThan.UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: PruneExpiredRateLimitCounters: %w", err)
+	}
+	return nil
 }
 func (s *sqliteStore) PruneExpiredNonces(ctx context.Context) error {
 	_, err := s.db.ExecContext(ctx,
