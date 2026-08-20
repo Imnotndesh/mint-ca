@@ -38,5 +38,13 @@ func DefaultConfigs() []LimiterConfig {
 			MaxRequests:   300,
 			Enabled:       true,
 		},
+		{
+			Name:          "acme_key_change_per_account",
+			Scope:         "account",
+			Algorithm:     "fixed_window",
+			WindowSeconds: 3600,
+			MaxRequests:   5,
+			Enabled:       true,
+		},
 	}
 }

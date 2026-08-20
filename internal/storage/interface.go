@@ -557,6 +557,18 @@ type Store interface {
 	// PruneExpiredRateLimitCounters deletes counter rows whose window
 	// started before olderThan.
 	PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error
+	// --- Add to Store interface ---
+
+	// UpdateACMEAccountKey swaps an account's key_id/key_jwk (key rollover).
+	UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK JSON) error
+
+	// MarkKeyIDRetired permanently blocks a JWK thumbprint from being used as
+	// a NEW account key again (common CA practice: an old key from a rollover
+	// can never come back into service, even on a different account).
+	MarkKeyIDRetired(ctx context.Context, keyID string) error
+
+	// IsKeyIDRetired reports whether keyID was retired via a prior key-change.
+	IsKeyIDRetired(ctx context.Context, keyID string) (bool, error)
 
 	// Close releases all connections held by the store.
 	Close() error

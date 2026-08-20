@@ -370,5 +370,17 @@ func (f *fakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan
 	notImplemented("PruneExpiredRateLimitCounters")
 	return nil
 }
+func (f *fakeStore) UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK storage.JSON) error {
+	notImplemented("UpdateACMEAccountKey")
+	return nil
+}
+func (f *fakeStore) MarkKeyIDRetired(ctx context.Context, keyID string) error {
+	notImplemented("MarkKeyIDRetired")
+	return nil
+}
+func (f *fakeStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, error) {
+	notImplemented("IsKeyIDRetired")
+	return false, nil
+}
 
 var errNotFound = fmt.Errorf("sshca fakeStore: record not found")
