@@ -493,6 +493,32 @@ func (f *fakeStore) GetACMEAuthorizationByIdentifier(ctx context.Context, accoun
 	}
 	return best, nil
 }
+func (f *fakeStore) GetRateLimitConfig(ctx context.Context, name string) (*storage.RateLimitConfig, error) {
+	notImplemented("GetRateLimitConfig")
+	return nil, nil
+}
+func (f *fakeStore) ListRateLimitConfigs(ctx context.Context) ([]*storage.RateLimitConfig, error) {
+	notImplemented("ListRateLimitConfigs")
+	return nil, nil
+}
+func (f *fakeStore) UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	notImplemented("UpsertRateLimitConfigIfAbsent")
+	return nil
+}
+func (f *fakeStore) UpdateRateLimitConfig(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	notImplemented("UpdateRateLimitConfig")
+	return nil
+}
+func (f *fakeStore) IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error {
+	// Silently accept — ratelimit tests that exercise the real Engine can
+	// override this via a purpose-built fake if needed; ACME service tests
+	// don't touch rate limiting directly.
+	return nil
+}
+func (f *fakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
+	notImplemented("PruneExpiredRateLimitCounters")
+	return nil
+}
 
 // ListAuthorizationsByAccount returns standalone pre-authorizations for an
 // account, newest first.

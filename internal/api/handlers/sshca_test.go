@@ -365,6 +365,30 @@ func (f *sshFakeStore) ListAuthorizationsByAccount(ctx context.Context, accountI
 	sshNotImplemented("ListAuthorizationsByAccount")
 	return nil, nil
 }
+func (f *sshFakeStore) GetRateLimitConfig(ctx context.Context, name string) (*storage.RateLimitConfig, error) {
+	sshNotImplemented("GetRateLimitConfig")
+	return nil, nil
+}
+func (f *sshFakeStore) ListRateLimitConfigs(ctx context.Context) ([]*storage.RateLimitConfig, error) {
+	sshNotImplemented("ListRateLimitConfigs")
+	return nil, nil
+}
+func (f *sshFakeStore) UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	sshNotImplemented("UpsertRateLimitConfigIfAbsent")
+	return nil
+}
+func (f *sshFakeStore) UpdateRateLimitConfig(ctx context.Context, cfg *storage.RateLimitConfig) error {
+	sshNotImplemented("UpdateRateLimitConfig")
+	return nil
+}
+func (f *sshFakeStore) IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error {
+	sshNotImplemented("IncrementRateLimitCounter")
+	return nil
+}
+func (f *sshFakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
+	sshNotImplemented("PruneExpiredRateLimitCounters")
+	return nil
+}
 
 var sshErrNotFound = errors.New("handlers fakeStore: record not found")
 

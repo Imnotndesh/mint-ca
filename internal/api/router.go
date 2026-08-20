@@ -2,6 +2,7 @@ package api
 
 import (
 	internalacme "mint-ca/internal/acme"
+	"mint-ca/internal/ratelimit"
 	"net/http"
 
 	"mint-ca/internal/api/handlers"
@@ -28,6 +29,7 @@ func BuildRouter(
 	crlMgr *revocation.CRLManager,
 	ocspResponder *revocation.OCSPResponder,
 	policyEngine *policy.Engine,
+	rlEngine *ratelimit.Engine, // NEW parameter
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -52,6 +54,7 @@ func BuildRouter(
 
 	r.Group(func(r chi.Router) {
 		r.Use(apimiddleware.Auth(store))
+		r.Use(apimiddleware.RateLimit(rlEngine, store)) // NEW — after Auth, before Audit
 		r.Use(apimiddleware.Audit(store))
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
@@ -67,7 +70,7 @@ func BuildRouter(
 
 	if cfg.ACME.Enabled {
 		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, cfg.ACME.BaseURL)
-		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME).RegisterRoutes(r)
+		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
 	}
 
 	return r

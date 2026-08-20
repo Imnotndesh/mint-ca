@@ -167,6 +167,18 @@ type SSHCertificate struct {
 	Requester     string        `json:"requester"`
 	CreatedAt     time.Time     `json:"created_at"`
 }
+
+// RateLimitConfig is a single named limiter's configuration, persisted so
+// it can be edited at runtime (e.g. via a future web UI) without a restart.
+type RateLimitConfig struct {
+	Name          string    `json:"name"`
+	Scope         string    `json:"scope"`
+	Algorithm     string    `json:"algorithm"`
+	WindowSeconds int       `json:"window_seconds"`
+	MaxRequests   int       `json:"max_requests"`
+	Enabled       bool      `json:"enabled"`
+	UpdatedAt     time.Time `json:"updated_at"`
+}
 type ACMEAuthorizationStatus string
 
 const (
@@ -519,6 +531,32 @@ type Store interface {
 	// RevokeSSHCertificate marks an SSH certificate revoked. Schema/plumbing
 	// only in phase 1 — no API endpoint wired up to it yet.
 	RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error
+	// --- Add to the Store interface ---
+
+	// GetRateLimitConfig returns the config for a named limiter, or (nil, nil).
+	GetRateLimitConfig(ctx context.Context, name string) (*RateLimitConfig, error)
+
+	// ListRateLimitConfigs returns all configured limiters.
+	ListRateLimitConfigs(ctx context.Context) ([]*RateLimitConfig, error)
+
+	// UpsertRateLimitConfigIfAbsent inserts cfg only if no row with that
+	// name already exists. Used to seed defaults at boot without ever
+	// clobbering a value a future web UI has changed.
+	UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *RateLimitConfig) error
+
+	// UpdateRateLimitConfig unconditionally overwrites a limiter's config.
+	// Intended for the future web UI's edit endpoint.
+	UpdateRateLimitConfig(ctx context.Context, cfg *RateLimitConfig) error
+
+	// IncrementRateLimitCounter is a best-effort, write-through persistence
+	// of a fixed-window counter increment. Never authoritative — the caller
+	// (ratelimit.Engine) has already made its allow/deny decision from
+	// in-memory state before calling this.
+	IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error
+
+	// PruneExpiredRateLimitCounters deletes counter rows whose window
+	// started before olderThan.
+	PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error
 
 	// Close releases all connections held by the store.
 	Close() error

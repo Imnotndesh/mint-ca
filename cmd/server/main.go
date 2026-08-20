@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"mint-ca/internal/logger"
+	"mint-ca/internal/ratelimit"
 	"net/http"
 	"os"
 	"os/signal"
@@ -47,6 +48,18 @@ func main() {
 		slog.Error("failed to open storage", "err", err)
 		os.Exit(1)
 	}
+	if err := setup.SeedRateLimitConfigs(context.Background(), store, cfg.RateLimit); err != nil {
+		slog.Error("failed to seed rate limit configs", "err", err)
+		_ = store.Close()
+		os.Exit(1)
+	}
+	var rlEngine *ratelimit.Engine
+	rlEngine, err = setup.LoadRateLimitEngine(context.Background(), store)
+	if err != nil {
+		slog.Error("failed to load rate limit engine", "err", err)
+		_ = store.Close()
+		os.Exit(1)
+	}
 
 	ks, err := mintcrypto.NewKeystore(cfg.Crypto.MasterKey)
 	if err != nil {
@@ -66,6 +79,7 @@ func main() {
 	apiWorkers := workers.NewWorkerGroup()
 	apiWorkers.Add(workers.NewCRLWorker(crlManager, cfg.CRL))
 	apiWorkers.Add(workers.NewNonceWorker(store))
+	apiWorkers.Add(workers.NewRateLimitPruneWorker(store))
 	apiWorkers.Start(context.Background())
 
 	// Read state before starting the listener so we know which router to mount.
@@ -147,7 +161,7 @@ func main() {
 
 	case storage.StateReady:
 		slog.Info("setup complete — starting full API")
-		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine)
+		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine)
 	}
 
 	srv := &http.Server{

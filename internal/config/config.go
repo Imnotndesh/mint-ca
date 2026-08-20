@@ -17,12 +17,13 @@ import (
 // No package other than this one calls os.Getenv. If you need a value from the
 // environment, add it here.
 type Config struct {
-	Server  ServerConfig
-	Storage StorageConfig
-	Crypto  CryptoConfig
-	ACME    ACMEConfig
-	CRL     CRLConfig
-	Log     LogConfig
+	Server    ServerConfig
+	Storage   StorageConfig
+	Crypto    CryptoConfig
+	ACME      ACMEConfig
+	CRL       CRLConfig
+	Log       LogConfig
+	RateLimit RateLimitConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -117,6 +118,26 @@ type CRLConfig struct {
 	// Default: 24h
 	// Env: MINT_CRL_VALIDITY_SECONDS
 	Validity time.Duration
+}
+
+// RateLimitOverride holds an optional first-boot-only override for one
+// hardcoded default limiter. Zero value (both fields 0) means "no override,
+// use the hardcoded default" for that field individually.
+type RateLimitOverride struct {
+	WindowSeconds int
+	MaxRequests   int
+}
+
+// RateLimitConfig holds optional env-sourced overrides for the four
+// hardcoded default limiters, applied only when seeding the DB for the
+// first time (see storage.UpsertRateLimitConfigIfAbsent). If a DB row
+// already exists, these are ignored entirely — the DB is authoritative
+// after first boot so a future web UI's edits are never clobbered.
+type RateLimitConfig struct {
+	NewAccountPerIP      RateLimitOverride
+	NewOrderPerAccount   RateLimitOverride
+	NewAuthzPerAccount   RateLimitOverride
+	APIKeyRequestsPerKey RateLimitOverride
 }
 
 // LogConfig controls structured logging output.
@@ -251,7 +272,22 @@ func Load() (*Config, error) {
 			c.Log.Level,
 		))
 	}
-
+	c.RateLimit.NewAccountPerIP = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_NEW_ACCOUNT_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_NEW_ACCOUNT_MAX"),
+	}
+	c.RateLimit.NewOrderPerAccount = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_NEW_ORDER_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_NEW_ORDER_MAX"),
+	}
+	c.RateLimit.NewAuthzPerAccount = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_NEW_AUTHZ_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_NEW_AUTHZ_MAX"),
+	}
+	c.RateLimit.APIKeyRequestsPerKey = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_APIKEY_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_APIKEY_MAX"),
+	}
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)
 	}
@@ -297,6 +333,12 @@ func (c *Config) Redact() map[string]interface{} {
 			"level": c.Log.Level,
 			"json":  c.Log.JSON,
 		},
+		"rate_limit": map[string]interface{}{
+			"new_account_override": c.RateLimit.NewAccountPerIP.MaxRequests > 0 || c.RateLimit.NewAccountPerIP.WindowSeconds > 0,
+			"new_order_override":   c.RateLimit.NewOrderPerAccount.MaxRequests > 0 || c.RateLimit.NewOrderPerAccount.WindowSeconds > 0,
+			"new_authz_override":   c.RateLimit.NewAuthzPerAccount.MaxRequests > 0 || c.RateLimit.NewAuthzPerAccount.WindowSeconds > 0,
+			"apikey_override":      c.RateLimit.APIKeyRequestsPerKey.MaxRequests > 0 || c.RateLimit.APIKeyRequestsPerKey.WindowSeconds > 0,
+		},
 	}
 }
 
@@ -317,6 +359,20 @@ func envBool(key string) bool {
 		return true
 	}
 	return false
+}
+
+// envIntOptional reads an integer environment variable, returning 0 if
+// unset, empty, or unparsable — 0 is treated by callers as "no override".
+func envIntOptional(key string) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // envDuration reads an environment variable as a number of seconds and returns

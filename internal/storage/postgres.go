@@ -248,6 +248,24 @@ CREATE TABLE IF NOT EXISTS ssh_certificates (
 	requester      TEXT        NOT NULL DEFAULT '',
 	created_at     TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS rate_limit_configs (
+    name           TEXT        NOT NULL PRIMARY KEY,
+    scope          TEXT        NOT NULL,
+    algorithm      TEXT        NOT NULL DEFAULT 'fixed_window',
+    window_seconds INTEGER     NOT NULL,
+    max_requests   INTEGER     NOT NULL,
+    enabled        BOOLEAN     NOT NULL DEFAULT TRUE,
+    updated_at     TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS rate_limit_counters (
+    limiter_name TEXT        NOT NULL,
+    bucket_key   TEXT        NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    count        INTEGER     NOT NULL DEFAULT 0,
+    PRIMARY KEY (limiter_name, bucket_key, window_start)
+);
+CREATE INDEX IF NOT EXISTS idx_pg_rl_counters_window_start ON rate_limit_counters(window_start);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pg_ssh_certs_ca_serial ON ssh_certificates(ca_id, serial);
 `
 
@@ -1652,6 +1670,101 @@ func (s *postgresStore) ConsumeNonce(ctx context.Context, nonce string) (bool, e
 		return false, nil
 	}
 	return true, nil
+}
+func (s *postgresStore) GetRateLimitConfig(ctx context.Context, name string) (*RateLimitConfig, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT name, scope, algorithm, window_seconds, max_requests, enabled, updated_at
+		FROM rate_limit_configs WHERE name = $1`, name)
+	c, err := pgScanRateLimitConfig(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetRateLimitConfig: %w", err)
+	}
+	return c, nil
+}
+
+func (s *postgresStore) ListRateLimitConfigs(ctx context.Context) ([]*RateLimitConfig, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT name, scope, algorithm, window_seconds, max_requests, enabled, updated_at
+		FROM rate_limit_configs ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListRateLimitConfigs: %w", err)
+	}
+	defer rows.Close()
+	var out []*RateLimitConfig
+	for rows.Next() {
+		var c RateLimitConfig
+		if err := rows.Scan(&c.Name, &c.Scope, &c.Algorithm, &c.WindowSeconds, &c.MaxRequests, &c.Enabled, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *RateLimitConfig) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO rate_limit_configs
+			(name, scope, algorithm, window_seconds, max_requests, enabled, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT (name) DO NOTHING`,
+		cfg.Name, cfg.Scope, cfg.Algorithm, cfg.WindowSeconds, cfg.MaxRequests, cfg.Enabled, cfg.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpsertRateLimitConfigIfAbsent: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) UpdateRateLimitConfig(ctx context.Context, cfg *RateLimitConfig) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE rate_limit_configs SET
+			scope = $1, algorithm = $2, window_seconds = $3, max_requests = $4, enabled = $5, updated_at = $6
+		WHERE name = $7`,
+		cfg.Scope, cfg.Algorithm, cfg.WindowSeconds, cfg.MaxRequests, cfg.Enabled, cfg.UpdatedAt.UTC(),
+		cfg.Name,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateRateLimitConfig: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: UpdateRateLimitConfig: limiter %q not found", cfg.Name)
+	}
+	return nil
+}
+
+func pgScanRateLimitConfig(row *sql.Row) (*RateLimitConfig, error) {
+	var c RateLimitConfig
+	err := row.Scan(&c.Name, &c.Scope, &c.Algorithm, &c.WindowSeconds, &c.MaxRequests, &c.Enabled, &c.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *postgresStore) IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO rate_limit_counters (limiter_name, bucket_key, window_start, count)
+		VALUES ($1,$2,$3,1)
+		ON CONFLICT (limiter_name, bucket_key, window_start) DO UPDATE SET
+			count = rate_limit_counters.count + 1`,
+		limiterName, bucketKey, windowStart.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: IncrementRateLimitCounter: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM rate_limit_counters WHERE window_start < $1`, olderThan.UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: PruneExpiredRateLimitCounters: %w", err)
+	}
+	return nil
 }
 
 // PruneExpiredNonces deletes all nonces past their expiry.
