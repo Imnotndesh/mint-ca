@@ -203,6 +203,10 @@ CREATE TABLE IF NOT EXISTS crl_cache (
 	this_update TIMESTAMPTZ NOT NULL,
 	next_update TIMESTAMPTZ NOT NULL
 );
+CREATE TABLE IF NOT EXISTS acme_retired_keys (
+    key_id     TEXT        NOT NULL PRIMARY KEY,
+    retired_at TIMESTAMPTZ NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS api_keys (
 	id         TEXT        NOT NULL PRIMARY KEY,
@@ -565,7 +569,43 @@ func pgScanCert(row *sql.Row) (*Certificate, error) {
 	_ = pgUnmarshalJSON(metaStr, &c.Metadata)
 	return &c, nil
 }
+func (s *postgresStore) UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK JSON) error {
+	jwk, _ := pgMarshalJSON(newKeyJWK)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE acme_accounts SET key_id = $1, key_jwk = $2 WHERE id = $3`,
+		newKeyID, jwk, accountID.String())
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateACMEAccountKey: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: UpdateACMEAccountKey: account %s not found", accountID)
+	}
+	return nil
+}
 
+func (s *postgresStore) MarkKeyIDRetired(ctx context.Context, keyID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO acme_retired_keys (key_id, retired_at) VALUES ($1, $2)
+		ON CONFLICT (key_id) DO NOTHING`,
+		keyID, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: MarkKeyIDRetired: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM acme_retired_keys WHERE key_id = $1`, keyID)
+	var x int
+	err := row.Scan(&x)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("postgres: IsKeyIDRetired: %w", err)
+	}
+	return true, nil
+}
 func pgScanCerts(rows *sql.Rows) ([]*Certificate, error) {
 	var out []*Certificate
 	for rows.Next() {

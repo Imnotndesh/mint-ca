@@ -39,6 +39,11 @@ type ProvisionerConfig struct {
 	AllowedChallengeTypes []string `json:"allowed_challenge_types"`
 }
 
+type KeyChangeRequest struct {
+	Account json.RawMessage `json:"account"` // account URL, as string
+	OldKey  json.RawMessage `json:"oldKey"`
+}
+
 // SetDefaults fills in zero-value fields with sensible defaults.
 // Exported so handlers can call it without reflection.
 func (c *ProvisionerConfig) SetDefaults() {
@@ -217,6 +222,87 @@ func (s *Service) NewPreAuth(
 // IssueNonce generates and persists a fresh nonce.
 func (s *Service) IssueNonce(ctx context.Context) (string, error) {
 	return s.nonces.Issue(ctx)
+}
+func (s *Service) KeyChange(
+	ctx context.Context,
+	outerAccount *storage.ACMEAccount,
+	innerJWS *RawJWS,
+	expectedAccountURL string,
+) (*storage.ACMEAccount, *Problem) {
+
+	innerHdr, err := innerJWS.ParseProtected()
+	if err != nil {
+		return nil, ErrMalformedProblem("keyChange: parse inner protected header: " + err.Error())
+	}
+	if len(innerHdr.JWK) == 0 {
+		return nil, ErrMalformedProblem("keyChange: inner JWS must carry jwk, not kid")
+	}
+	newPub, err := ParseJWK(innerHdr.JWK)
+	if err != nil {
+		return nil, NewProblem(ErrBadPublicKey, 400, "keyChange: "+err.Error())
+	}
+	if err := innerJWS.Verify(newPub, innerHdr.Algorithm); err != nil {
+		return nil, ErrUnauthorizedProblem("keyChange: inner JWS signature invalid: " + err.Error())
+	}
+
+	innerPayload, err := innerJWS.PayloadBytes()
+	if err != nil || innerPayload == nil {
+		return nil, ErrMalformedProblem("keyChange: inner JWS requires a payload")
+	}
+	var req KeyChangeRequest
+	if err := json.Unmarshal(innerPayload, &req); err != nil {
+		return nil, ErrMalformedProblem("keyChange: decode inner payload: " + err.Error())
+	}
+
+	var accountURL string
+	_ = json.Unmarshal(req.Account, &accountURL)
+	if strings.TrimRight(accountURL, "/") != strings.TrimRight(expectedAccountURL, "/") {
+		return nil, NewProblem(ErrMalformed, 400, "keyChange: inner account URL does not match authenticated account")
+	}
+
+	oldThumb, err := Thumbprint(req.OldKey)
+	if err != nil {
+		return nil, ErrMalformedProblem("keyChange: thumbprint oldKey: " + err.Error())
+	}
+	if oldThumb != outerAccount.KeyID {
+		return nil, NewProblem(ErrMalformed, 400, "keyChange: oldKey does not match authenticated account's current key")
+	}
+
+	newThumb, err := Thumbprint(innerHdr.JWK)
+	if err != nil {
+		return nil, ErrServerInternalProblem("keyChange: thumbprint new key: " + err.Error())
+	}
+	if newThumb == oldThumb {
+		return nil, NewProblem(ErrMalformed, 400, "keyChange: new key is identical to current key")
+	}
+
+	// New key must not already be in use, nor be a previously-retired key
+	// (common CA practice: rolled-off keys are permanently blocked from re-use).
+	existing, err := s.store.GetACMEAccountByKeyID(ctx, newThumb)
+	if err != nil {
+		return nil, ErrServerInternalProblem("keyChange: check new key: " + err.Error())
+	}
+	if existing != nil {
+		return nil, NewProblem(ErrMalformed, 409, "keyChange: new key is already in use by another account")
+	}
+	retired, err := s.store.IsKeyIDRetired(ctx, newThumb)
+	if err != nil {
+		return nil, ErrServerInternalProblem("keyChange: check retired keys: " + err.Error())
+	}
+	if retired {
+		return nil, NewProblem(ErrMalformed, 409, "keyChange: this key was previously retired and cannot be reused")
+	}
+
+	if err := s.store.UpdateACMEAccountKey(ctx, outerAccount.ID, newThumb, storage.JSON(mustUnmarshalRawJSON(innerHdr.JWK))); err != nil {
+		return nil, ErrServerInternalProblem("keyChange: update account key: " + err.Error())
+	}
+	if err := s.store.MarkKeyIDRetired(ctx, oldThumb); err != nil {
+		slog.Warn("keyChange: failed to retire old key", "account_id", outerAccount.ID, "err", err)
+	}
+
+	outerAccount.KeyID = newThumb
+	outerAccount.KeyJWK = storage.JSON(mustUnmarshalRawJSON(innerHdr.JWK))
+	return outerAccount, nil
 }
 
 // RevokeCert handles RFC 8555 §7.6 certificate revocation. Exactly one of

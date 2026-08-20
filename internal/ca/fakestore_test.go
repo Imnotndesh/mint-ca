@@ -398,3 +398,15 @@ func (f *caFakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderTh
 	caNotImplemented("PruneExpiredRateLimitCounters")
 	return nil
 }
+func (f *caFakeStore) UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK storage.JSON) error {
+	caNotImplemented("UpdateACMEAccountKey")
+	return nil
+}
+func (f *caFakeStore) MarkKeyIDRetired(ctx context.Context, keyID string) error {
+	caNotImplemented("MarkKeyIDRetired")
+	return nil
+}
+func (f *caFakeStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, error) {
+	caNotImplemented("IsKeyIDRetired")
+	return false, nil
+}

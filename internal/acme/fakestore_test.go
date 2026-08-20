@@ -24,6 +24,7 @@ type fakeStore struct {
 	authorizations map[uuid.UUID]*storage.ACMEAuthorization
 	challenges     map[uuid.UUID]*storage.ACMEChallenge
 	certsBySerial  map[string]*storage.Certificate
+	retiredKeys    map[string]bool
 	crls           map[uuid.UUID]*storage.CRLCache
 	nonces         map[string]time.Time
 }
@@ -37,6 +38,7 @@ func NewFakeStore() *fakeStore {
 		authorizations: make(map[uuid.UUID]*storage.ACMEAuthorization),
 		challenges:     make(map[uuid.UUID]*storage.ACMEChallenge),
 		certsBySerial:  make(map[string]*storage.Certificate),
+		retiredKeys:    make(map[string]bool),
 		crls:           make(map[uuid.UUID]*storage.CRLCache),
 		nonces:         make(map[string]time.Time),
 	}
@@ -518,6 +520,33 @@ func (f *fakeStore) IncrementRateLimitCounter(ctx context.Context, limiterName, 
 func (f *fakeStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
 	notImplemented("PruneExpiredRateLimitCounters")
 	return nil
+}
+func (f *fakeStore) UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK storage.JSON) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.accounts[accountID]
+	if !ok {
+		return fmt.Errorf("account not found")
+	}
+	a.KeyID = newKeyID
+	a.KeyJWK = newKeyJWK
+	return nil
+}
+
+func (f *fakeStore) MarkKeyIDRetired(ctx context.Context, keyID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.retiredKeys == nil {
+		f.retiredKeys = make(map[string]bool)
+	}
+	f.retiredKeys[keyID] = true
+	return nil
+}
+
+func (f *fakeStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.retiredKeys[keyID], nil
 }
 
 // ListAuthorizationsByAccount returns standalone pre-authorizations for an

@@ -63,6 +63,7 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/account/{accountID}/orders", h.listOrders)
 		r.Post("/revoke-cert", h.revokeCert)
+		r.Post("/key-change", h.keyChange)
 	})
 }
 
@@ -360,6 +361,7 @@ func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"newNonce":   base + "/new-nonce",
 		"newAccount": base + "/new-account",
+		"keyChange":  base + "/key-change",
 		"newOrder":   base + "/new-order",
 		"newAuthz":   base + "/new-authz",
 		"meta": map[string]interface{}{
@@ -458,7 +460,66 @@ func (h *ACMEHandler) newNonce(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
+func (h *ACMEHandler) keyChange(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
 
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_key_change_per_account", account.ID.String(), account.ID.String()) {
+		return
+	}
+
+	innerPayload, err := jws.PayloadBytes()
+	if err != nil || innerPayload == nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("key-change requires a payload"))
+		return
+	}
+	var innerJWS internalacme.RawJWS
+	if err := json.Unmarshal(innerPayload, &innerJWS); err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode inner JWS: "+err.Error()))
+		return
+	}
+
+	accountURL := h.service.AccountURL(prov.ID, account.ID)
+	updated, prob := h.service.KeyChange(ctx, account, &innerJWS, accountURL)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	entry := &storage.AuditLog{
+		ID:        uuid.New(),
+		EventType: "acme_key_change",
+		Actor:     "acme-account:" + updated.ID.String(),
+		Payload:   storage.JSON{"new_key_id": updated.KeyID},
+		CreatedAt: time.Now().UTC(),
+	}
+	go func() { _ = h.store.WriteAuditLog(context.Background(), entry) }()
+
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{})
+}
 func (h *ACMEHandler) newAccount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	prov, prob := h.loadProvisioner(r)

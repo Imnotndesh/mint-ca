@@ -299,6 +299,10 @@ CREATE TABLE IF NOT EXISTS rate_limit_configs (
     enabled        INTEGER NOT NULL DEFAULT 1,
     updated_at     DATETIME NOT NULL
 );
+CREATE TABLE IF NOT EXISTS acme_retired_keys (
+    key_id     TEXT NOT NULL PRIMARY KEY,
+    retired_at DATETIME NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS rate_limit_counters (
     limiter_name TEXT NOT NULL,
@@ -1898,6 +1902,43 @@ func (s *sqliteStore) IncrementRateLimitCounter(ctx context.Context, limiterName
 		return fmt.Errorf("sqlite: IncrementRateLimitCounter: %w", err)
 	}
 	return nil
+}
+func (s *sqliteStore) UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK JSON) error {
+	jwk, _ := marshalJSON(newKeyJWK)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE acme_accounts SET key_id = ?, key_jwk = ? WHERE id = ?`,
+		newKeyID, jwk, accountID.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateACMEAccountKey: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateACMEAccountKey: account %s not found", accountID)
+	}
+	return nil
+}
+
+func (s *sqliteStore) MarkKeyIDRetired(ctx context.Context, keyID string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO acme_retired_keys (key_id, retired_at) VALUES (?, ?)
+		ON CONFLICT(key_id) DO NOTHING`,
+		keyID, time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: MarkKeyIDRetired: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM acme_retired_keys WHERE key_id = ?`, keyID)
+	var x int
+	err := row.Scan(&x)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("sqlite: IsKeyIDRetired: %w", err)
+	}
+	return true, nil
 }
 
 func (s *sqliteStore) PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error {
