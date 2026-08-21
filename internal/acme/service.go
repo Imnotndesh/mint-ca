@@ -104,13 +104,14 @@ type Store interface {
 
 // Service provides all ACME business logic.
 type Service struct {
-	store   Store
-	engine  *ca.Engine
-	nonces  *NonceManager
-	crlMgr  *revocation.CRLManager
-	http01  *challenge.HTTP01Validator
-	dns01   *challenge.DNS01Validator
-	baseURL string
+	store     Store
+	engine    *ca.Engine
+	nonces    *NonceManager
+	crlMgr    *revocation.CRLManager
+	http01    *challenge.HTTP01Validator
+	dns01     *challenge.DNS01Validator
+	tlsalpn01 *challenge.TLSALPN01Validator
+	baseURL   string
 }
 
 var allowedACMERevocationReasons = map[int]bool{
@@ -130,13 +131,14 @@ func NewService(
 	baseURL string,
 ) *Service {
 	return &Service{
-		store:   store,
-		engine:  engine,
-		nonces:  nonces,
-		crlMgr:  crlMgr,
-		http01:  challenge.NewHTTP01Validator(),
-		dns01:   challenge.NewDNS01Validator(nil),
-		baseURL: strings.TrimRight(baseURL, "/"),
+		store:     store,
+		engine:    engine,
+		nonces:    nonces,
+		crlMgr:    crlMgr,
+		http01:    challenge.NewHTTP01Validator(),
+		dns01:     challenge.NewDNS01Validator(nil),
+		tlsalpn01: challenge.NewTLSALPN01Validator(443),
+		baseURL:   strings.TrimRight(baseURL, "/"),
 	}
 }
 
@@ -852,6 +854,8 @@ func (s *Service) performPreAuthValidation(
 	case storage.ACMEChallengeTypeDNS01:
 		digest := DNS01DigestAuthorization(keyAuth)
 		valErr = s.dns01.Validate(ctx, domain, digest)
+	case storage.ACMEChallengeTypeTLSALPN01:
+		valErr = s.tlsalpn01.Validate(ctx, domain, keyAuth)
 	default:
 		valErr = fmt.Errorf("unsupported challenge type %q", ch.Type)
 	}
@@ -919,6 +923,8 @@ func (s *Service) performValidation(
 	case storage.ACMEChallengeTypeDNS01:
 		digest := DNS01DigestAuthorization(keyAuth)
 		valErr = s.dns01.Validate(ctx, domain, digest)
+	case storage.ACMEChallengeTypeTLSALPN01:
+		valErr = s.tlsalpn01.Validate(ctx, domain, keyAuth)
 	default:
 		valErr = fmt.Errorf("unsupported challenge type %q", ch.Type)
 	}
