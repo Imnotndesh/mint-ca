@@ -145,7 +145,12 @@ func TestTLSALPN01_Success(t *testing.T) {
 
 	cert := buildTestCert(t, certOpts{domain: domain, digest: digest[:]})
 	ln, port := startACMETLSListener(t, cert, true)
-	defer ln.Close()
+	defer func(ln net.Listener) {
+		err := ln.Close()
+		if err != nil {
+			return
+		}
+	}(ln)
 
 	v := newTestValidator(t, port)
 	if err := v.Validate(context.Background(), domain, keyAuth); err != nil {
