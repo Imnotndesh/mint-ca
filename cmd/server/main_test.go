@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"mint-ca/internal/ratelimit"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,7 +33,6 @@ import (
 	"mint-ca/internal/sshca"
 	"mint-ca/internal/storage"
 
-	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -114,33 +114,28 @@ func TestMain(m *testing.M) {
 
 func runLiveStack(m *testing.M) (int, error) {
 	tmpDir, err := os.MkdirTemp("", "mint-ca-test-*")
+	if err != nil {
+		return 1, err
+	}
+	defer os.RemoveAll(tmpDir)
+	dbPath := filepath.Join(tmpDir, "mint-ca.db")
+
 	masterKeyBytes := make([]byte, 32)
 	if _, err := rand.Read(masterKeyBytes); err != nil {
 		return 1, fmt.Errorf("generate master key: %w", err)
 	}
-	if err != nil {
-		return 1, err
-	}
-	defer func(path string) {
-		err = os.RemoveAll(path)
-		if err != nil {
-			return
-		}
-	}(tmpDir)
-	dbPath := filepath.Join(tmpDir, "mint-ca.db")
 
 	env := map[string]string{
-		"MINT_MASTER_KEY":                      hex.EncodeToString(masterKeyBytes),
-		"MINT_DB_DRIVER":                       "sqlite",
-		"MINT_DB_DSN":                          dbPath,
-		"MINT_TLS_DISABLED":                    "true",
-		"MINT_ACME_ENABLED":                    "true",
-		"MINT_ACME_BASE_URL":                   "http://127.0.0.1:0",
-		"MINT_ACME_EAB_REQUIRED":               "false",
-		"MINT_LOG_LEVEL":                       "error",
-		"MINT_CRL_REFRESH_INTERVAL_SECONDS":    "3600",
-		"MINT_CRL_VALIDITY_SECONDS":            "86400",
-		"MINT_RATELIMIT_APIKEY_WINDOW_SECONDS": "60",
+		"MINT_MASTER_KEY":                   hex.EncodeToString(masterKeyBytes),
+		"MINT_DB_DRIVER":                    "sqlite",
+		"MINT_DB_DSN":                       dbPath,
+		"MINT_TLS_DISABLED":                 "true",
+		"MINT_ACME_ENABLED":                 "true",
+		"MINT_ACME_BASE_URL":                "http://127.0.0.1:0",
+		"MINT_ACME_EAB_REQUIRED":            "false",
+		"MINT_LOG_LEVEL":                    "error",
+		"MINT_CRL_REFRESH_INTERVAL_SECONDS": "3600",
+		"MINT_CRL_VALIDITY_SECONDS":         "86400",
 	}
 	var keys []string
 	for k, v := range env {
@@ -180,11 +175,15 @@ func runLiveStack(m *testing.M) (int, error) {
 	}
 	defer ks.Zero()
 
-	// reserve a stable base URL before constructing engines that bake it in
-	placeholder := httptest.NewServer(http.NotFoundHandler())
-	baseURL := placeholder.URL
+	// Reserve a fixed listener address BEFORE building engines, so the
+	// ACME base URL baked into caEngine/ACME service matches exactly
+	// where the full API server ends up actually listening.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 1, fmt.Errorf("reserve listener: %w", err)
+	}
+	baseURL := "http://" + listener.Addr().String()
 	cfg.ACME.BaseURL = baseURL
-	placeholder.Close()
 
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
 	sshcaEngine := sshca.NewEngine(store, ks)
@@ -192,7 +191,8 @@ func runLiveStack(m *testing.M) (int, error) {
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
 	policyEngine := policy.NewEngine(store)
 
-	// ---- setup mode over real HTTP ----
+	// ---- setup mode over real HTTP (separate ephemeral server; doesn't
+	// need to match baseURL since /setup/* never validates a JWS URL) ----
 	setupRouter := api.BuildSetupRouter(cfg, store, caEngine, func(certPEM, keyPEM []byte) error { return nil })
 	setupSrv := httptest.NewServer(setupRouter)
 	defer setupSrv.Close()
@@ -218,12 +218,16 @@ func runLiveStack(m *testing.M) (int, error) {
 		return 1, fmt.Errorf("setup api-key: %w", err)
 	}
 
+	// ---- full API, bound to the SAME address baked into cfg.ACME.BaseURL ----
 	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine)
-	fullSrv := httptest.NewServer(fullRouter)
+	fullSrv := httptest.NewUnstartedServer(fullRouter)
+	_ = fullSrv.Listener.Close()
+	fullSrv.Listener = listener
+	fullSrv.Start()
 	defer fullSrv.Close()
 
 	shared = &liveState{
-		baseURL:   fullSrv.URL,
+		baseURL:   baseURL,
 		bootstrap: bk.Raw,
 		adminKey:  apiKeyResp.APIKey,
 		rootCAID:  apiKeyResp.CAID,
@@ -464,8 +468,9 @@ func init() {
 			pub, _ := genSSHAuthorizedKey(nil)
 			ctx.put("ssh_pub", pub)
 			return map[string]interface{}{
-				"provisioner_id": uuid.NewString(), "public_key": pub,
-				"principals": []string{"alice"}, "key_id": "alice", "ttl_seconds": 3600,
+				"provisioner_id": ctx.get("apikey_prov_id"),
+				"public_key":     pub,
+				"principals":     []string{"alice"}, "key_id": "alice", "ttl_seconds": 3600,
 			}
 		},
 		Want: http.StatusCreated,
