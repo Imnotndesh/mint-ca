@@ -16,6 +16,8 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	mintcrypto "mint-ca/internal/crypto"
@@ -26,6 +28,7 @@ import (
 
 // KeyAlgo identifies the algorithm and key size used for a generated keypair.
 type KeyAlgo string
+type NameConstraints = storage.NameConstraints
 
 const (
 	KeyAlgoECDSAP256 KeyAlgo = "ecdsa-p256"
@@ -95,7 +98,6 @@ func (r *CreateRootCARequest) validate() error {
 // intermediate (child) CA signed by an existing CA in the store.
 // The parent can itself be an intermediate — depth is not limited.
 type CreateIntermediateCARequest struct {
-	// ParentCAID is the database ID of the CA that will sign this one.
 	ParentCAID uuid.UUID
 
 	Name         string
@@ -107,14 +109,11 @@ type CreateIntermediateCARequest struct {
 
 	KeyAlgo KeyAlgo
 
-	// TTLDays is how long this intermediate's certificate is valid.
-	// The engine automatically clamps this to the parent's remaining lifetime.
 	TTLDays int
 
-	// MaxPathLen controls how many further intermediates can be issued below
-	// this one. Set to 0 to only allow leaf certificates. Set to -1 for
-	// unlimited (not recommended for intermediates).
 	MaxPathLen int
+
+	NameConstraints *NameConstraints
 }
 
 func (r *CreateIntermediateCARequest) setDefaults() {
@@ -126,6 +125,111 @@ func (r *CreateIntermediateCARequest) setDefaults() {
 	}
 }
 
+// validateNameConstraints checks that every entry is well-formed per
+// RFC 5280 §4.2.1.10: DNS entries are plain suffixes (no wildcards), IP
+// entries are valid CIDR, email entries are either a bare domain or a
+// full "user@domain" address.
+func validateNameConstraints(nc *NameConstraints) error {
+	if nc == nil {
+		return nil
+	}
+
+	checkDNS := func(label string, domains []string) error {
+		for _, d := range domains {
+			if d == "" {
+				return fmt.Errorf("name constraints: %s: empty DNS domain", label)
+			}
+			if strings.Contains(d, "*") {
+				return fmt.Errorf("name constraints: %s: %q must be a plain DNS suffix — wildcards are forbidden by RFC 5280", label, d)
+			}
+		}
+		return nil
+	}
+	if err := checkDNS("permitted_dns_domains", nc.PermittedDNSDomains); err != nil {
+		return err
+	}
+	if err := checkDNS("excluded_dns_domains", nc.ExcludedDNSDomains); err != nil {
+		return err
+	}
+
+	checkCIDR := func(label string, ranges []string) error {
+		for _, r := range ranges {
+			if _, _, err := net.ParseCIDR(r); err != nil {
+				return fmt.Errorf("name constraints: %s: %q is not a valid CIDR range: %w", label, r, err)
+			}
+		}
+		return nil
+	}
+	if err := checkCIDR("permitted_ip_ranges", nc.PermittedIPRanges); err != nil {
+		return err
+	}
+	if err := checkCIDR("excluded_ip_ranges", nc.ExcludedIPRanges); err != nil {
+		return err
+	}
+
+	checkEmail := func(label string, domains []string) error {
+		for _, d := range domains {
+			if d == "" {
+				return fmt.Errorf("name constraints: %s: empty email domain", label)
+			}
+			at := strings.LastIndex(d, "@")
+			domainPart := d
+			if at >= 0 {
+				domainPart = d[at+1:]
+			}
+			if domainPart == "" {
+				return fmt.Errorf("name constraints: %s: %q has no domain part", label, d)
+			}
+			if strings.Contains(d, "*") {
+				return fmt.Errorf("name constraints: %s: %q must not contain wildcards", label, d)
+			}
+		}
+		return nil
+	}
+	if err := checkEmail("permitted_email_domains", nc.PermittedEmailDomains); err != nil {
+		return err
+	}
+	if err := checkEmail("excluded_email_domains", nc.ExcludedEmailDomains); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// applyNameConstraintsToTemplate translates the storage-shape NameConstraints
+// into the stdlib x509.Certificate fields, parsing CIDR ranges into
+// *net.IPNet. Callers must have already validated nc via
+// validateNameConstraints. RFC 5280 recommends the DNS constraint be
+// critical; CA/Browser Forum baseline requirements mandate it — mint-ca
+// hardcodes this to true and does not expose it as configurable.
+func applyNameConstraintsToTemplate(template *x509.Certificate, nc *NameConstraints) error {
+	if nc == nil {
+		return nil
+	}
+
+	template.PermittedDNSDomains = append([]string(nil), nc.PermittedDNSDomains...)
+	template.ExcludedDNSDomains = append([]string(nil), nc.ExcludedDNSDomains...)
+	template.PermittedEmailAddresses = append([]string(nil), nc.PermittedEmailDomains...)
+	template.ExcludedEmailAddresses = append([]string(nil), nc.ExcludedEmailDomains...)
+
+	for _, cidr := range nc.PermittedIPRanges {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("applyNameConstraintsToTemplate: permitted IP range %q: %w", cidr, err)
+		}
+		template.PermittedIPRanges = append(template.PermittedIPRanges, ipnet)
+	}
+	for _, cidr := range nc.ExcludedIPRanges {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return fmt.Errorf("applyNameConstraintsToTemplate: excluded IP range %q: %w", cidr, err)
+		}
+		template.ExcludedIPRanges = append(template.ExcludedIPRanges, ipnet)
+	}
+	template.PermittedDNSDomainsCritical = true
+
+	return nil
+}
 func (r *CreateIntermediateCARequest) validate() error {
 	if r.ParentCAID == uuid.Nil {
 		return errors.New("ca: CreateIntermediateCARequest: ParentCAID is required")
@@ -142,6 +246,118 @@ func (r *CreateIntermediateCARequest) validate() error {
 	if r.TTLDays <= 0 {
 		return errors.New("ca: CreateIntermediateCARequest: TTLDays must be positive")
 	}
+	if err := validateNameConstraints(r.NameConstraints); err != nil {
+		return fmt.Errorf("ca: CreateIntermediateCARequest: %w", err)
+	}
+	return nil
+}
+
+// idCeCertificatePolicies is the OID for the certificatePolicies extension
+// (RFC 5280 §4.2.1.4): 2.5.29.32.
+var idCeCertificatePolicies = asn1.ObjectIdentifier{2, 5, 29, 32}
+
+// idQtCPS is the policyQualifierId for a CPS pointer qualifier (RFC 5280
+// §4.2.1.4): 1.3.6.1.5.5.7.2.1.
+var idQtCPS = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 2, 1}
+
+// asn1PolicyQualifierInfo and asn1PolicyInformation mirror the RFC 5280
+// §4.2.1.4 ASN.1 structures. The stdlib's x509.Certificate.PolicyIdentifiers
+// field only supports bare OIDs with no qualifier support, so we hand-roll
+// the extension via ExtraExtensions when a CPS URI is requested — same
+// pattern already used elsewhere in this file for AIA/CRLDP-style extras.
+type asn1PolicyQualifierInfo struct {
+	PolicyQualifierID asn1.ObjectIdentifier
+	Qualifier         asn1.RawValue
+}
+
+type asn1PolicyInformation struct {
+	PolicyIdentifier asn1.ObjectIdentifier
+	Qualifiers       []asn1PolicyQualifierInfo `asn1:"optional"`
+}
+
+// validateCertPolicyOIDs checks that every OID string parses as a valid
+// dotted-decimal ASN.1 object identifier.
+func validateCertPolicyOIDs(oids []string) error {
+	for _, s := range oids {
+		if s == "" {
+			return fmt.Errorf("certificate policies: empty OID string")
+		}
+		parts := strings.Split(s, ".")
+		if len(parts) < 2 {
+			return fmt.Errorf("certificate policies: %q is not a valid dotted-decimal OID", s)
+		}
+		for _, p := range parts {
+			if p == "" {
+				return fmt.Errorf("certificate policies: %q is not a valid dotted-decimal OID", s)
+			}
+			for _, c := range p {
+				if c < '0' || c > '9' {
+					return fmt.Errorf("certificate policies: %q is not a valid dotted-decimal OID", s)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// parseOIDString parses a dotted-decimal OID string into an
+// asn1.ObjectIdentifier. Callers must have already validated the string via
+// validateCertPolicyOIDs.
+func parseOIDString(s string) (asn1.ObjectIdentifier, error) {
+	parts := strings.Split(s, ".")
+	oid := make(asn1.ObjectIdentifier, len(parts))
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("parseOIDString: %q: %w", s, err)
+		}
+		oid[i] = n
+	}
+	return oid, nil
+}
+
+// applyCertPoliciesToTemplate embeds an RFC 5280 §4.2.1.4 Certificate
+// Policies extension via ExtraExtensions when oids is non-empty. When
+// cpsURI is non-empty, every policyInformation entry gets a CPS-pointer
+// qualifier; otherwise OIDs are emitted bare — the default, and the
+// recommended mode for a private/internal CA per plan discussion.
+func applyCertPoliciesToTemplate(template *x509.Certificate, oids []string, cpsURI string) error {
+	if len(oids) == 0 {
+		return nil
+	}
+
+	infos := make([]asn1PolicyInformation, 0, len(oids))
+	for _, s := range oids {
+		oid, err := parseOIDString(s)
+		if err != nil {
+			return fmt.Errorf("applyCertPoliciesToTemplate: %w", err)
+		}
+		info := asn1PolicyInformation{PolicyIdentifier: oid}
+		if cpsURI != "" {
+			qualifierBytes, err := asn1.Marshal(cpsURI)
+			if err != nil {
+				return fmt.Errorf("applyCertPoliciesToTemplate: marshal CPS URI: %w", err)
+			}
+			info.Qualifiers = []asn1PolicyQualifierInfo{
+				{
+					PolicyQualifierID: idQtCPS,
+					Qualifier:         asn1.RawValue{FullBytes: qualifierBytes},
+				},
+			}
+		}
+		infos = append(infos, info)
+	}
+
+	der, err := asn1.Marshal(infos)
+	if err != nil {
+		return fmt.Errorf("applyCertPoliciesToTemplate: marshal certificatePolicies: %w", err)
+	}
+
+	template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
+		Id:       idCeCertificatePolicies,
+		Critical: false,
+		Value:    der,
+	})
 	return nil
 }
 
@@ -149,35 +365,20 @@ func (r *CreateIntermediateCARequest) validate() error {
 // the keypair for and sign. The private key is returned to the caller once and
 // never stored.
 type IssueCertRequest struct {
-	// CAID is the issuing CA.
-	CAID uuid.UUID
-
-	// ProvisionerID is the provisioner authorising this issuance. It must exist and be active. It is recorded on the certificate for audit purposes.
-	ProvisionerID uuid.UUID
-
-	// Requester is a free-form string identifying who asked — e.g. an API key ,name, an ACME account key thumbprint, etc.
-	Requester string
-
-	// Subject
-	CommonName string
-
-	// SANs — at least one is strongly recommended; policy may require them.
-	SANsDNS   []string
-	SANsIP    []net.IP
-	SANsEmail []string
-
-	// KeyUsage and ExtKeyUsage control the certificate's intended purpose.
-	KeyUsage    x509.KeyUsage
-	ExtKeyUsage []x509.ExtKeyUsage
-
-	// TTLSeconds is the certificate lifetime. Must be positive.
-	TTLSeconds int64
-
-	// KeyAlgo is the algorithm for the generated leaf keypair.
-	KeyAlgo KeyAlgo
-
-	// Metadata is arbitrary key-value data stored alongside the certificate.
-	Metadata storage.JSON
+	CAID             uuid.UUID
+	ProvisionerID    uuid.UUID
+	Requester        string
+	CommonName       string
+	SANsDNS          []string
+	SANsIP           []net.IP
+	SANsEmail        []string
+	KeyUsage         x509.KeyUsage
+	ExtKeyUsage      []x509.ExtKeyUsage
+	TTLSeconds       int64
+	KeyAlgo          KeyAlgo
+	Metadata         storage.JSON
+	CertPolicyOIDs   []string
+	CertPolicyCPSURI string
 }
 
 func (r *IssueCertRequest) setDefaults() {
@@ -212,21 +413,23 @@ func (r *IssueCertRequest) validate() error {
 	if r.TTLSeconds <= 0 {
 		return errors.New("ca: IssueCertRequest: TTLSeconds must be positive")
 	}
+	if err := validateCertPolicyOIDs(r.CertPolicyOIDs); err != nil {
+		return fmt.Errorf("ca: IssueCertRequest: %w", err)
+	}
 	return nil
 }
 
 // SignCSRRequest asks the engine to sign an externally-provided CSR.
 // The caller already holds the private key; we only issue the certificate.
 type SignCSRRequest struct {
-	CAID          uuid.UUID
-	ProvisionerID uuid.UUID
-	Requester     string
-	// CSRPEM is the PEM-encoded certificate signing request.
-	CSRPEM []byte
-	// TTLSeconds is the certificate lifetime.
-	TTLSeconds int64
-	// Metadata is arbitrary key-value data stored alongside the certificate.
-	Metadata storage.JSON
+	CAID             uuid.UUID
+	ProvisionerID    uuid.UUID
+	Requester        string
+	CSRPEM           []byte
+	TTLSeconds       int64
+	Metadata         storage.JSON
+	CertPolicyOIDs   []string
+	CertPolicyCPSURI string
 }
 
 func (r *SignCSRRequest) setDefaults() {
@@ -244,6 +447,9 @@ func (r *SignCSRRequest) validate() error {
 	}
 	if len(r.CSRPEM) == 0 {
 		return errors.New("ca: SignCSRRequest: CSRPEM is required")
+	}
+	if err := validateCertPolicyOIDs(r.CertPolicyOIDs); err != nil {
+		return fmt.Errorf("ca: SignCSRRequest: %w", err)
 	}
 	return nil
 }
@@ -486,6 +692,11 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 			fmt.Sprintf("%s/v1/pki/ca/%s/crt", e.baseUrl, req.ParentCAID),
 		},
 	}
+
+	if err := applyNameConstraintsToTemplate(template, req.NameConstraints); err != nil {
+		return nil, fmt.Errorf("ca: CreateIntermediateCA: apply name constraints: %w", err)
+	}
+
 	certDER, err := x509.CreateCertificate(rand.Reader, template, parentCert, pubkey(privKey), parentKey)
 	if err != nil {
 		return nil, fmt.Errorf("ca: CreateIntermediateCA: sign certificate: %w", err)
@@ -499,17 +710,18 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 
 	parentID := req.ParentCAID
 	record := &storage.CertificateAuthority{
-		ID:        uuid.New(),
-		ParentID:  &parentID,
-		Name:      req.Name,
-		Type:      storage.CATypeIntermediate,
-		Status:    storage.CAStatusActive,
-		CertPEM:   string(certPEM),
-		KeyEnc:    encKey,
-		KeyAlgo:   string(req.KeyAlgo),
-		NotBefore: now,
-		NotAfter:  notAfter,
-		CreatedAt: now,
+		ID:              uuid.New(),
+		ParentID:        &parentID,
+		Name:            req.Name,
+		Type:            storage.CATypeIntermediate,
+		Status:          storage.CAStatusActive,
+		CertPEM:         string(certPEM),
+		KeyEnc:          encKey,
+		KeyAlgo:         string(req.KeyAlgo),
+		NameConstraints: req.NameConstraints,
+		NotBefore:       now,
+		NotAfter:        notAfter,
+		CreatedAt:       now,
 	}
 
 	if err := e.store.CreateCA(ctx, record); err != nil {
@@ -584,6 +796,10 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		},
 	}
 
+	if err := applyCertPoliciesToTemplate(template, req.CertPolicyOIDs, req.CertPolicyCPSURI); err != nil {
+		return nil, fmt.Errorf("ca: IssueCert: %w", err)
+	}
+
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, pubkey(leafKey), issuerKey)
 	if err != nil {
 		return nil, fmt.Errorf("ca: IssueCert: sign certificate: %w", err)
@@ -649,9 +865,16 @@ func (e *Engine) SignCSR(ctx context.Context, req SignCSRRequest) (*IssuedCertif
 	if err != nil {
 		return nil, fmt.Errorf("ca: SignCSR: parse CSR: %w", err)
 	}
-	// Verify the CSR's self-signature so we know the caller holds the private key.
 	if err := csr.CheckSignature(); err != nil {
 		return nil, fmt.Errorf("ca: SignCSR: CSR signature invalid: %w", err)
+	}
+
+	constraintsChain, err := e.collectNameConstraints(ctx, issuerRecord)
+	if err != nil {
+		return nil, fmt.Errorf("ca: SignCSR: %w", err)
+	}
+	if err := enforceNameConstraints(constraintsChain, csr.DNSNames, csr.IPAddresses, csr.EmailAddresses); err != nil {
+		return nil, fmt.Errorf("ca: SignCSR: %w", err)
 	}
 
 	serial, err := randomSerial()
@@ -691,6 +914,10 @@ func (e *Engine) SignCSR(ctx context.Context, req SignCSRRequest) (*IssuedCertif
 		IsCA:                  false,
 		SubjectKeyId:          ski,
 		AuthorityKeyId:        aki,
+	}
+
+	if err := applyCertPoliciesToTemplate(template, req.CertPolicyOIDs, req.CertPolicyCPSURI); err != nil {
+		return nil, fmt.Errorf("ca: SignCSR: %w", err)
 	}
 
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, csr.PublicKey, issuerKey)
@@ -986,4 +1213,162 @@ func keyUsageStrings(ku x509.KeyUsage, eku []x509.ExtKeyUsage) []string {
 	}
 
 	return out
+}
+
+// collectNameConstraints walks from issuer up through every ancestor CA
+// (via ParentID) to the root, returning the list of NameConstraints found
+// along the way (nearest ancestor first). Since only intermediates carry
+// name constraints in mint-ca, the root contributes nothing, but any
+// intermediate ancestor might — this must not stop at the immediate
+// issuer alone.
+func (e *Engine) collectNameConstraints(ctx context.Context, issuer *storage.CertificateAuthority) ([]*NameConstraints, error) {
+	var out []*NameConstraints
+
+	current := issuer
+	for {
+		if current.NameConstraints != nil {
+			out = append(out, current.NameConstraints)
+		}
+		if current.ParentID == nil {
+			break
+		}
+		parent, err := e.store.GetCA(ctx, *current.ParentID)
+		if err != nil {
+			return nil, fmt.Errorf("collectNameConstraints: load parent %s: %w", *current.ParentID, err)
+		}
+		if parent == nil {
+			return nil, fmt.Errorf("collectNameConstraints: parent CA %s not found — broken chain", *current.ParentID)
+		}
+		current = parent
+	}
+
+	return out, nil
+}
+
+// enforceNameConstraints checks a candidate leaf's SANs against every
+// ancestor's name constraints, failing fast with a clear error naming the
+// offending SAN and constraint if any ancestor rejects it. This is called
+// at issuance time (both IssueCert and SignCSR) since x509.CreateCertificate
+// itself does not enforce name constraints — only x509.Verify does, at
+// validation time by relying parties. Enforcing here gives operators an
+// immediate, actionable error instead of silently minting a
+// spec-non-compliant (or policy-violating) certificate.
+func enforceNameConstraints(constraintsChain []*NameConstraints, dnsNames []string, ips []net.IP, emails []string) error {
+	for _, nc := range constraintsChain {
+		if nc == nil {
+			continue
+		}
+
+		for _, dns := range dnsNames {
+			if err := checkDNSAgainstConstraints(dns, nc); err != nil {
+				return err
+			}
+		}
+		for _, ip := range ips {
+			if err := checkIPAgainstConstraints(ip, nc); err != nil {
+				return err
+			}
+		}
+		for _, email := range emails {
+			if err := checkEmailAgainstConstraints(email, nc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func checkDNSAgainstConstraints(dns string, nc *NameConstraints) error {
+	dns = strings.ToLower(strings.TrimSuffix(dns, "."))
+
+	for _, excluded := range nc.ExcludedDNSDomains {
+		if dnsMatchesConstraint(dns, excluded) {
+			return fmt.Errorf("name constraints: DNS SAN %q is excluded by ancestor CA constraint %q", dns, excluded)
+		}
+	}
+
+	if len(nc.PermittedDNSDomains) == 0 {
+		return nil
+	}
+	for _, permitted := range nc.PermittedDNSDomains {
+		if dnsMatchesConstraint(dns, permitted) {
+			return nil
+		}
+	}
+	return fmt.Errorf("name constraints: DNS SAN %q does not match any permitted domain of an ancestor CA (%s)",
+		dns, strings.Join(nc.PermittedDNSDomains, ", "))
+}
+
+// dnsMatchesConstraint implements RFC 5280 §4.2.1.10 DNS name-constraint
+// matching: the constraint "example.com" matches "example.com" and any
+// subdomain "*.example.com" (host.example.com, a.b.example.com, ...), but
+// not "notexample.com".
+func dnsMatchesConstraint(name, constraint string) bool {
+	constraint = strings.ToLower(strings.TrimSuffix(constraint, "."))
+	if name == constraint {
+		return true
+	}
+	return strings.HasSuffix(name, "."+constraint)
+}
+
+func checkIPAgainstConstraints(ip net.IP, nc *NameConstraints) error {
+	for _, cidr := range nc.ExcludedIPRanges {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue // already validated at CA-creation time; skip defensively
+		}
+		if ipnet.Contains(ip) {
+			return fmt.Errorf("name constraints: IP SAN %s is excluded by ancestor CA constraint %q", ip, cidr)
+		}
+	}
+
+	if len(nc.PermittedIPRanges) == 0 {
+		return nil
+	}
+	for _, cidr := range nc.PermittedIPRanges {
+		_, ipnet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			continue
+		}
+		if ipnet.Contains(ip) {
+			return nil
+		}
+	}
+	return fmt.Errorf("name constraints: IP SAN %s does not match any permitted range of an ancestor CA (%s)",
+		ip, strings.Join(nc.PermittedIPRanges, ", "))
+}
+
+func checkEmailAgainstConstraints(email string, nc *NameConstraints) error {
+	email = strings.ToLower(email)
+	domain := email
+	if at := strings.LastIndex(email, "@"); at >= 0 {
+		domain = email[at+1:]
+	}
+
+	matches := func(constraint string) bool {
+		constraint = strings.ToLower(constraint)
+		// A constraint containing "@" must match the full address; a bare
+		// domain constraint matches the domain part or any subdomain.
+		if strings.Contains(constraint, "@") {
+			return email == constraint
+		}
+		return domain == constraint || strings.HasSuffix(domain, "."+constraint)
+	}
+
+	for _, excluded := range nc.ExcludedEmailDomains {
+		if matches(excluded) {
+			return fmt.Errorf("name constraints: email SAN %q is excluded by ancestor CA constraint %q", email, excluded)
+		}
+	}
+
+	if len(nc.PermittedEmailDomains) == 0 {
+		return nil
+	}
+	for _, permitted := range nc.PermittedEmailDomains {
+		if matches(permitted) {
+			return nil
+		}
+	}
+	return fmt.Errorf("name constraints: email SAN %q does not match any permitted domain of an ancestor CA (%s)",
+		email, strings.Join(nc.PermittedEmailDomains, ", "))
 }

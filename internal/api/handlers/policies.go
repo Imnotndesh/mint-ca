@@ -36,6 +36,8 @@ type policyRequest struct {
 	AllowedSANs    []string            `json:"allowed_sans"`
 	RequireSAN     bool                `json:"require_san"`
 	KeyAlgos       []string            `json:"key_algos"`
+	PolicyOIDs     []string            `json:"policy_oids"`
+	CPSURI         string              `json:"cps_uri"`
 }
 
 func (h *PolicyHandler) create(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +57,8 @@ func (h *PolicyHandler) create(w http.ResponseWriter, r *http.Request) {
 		AllowedSANs:    req.AllowedSANs,
 		RequireSAN:     req.RequireSAN,
 		KeyAlgos:       req.KeyAlgos,
+		PolicyOIDs:     req.PolicyOIDs,
+		CPSURI:         req.CPSURI,
 		CreatedAt:      time.Now().UTC(),
 	}
 	if err := h.store.CreatePolicy(r.Context(), pol); err != nil {
@@ -109,6 +113,8 @@ func (h *PolicyHandler) update(w http.ResponseWriter, r *http.Request) {
 		AllowedSANs:    req.AllowedSANs,
 		RequireSAN:     req.RequireSAN,
 		KeyAlgos:       req.KeyAlgos,
+		PolicyOIDs:     req.PolicyOIDs,
+		CPSURI:         req.CPSURI,
 	}
 	if err := h.store.UpdatePolicy(r.Context(), pol); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

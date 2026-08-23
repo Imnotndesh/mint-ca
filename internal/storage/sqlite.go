@@ -91,25 +91,78 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 		}
 	}
 
+	// Add name_constraints column to certificate_authorities if it doesn't exist.
+	if err := addColumnIfAbsentSQLite(ctx, s.db, "certificate_authorities", "name_constraints",
+		"ALTER TABLE certificate_authorities ADD COLUMN name_constraints TEXT"); err != nil {
+		return err
+	}
+
+	// Add policy_oids / cps_uri columns to policies if they don't exist.
+	if err := addColumnIfAbsentSQLite(ctx, s.db, "policies", "policy_oids",
+		"ALTER TABLE policies ADD COLUMN policy_oids TEXT DEFAULT '[]'"); err != nil {
+		return err
+	}
+	if err := addColumnIfAbsentSQLite(ctx, s.db, "policies", "cps_uri",
+		"ALTER TABLE policies ADD COLUMN cps_uri TEXT DEFAULT ''"); err != nil {
+		return err
+	}
+
 	if _, err := s.db.ExecContext(ctx, sqliteNonceSchema); err != nil {
 		return err
 	}
 	return nil
 }
 
+// addColumnIfAbsentSQLite checks PRAGMA table_info(table) for columnName and,
+// if missing, runs alterSQL. Shared helper for the ADD COLUMN migration
+// idiom used throughout Migrate().
+func addColumnIfAbsentSQLite(ctx context.Context, db *sql.DB, table, columnName, alterSQL string) error {
+	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
+	if err != nil {
+		return fmt.Errorf("sqlite: query table_info(%s): %w", table, err)
+	}
+	var exists bool
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt interface{}
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("sqlite: scan table_info(%s): %w", table, err)
+		}
+		if name == columnName {
+			exists = true
+			break
+		}
+	}
+	err = rows.Close()
+	if err != nil {
+		return err
+	}
+	if exists {
+		return nil
+	}
+	if _, err := db.ExecContext(ctx, alterSQL); err != nil {
+		return fmt.Errorf("sqlite: add column %s.%s: %w", table, columnName, err)
+	}
+	return nil
+}
+
 const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS certificate_authorities (
-	id         TEXT    NOT NULL PRIMARY KEY,
-	parent_id  TEXT    REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
-	name       TEXT    NOT NULL UNIQUE,
-	type       TEXT    NOT NULL CHECK(type IN ('root','intermediate')),
-	status     TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
-	cert_pem   TEXT    NOT NULL,
-	key_enc    BLOB    NOT NULL,
-	key_algo   TEXT    NOT NULL,
-	not_before DATETIME NOT NULL,
-	not_after  DATETIME NOT NULL,
-	created_at DATETIME NOT NULL
+	id               TEXT    NOT NULL PRIMARY KEY,
+	parent_id        TEXT    REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
+	name             TEXT    NOT NULL UNIQUE,
+	type             TEXT    NOT NULL CHECK(type IN ('root','intermediate')),
+	status           TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	cert_pem         TEXT    NOT NULL,
+	key_enc          BLOB    NOT NULL,
+	key_algo         TEXT    NOT NULL,
+	name_constraints TEXT,
+	not_before       DATETIME NOT NULL,
+	not_after        DATETIME NOT NULL,
+	created_at       DATETIME NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS policies (
@@ -123,6 +176,8 @@ CREATE TABLE IF NOT EXISTS policies (
 	allowed_sans    TEXT    NOT NULL DEFAULT '[]',
 	require_san     INTEGER NOT NULL DEFAULT 0,
 	key_algos       TEXT    NOT NULL DEFAULT '[]',
+	policy_oids     TEXT    NOT NULL DEFAULT '[]',
+	cps_uri         TEXT    NOT NULL DEFAULT '',
 	created_at      DATETIME NOT NULL
 );
 
@@ -385,12 +440,39 @@ func sqlToUUIDValue(s *string) uuid.UUID {
 	return id
 }
 
+// marshalNameConstraints returns the JSON-encoded NameConstraints, or a
+// SQL NULL-equivalent empty string when nc is nil.
+func marshalNameConstraints(nc *NameConstraints) (interface{}, error) {
+	if nc == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(nc)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
+}
+
+func unmarshalNameConstraints(s *string) (*NameConstraints, error) {
+	if s == nil || *s == "" || *s == "null" {
+		return nil, nil
+	}
+	var nc NameConstraints
+	if err := json.Unmarshal([]byte(*s), &nc); err != nil {
+		return nil, err
+	}
+	return &nc, nil
+}
 func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) error {
-	_, err := s.db.ExecContext(ctx, `
+	ncStr, err := marshalNameConstraints(ca.NameConstraints)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateCA: marshal name_constraints: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificate_authorities
 			(id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-			 not_before, not_after, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 name_constraints, not_before, not_after, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ca.ID.String(),
 		uuidToSQL(ca.ParentID),
 		ca.Name,
@@ -399,6 +481,7 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 		ca.CertPEM,
 		ca.KeyEnc,
 		ca.KeyAlgo,
+		ncStr,
 		ca.NotBefore.UTC(),
 		ca.NotAfter.UTC(),
 		ca.CreatedAt.UTC(),
@@ -412,7 +495,7 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 func (s *sqliteStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuthority, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       not_before, not_after, created_at
+		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities WHERE id = ?`, id.String())
 	ca, err := scanCA(row)
 	if err != nil {
@@ -424,7 +507,7 @@ func (s *sqliteStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuth
 func (s *sqliteStore) GetCAByName(ctx context.Context, name string) (*CertificateAuthority, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       not_before, not_after, created_at
+		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities WHERE name = ?`, name)
 	ca, err := scanCA(row)
 	if err != nil {
@@ -436,7 +519,7 @@ func (s *sqliteStore) GetCAByName(ctx context.Context, name string) (*Certificat
 func (s *sqliteStore) ListCAs(ctx context.Context) ([]*CertificateAuthority, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       not_before, not_after, created_at
+		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: ListCAs: %w", err)
@@ -448,7 +531,7 @@ func (s *sqliteStore) ListCAs(ctx context.Context) ([]*CertificateAuthority, err
 func (s *sqliteStore) ListChildCAs(ctx context.Context, parentID uuid.UUID) ([]*CertificateAuthority, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       not_before, not_after, created_at
+		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities WHERE parent_id = ? ORDER BY created_at ASC`,
 		parentID.String())
 	if err != nil {
@@ -475,9 +558,11 @@ func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 	var ca CertificateAuthority
 	var idStr string
 	var parentIDStr *string
+	var ncStr *string
 	err := row.Scan(
 		&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 		&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
+		&ncStr,
 		&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
@@ -488,7 +573,38 @@ func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 	}
 	ca.ID = uuid.MustParse(idStr)
 	ca.ParentID = sqlToUUID(parentIDStr)
+	ca.NameConstraints, err = unmarshalNameConstraints(ncStr)
+	if err != nil {
+		return nil, fmt.Errorf("scanCA: unmarshal name_constraints: %w", err)
+	}
 	return &ca, nil
+}
+
+func scanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
+	var out []*CertificateAuthority
+	for rows.Next() {
+		var ca CertificateAuthority
+		var idStr string
+		var parentIDStr *string
+		var ncStr *string
+		if err := rows.Scan(
+			&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
+			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
+			&ncStr,
+			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		ca.ID = uuid.MustParse(idStr)
+		ca.ParentID = sqlToUUID(parentIDStr)
+		nc, err := unmarshalNameConstraints(ncStr)
+		if err != nil {
+			return nil, fmt.Errorf("scanCAs: unmarshal name_constraints: %w", err)
+		}
+		ca.NameConstraints = nc
+		out = append(out, &ca)
+	}
+	return out, rows.Err()
 }
 
 // ListChallengesByAuthorization returns all challenges belonging to a given authorization.
@@ -512,26 +628,6 @@ func (s *postgresStore) ListChallengesByAuthorization(ctx context.Context, authI
 		c.OrderID = uuid.MustParse(orderIDStr)
 		c.AuthorizationID = pgSQLToUUID(authIDStr)
 		out = append(out, &c)
-	}
-	return out, rows.Err()
-}
-
-func scanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
-	var out []*CertificateAuthority
-	for rows.Next() {
-		var ca CertificateAuthority
-		var idStr string
-		var parentIDStr *string
-		if err := rows.Scan(
-			&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
-			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
-			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		ca.ID = uuid.MustParse(idStr)
-		ca.ParentID = sqlToUUID(parentIDStr)
-		out = append(out, &ca)
 	}
 	return out, rows.Err()
 }
@@ -796,6 +892,7 @@ func (s *sqliteStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	ai, _ := marshalStringSlice(p.AllowedIPs)
 	as_, _ := marshalStringSlice(p.AllowedSANs)
 	ka, _ := marshalStringSlice(p.KeyAlgos)
+	po, _ := marshalStringSlice(p.PolicyOIDs)
 	requireSAN := 0
 	if p.RequireSAN {
 		requireSAN = 1
@@ -803,10 +900,10 @@ func (s *sqliteStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO policies
 			(id, name, scope, max_ttl_seconds, allowed_domains, denied_domains,
-			 allowed_ips, allowed_sans, require_san, key_algos, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID.String(), p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, requireSAN, ka, p.CreatedAt.UTC(),
+		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI, p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreatePolicy: %w", err)
@@ -846,6 +943,7 @@ func (s *sqliteStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 	ai, _ := marshalStringSlice(p.AllowedIPs)
 	as_, _ := marshalStringSlice(p.AllowedSANs)
 	ka, _ := marshalStringSlice(p.KeyAlgos)
+	po, _ := marshalStringSlice(p.PolicyOIDs)
 	requireSAN := 0
 	if p.RequireSAN {
 		requireSAN = 1
@@ -855,10 +953,10 @@ func (s *sqliteStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 			name = ?, scope = ?, max_ttl_seconds = ?,
 			allowed_domains = ?, denied_domains = ?,
 			allowed_ips = ?, allowed_sans = ?,
-			require_san = ?, key_algos = ?
+			require_san = ?, key_algos = ?, policy_oids = ?, cps_uri = ?
 		WHERE id = ?`,
 		p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, requireSAN, ka,
+		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI,
 		p.ID.String(),
 	)
 	if err != nil {
@@ -870,27 +968,19 @@ func (s *sqliteStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 	return nil
 }
 
-func (s *sqliteStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM policies WHERE id = ?`, id.String())
-	if err != nil {
-		return fmt.Errorf("sqlite: DeletePolicy: %w", err)
-	}
-	return nil
-}
-
 const policySelectSQL = `
 	SELECT id, name, scope, max_ttl_seconds,
 	       allowed_domains, denied_domains, allowed_ips, allowed_sans,
-	       require_san, key_algos, created_at
+	       require_san, key_algos, policy_oids, cps_uri, created_at
 	FROM policies`
 
 func scanPolicy(row *sql.Row) (*Policy, error) {
 	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr string
+	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
 	var requireSAN int
 	err := row.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -905,16 +995,17 @@ func scanPolicy(row *sql.Row) (*Policy, error) {
 	p.AllowedIPs, _ = unmarshalStringSlice(aiStr)
 	p.AllowedSANs, _ = unmarshalStringSlice(asStr)
 	p.KeyAlgos, _ = unmarshalStringSlice(kaStr)
+	p.PolicyOIDs, _ = unmarshalStringSlice(poStr)
 	return &p, nil
 }
 
 func scanPolicyRows(rows *sql.Rows) (*Policy, error) {
 	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr string
+	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
 	var requireSAN int
 	if err := rows.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -925,7 +1016,16 @@ func scanPolicyRows(rows *sql.Rows) (*Policy, error) {
 	p.AllowedIPs, _ = unmarshalStringSlice(aiStr)
 	p.AllowedSANs, _ = unmarshalStringSlice(asStr)
 	p.KeyAlgos, _ = unmarshalStringSlice(kaStr)
+	p.PolicyOIDs, _ = unmarshalStringSlice(poStr)
 	return &p, nil
+}
+
+func (s *sqliteStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM policies WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: DeletePolicy: %w", err)
+	}
+	return nil
 }
 
 func (s *sqliteStore) CreateACMEAccount(ctx context.Context, a *ACMEAccount) error {

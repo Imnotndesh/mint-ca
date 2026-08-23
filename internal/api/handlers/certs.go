@@ -48,7 +48,7 @@ type issueCertRequest struct {
 	Metadata      storage.JSON `json:"metadata"`
 }
 
-func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
+func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request){ 
 	var req issueCertRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -81,8 +81,10 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		algo = string(ca.DefaultKeyAlgo)
 	}
 
-	// Policy evaluation before any crypto work.
-	if err := h.policy.Evaluate(r.Context(), policy.CertRequest{
+	// Policy evaluation before any crypto work. The matched policy (if any)
+	// supplies the Certificate Policies OIDs/CPS URI to embed at issuance —
+	// avoids a second DB round-trip to re-resolve the same policy.
+	matchedPolicy, err := h.policy.Evaluate(r.Context(), policy.CertRequest{
 		CAID:          caID,
 		ProvisionerID: provID,
 		CommonName:    req.CommonName,
@@ -91,7 +93,8 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		SANsEmail:     req.SANsEmail,
 		TTLSeconds:    req.TTLSeconds,
 		KeyAlgo:       algo,
-	}); err != nil {
+	})
+	if err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -107,19 +110,28 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		eku = append(eku, gox509.ExtKeyUsageClientAuth)
 	}
 
+	var certPolicyOIDs []string
+	var certPolicyCPSURI string
+	if matchedPolicy != nil {
+		certPolicyOIDs = matchedPolicy.PolicyOIDs
+		certPolicyCPSURI = matchedPolicy.CPSURI
+	}
+
 	issued, err := h.engine.IssueCert(r.Context(), ca.IssueCertRequest{
-		CAID:          caID,
-		ProvisionerID: provID,
-		Requester:     actorFromContext(r),
-		CommonName:    req.CommonName,
-		SANsDNS:       req.SANsDNS,
-		SANsIP:        ips,
-		SANsEmail:     req.SANsEmail,
-		TTLSeconds:    req.TTLSeconds,
-		KeyAlgo:       ca.KeyAlgo(algo),
-		KeyUsage:      ku,
-		ExtKeyUsage:   eku,
-		Metadata:      req.Metadata,
+		CAID:             caID,
+		ProvisionerID:    provID,
+		Requester:        actorFromContext(r),
+		CommonName:       req.CommonName,
+		SANsDNS:          req.SANsDNS,
+		SANsIP:           ips,
+		SANsEmail:        req.SANsEmail,
+		TTLSeconds:       req.TTLSeconds,
+		KeyAlgo:          ca.KeyAlgo(algo),
+		KeyUsage:         ku,
+		ExtKeyUsage:      eku,
+		Metadata:         req.Metadata,
+		CertPolicyOIDs:   certPolicyOIDs,
+		CertPolicyCPSURI: certPolicyCPSURI,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

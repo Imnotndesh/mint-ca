@@ -124,17 +124,18 @@ type SANs struct {
 
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.
 type CertificateAuthority struct {
-	ID        uuid.UUID  `json:"id"`
-	ParentID  *uuid.UUID `json:"parent_id,omitempty"`
-	Name      string     `json:"name"`
-	Type      CAType     `json:"type"`
-	Status    CAStatus   `json:"status"`
-	CertPEM   string     `json:"cert_pem"`
-	KeyEnc    []byte     `json:"-"`
-	KeyAlgo   string     `json:"key_algo"`
-	NotBefore time.Time  `json:"not_before"`
-	NotAfter  time.Time  `json:"not_after"`
-	CreatedAt time.Time  `json:"created_at"`
+	ID              uuid.UUID        `json:"id"`
+	ParentID        *uuid.UUID       `json:"parent_id,omitempty"`
+	Name            string           `json:"name"`
+	Type            CAType           `json:"type"`
+	Status          CAStatus         `json:"status"`
+	CertPEM         string           `json:"cert_pem"`
+	KeyEnc          []byte           `json:"-"`
+	KeyAlgo         string           `json:"key_algo"`
+	NameConstraints *NameConstraints `json:"name_constraints,omitempty"`
+	NotBefore       time.Time        `json:"not_before"`
+	NotAfter        time.Time        `json:"not_after"`
+	CreatedAt       time.Time        `json:"created_at"`
 }
 
 // SSHCertificateAuthority is a signing key used to issue SSH user/host
@@ -242,7 +243,17 @@ type Policy struct {
 	AllowedSANs    []string    `json:"allowed_sans"`
 	RequireSAN     bool        `json:"require_san"`
 	KeyAlgos       []string    `json:"key_algos"`
+	PolicyOIDs     []string    `json:"policy_oids,omitempty"` // dotted-decimal OID strings
+	CPSURI         string      `json:"cps_uri,omitempty"`
 	CreatedAt      time.Time   `json:"created_at"`
+}
+type NameConstraints struct {
+	PermittedDNSDomains   []string `json:"permitted_dns_domains,omitempty"`
+	ExcludedDNSDomains    []string `json:"excluded_dns_domains,omitempty"`
+	PermittedIPRanges     []string `json:"permitted_ip_ranges,omitempty"`
+	ExcludedIPRanges      []string `json:"excluded_ip_ranges,omitempty"`
+	PermittedEmailDomains []string `json:"permitted_email_domains,omitempty"`
+	ExcludedEmailDomains  []string `json:"excluded_email_domains,omitempty"`
 }
 
 // ACMEAccount is an ACME client account, keyed by its JWK thumbprint.

@@ -59,23 +59,33 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, postgresSchema); err != nil {
 		return err
 	}
-	_, err := s.db.ExecContext(ctx, postgresNonceSchema)
-	return err
+	if _, err := s.db.ExecContext(ctx, postgresNonceSchema); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE certificate_authorities ADD COLUMN IF NOT EXISTS name_constraints TEXT;
+		ALTER TABLE policies ADD COLUMN IF NOT EXISTS policy_oids TEXT DEFAULT '[]';
+		ALTER TABLE policies ADD COLUMN IF NOT EXISTS cps_uri TEXT DEFAULT '';
+	`); err != nil {
+		return fmt.Errorf("postgres: migrate additive columns: %w", err)
+	}
+	return nil
 }
 
 const postgresSchema = `
 CREATE TABLE IF NOT EXISTS certificate_authorities (
-	id         TEXT        NOT NULL PRIMARY KEY,
-	parent_id  TEXT        REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
-	name       TEXT        NOT NULL UNIQUE,
-	type       TEXT        NOT NULL CHECK(type IN ('root','intermediate')),
-	status     TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
-	cert_pem   TEXT        NOT NULL,
-	key_enc    BYTEA       NOT NULL,
-	key_algo   TEXT        NOT NULL,
-	not_before TIMESTAMPTZ NOT NULL,
-	not_after  TIMESTAMPTZ NOT NULL,
-	created_at TIMESTAMPTZ NOT NULL
+	id               TEXT        NOT NULL PRIMARY KEY,
+	parent_id        TEXT        REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
+	name             TEXT        NOT NULL UNIQUE,
+	type             TEXT        NOT NULL CHECK(type IN ('root','intermediate')),
+	status           TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	cert_pem         TEXT        NOT NULL,
+	key_enc          BYTEA       NOT NULL,
+	key_algo         TEXT        NOT NULL,
+	name_constraints TEXT,
+	not_before       TIMESTAMPTZ NOT NULL,
+	not_after        TIMESTAMPTZ NOT NULL,
+	created_at       TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS policies (
@@ -89,6 +99,8 @@ CREATE TABLE IF NOT EXISTS policies (
 	allowed_sans    TEXT        NOT NULL DEFAULT '[]',
 	require_san     BOOLEAN     NOT NULL DEFAULT FALSE,
 	key_algos       TEXT        NOT NULL DEFAULT '[]',
+	policy_oids     TEXT        NOT NULL DEFAULT '[]',
+	cps_uri         TEXT        NOT NULL DEFAULT '',
 	created_at      TIMESTAMPTZ NOT NULL
 );
 
@@ -309,6 +321,16 @@ func pgUnmarshalStringSlice(s string) ([]string, error) {
 	var out []string
 	return out, json.Unmarshal([]byte(s), &out)
 }
+func pgUnmarshalNameConstraints(s *string) (*NameConstraints, error) {
+	if s == nil || *s == "" || *s == "null" {
+		return nil, nil
+	}
+	var nc NameConstraints
+	if err := json.Unmarshal([]byte(*s), &nc); err != nil {
+		return nil, err
+	}
+	return &nc, nil
+}
 
 func pgUUIDToSQL(id *uuid.UUID) interface{} {
 	if id == nil {
@@ -350,19 +372,34 @@ func pgSQLToUUID(s *string) *uuid.UUID {
 }
 
 func (s *postgresStore) CreateCA(ctx context.Context, ca *CertificateAuthority) error {
-	_, err := s.db.ExecContext(ctx, `
+	ncStr, err := pgMarshalNameConstraints(ca.NameConstraints)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateCA: marshal name_constraints: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificate_authorities
 			(id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-			 not_before, not_after, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			 name_constraints, not_before, not_after, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		ca.ID.String(), pgUUIDToSQL(ca.ParentID), ca.Name,
 		string(ca.Type), string(ca.Status), ca.CertPEM, ca.KeyEnc, ca.KeyAlgo,
-		ca.NotBefore.UTC(), ca.NotAfter.UTC(), ca.CreatedAt.UTC(),
+		ncStr, ca.NotBefore.UTC(), ca.NotAfter.UTC(), ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateCA: %w", err)
 	}
 	return nil
+}
+
+func pgMarshalNameConstraints(nc *NameConstraints) (interface{}, error) {
+	if nc == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(nc)
+	if err != nil {
+		return nil, err
+	}
+	return string(b), nil
 }
 
 func (s *postgresStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuthority, error) {
@@ -418,16 +455,18 @@ func (s *postgresStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status
 
 const pgCASelectSQL = `
 	SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-	       not_before, not_after, created_at
+	       name_constraints, not_before, not_after, created_at
 	FROM certificate_authorities`
 
 func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
 	var ca CertificateAuthority
 	var idStr string
 	var parentIDStr *string
+	var ncStr *string
 	err := row.Scan(
 		&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 		&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
+		&ncStr,
 		&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -438,6 +477,11 @@ func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
 	}
 	ca.ID = uuid.MustParse(idStr)
 	ca.ParentID = pgSQLToUUID(parentIDStr)
+	nc, err := pgUnmarshalNameConstraints(ncStr)
+	if err != nil {
+		return nil, fmt.Errorf("pgScanCA: unmarshal name_constraints: %w", err)
+	}
+	ca.NameConstraints = nc
 	return &ca, nil
 }
 
@@ -447,15 +491,22 @@ func pgScanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 		var ca CertificateAuthority
 		var idStr string
 		var parentIDStr *string
+		var ncStr *string
 		if err := rows.Scan(
 			&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
+			&ncStr,
 			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
 		ca.ParentID = pgSQLToUUID(parentIDStr)
+		nc, err := pgUnmarshalNameConstraints(ncStr)
+		if err != nil {
+			return nil, fmt.Errorf("pgScanCAs: unmarshal name_constraints: %w", err)
+		}
+		ca.NameConstraints = nc
 		out = append(out, &ca)
 	}
 	return out, rows.Err()
@@ -718,27 +769,19 @@ func (s *postgresStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	ai, _ := pgMarshalStringSlice(p.AllowedIPs)
 	as_, _ := pgMarshalStringSlice(p.AllowedSANs)
 	ka, _ := pgMarshalStringSlice(p.KeyAlgos)
+	po, _ := pgMarshalStringSlice(p.PolicyOIDs)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO policies
 			(id, name, scope, max_ttl_seconds, allowed_domains, denied_domains,
-			 allowed_ips, allowed_sans, require_san, key_algos, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		p.ID.String(), p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, p.RequireSAN, ka, p.CreatedAt.UTC(),
+		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreatePolicy: %w", err)
 	}
 	return nil
-}
-
-func (s *postgresStore) GetPolicy(ctx context.Context, id uuid.UUID) (*Policy, error) {
-	row := s.db.QueryRowContext(ctx, pgPolicySelectSQL+" WHERE id = $1", id.String())
-	p, err := pgScanPolicy(row)
-	if err != nil {
-		return nil, fmt.Errorf("postgres: GetPolicy: %w", err)
-	}
-	return p, nil
 }
 
 func (s *postgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
@@ -750,10 +793,10 @@ func (s *postgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 	var out []*Policy
 	for rows.Next() {
 		var p Policy
-		var idStr, adStr, ddStr, aiStr, asStr, kaStr string
+		var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
 		if err := rows.Scan(
 			&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-			&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &p.CreatedAt,
+			&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -763,9 +806,18 @@ func (s *postgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 		p.AllowedIPs, _ = pgUnmarshalStringSlice(aiStr)
 		p.AllowedSANs, _ = pgUnmarshalStringSlice(asStr)
 		p.KeyAlgos, _ = pgUnmarshalStringSlice(kaStr)
+		p.PolicyOIDs, _ = pgUnmarshalStringSlice(poStr)
 		out = append(out, &p)
 	}
 	return out, rows.Err()
+}
+func (s *postgresStore) GetPolicy(ctx context.Context, id uuid.UUID) (*Policy, error) {
+	row := s.db.QueryRowContext(ctx, policySelectSQL+" WHERE id = ?", id.String())
+	p, err := scanPolicy(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetPolicy: %w", err)
+	}
+	return p, nil
 }
 
 func (s *postgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
@@ -774,15 +826,16 @@ func (s *postgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 	ai, _ := pgMarshalStringSlice(p.AllowedIPs)
 	as_, _ := pgMarshalStringSlice(p.AllowedSANs)
 	ka, _ := pgMarshalStringSlice(p.KeyAlgos)
+	po, _ := pgMarshalStringSlice(p.PolicyOIDs)
 	_, err := s.db.ExecContext(ctx, `
 		UPDATE policies SET
 			name = $1, scope = $2, max_ttl_seconds = $3,
 			allowed_domains = $4, denied_domains = $5,
 			allowed_ips = $6, allowed_sans = $7,
-			require_san = $8, key_algos = $9
-		WHERE id = $10`,
+			require_san = $8, key_algos = $9, policy_oids = $10, cps_uri = $11
+		WHERE id = $12`,
 		p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, p.RequireSAN, ka, p.ID.String(),
+		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, p.ID.String(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: UpdatePolicy: %w", err)
@@ -790,26 +843,18 @@ func (s *postgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 	return nil
 }
 
-func (s *postgresStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM policies WHERE id = $1`, id.String())
-	if err != nil {
-		return fmt.Errorf("postgres: DeletePolicy: %w", err)
-	}
-	return nil
-}
-
 const pgPolicySelectSQL = `
 	SELECT id, name, scope, max_ttl_seconds,
 	       allowed_domains, denied_domains, allowed_ips, allowed_sans,
-	       require_san, key_algos, created_at
+	       require_san, key_algos, policy_oids, cps_uri, created_at
 	FROM policies`
 
 func pgScanPolicy(row *sql.Row) (*Policy, error) {
 	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr string
+	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
 	err := row.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -823,7 +868,16 @@ func pgScanPolicy(row *sql.Row) (*Policy, error) {
 	p.AllowedIPs, _ = pgUnmarshalStringSlice(aiStr)
 	p.AllowedSANs, _ = pgUnmarshalStringSlice(asStr)
 	p.KeyAlgos, _ = pgUnmarshalStringSlice(kaStr)
+	p.PolicyOIDs, _ = pgUnmarshalStringSlice(poStr)
 	return &p, nil
+}
+
+func (s *postgresStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM policies WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: DeletePolicy: %w", err)
+	}
+	return nil
 }
 
 func (s *postgresStore) CreateACMEAccount(ctx context.Context, a *ACMEAccount) error {
