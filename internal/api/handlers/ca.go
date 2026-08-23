@@ -67,16 +67,17 @@ func (h *CAHandler) createRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 type createIntermediateRequest struct {
-	ParentCAID   string `json:"parent_ca_id"`
-	Name         string `json:"name"`
-	CommonName   string `json:"common_name"`
-	Organization string `json:"organization"`
-	Country      string `json:"country"`
-	State        string `json:"state"`
-	Locality     string `json:"locality"`
-	KeyAlgo      string `json:"key_algo"`
-	TTLDays      int    `json:"ttl_days"`
-	MaxPathLen   int    `json:"max_path_len"`
+	ParentCAID      string                   `json:"parent_ca_id"`
+	Name            string                   `json:"name"`
+	CommonName      string                   `json:"common_name"`
+	Organization    string                   `json:"organization"`
+	Country         string                   `json:"country"`
+	State           string                   `json:"state"`
+	Locality        string                   `json:"locality"`
+	KeyAlgo         string                   `json:"key_algo"`
+	TTLDays         int                      `json:"ttl_days"`
+	MaxPathLen      int                      `json:"max_path_len"`
+	NameConstraints *storage.NameConstraints `json:"name_constraints,omitempty"`
 }
 
 func (h *CAHandler) createIntermediate(w http.ResponseWriter, r *http.Request) {
@@ -93,16 +94,17 @@ func (h *CAHandler) createIntermediate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	record, err := h.engine.CreateIntermediateCA(r.Context(), ca.CreateIntermediateCARequest{
-		ParentCAID:   parentID,
-		Name:         req.Name,
-		CommonName:   req.CommonName,
-		Organization: req.Organization,
-		Country:      req.Country,
-		State:        req.State,
-		Locality:     req.Locality,
-		KeyAlgo:      ca.KeyAlgo(req.KeyAlgo),
-		TTLDays:      req.TTLDays,
-		MaxPathLen:   req.MaxPathLen,
+		ParentCAID:      parentID,
+		Name:            req.Name,
+		CommonName:      req.CommonName,
+		Organization:    req.Organization,
+		Country:         req.Country,
+		State:           req.State,
+		Locality:        req.Locality,
+		KeyAlgo:         ca.KeyAlgo(req.KeyAlgo),
+		TTLDays:         req.TTLDays,
+		MaxPathLen:      req.MaxPathLen,
+		NameConstraints: req.NameConstraints,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

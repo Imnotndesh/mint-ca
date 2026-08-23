@@ -59,28 +59,27 @@ func NewEngine(store storage.Store) *Engine {
 //  2. If the provisioner has a policy attached, evaluate it. Result is final.
 //  3. If not, look for a CA-scoped policy. Evaluate it if found. Result is final.
 //  4. If no policy applies, permit.
-func (e *Engine) Evaluate(ctx context.Context, req CertRequest) error {
+func (e *Engine) Evaluate(ctx context.Context, req CertRequest) (*storage.Policy, error) {
 	if req.ProvisionerID == uuid.Nil {
-		return errors.New("policy: ProvisionerID is required")
+		return nil, errors.New("policy: ProvisionerID is required")
 	}
 	if req.CAID == uuid.Nil {
-		return errors.New("policy: CAID is required")
+		return nil, errors.New("policy: CAID is required")
 	}
 
 	provisioner, err := e.store.GetProvisioner(ctx, req.ProvisionerID)
 	if err != nil {
-		return fmt.Errorf("policy: load provisioner: %w", err)
+		return nil, fmt.Errorf("policy: load provisioner: %w", err)
 	}
 	if provisioner == nil {
-		return fmt.Errorf("policy: provisioner %s does not exist", req.ProvisionerID)
+		return nil, fmt.Errorf("policy: provisioner %s does not exist", req.ProvisionerID)
 	}
 	if provisioner.Status != storage.ProvisionerStatusActive {
-		return fmt.Errorf("policy: provisioner %q is disabled", provisioner.Name)
+		return nil, fmt.Errorf("policy: provisioner %q is disabled", provisioner.Name)
 	}
 
-	// Confirm the provisioner actually belongs to the CA being requested.
 	if provisioner.CAID != req.CAID {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"policy: provisioner %q belongs to CA %s, not %s",
 			provisioner.Name, provisioner.CAID, req.CAID,
 		)
@@ -89,29 +88,28 @@ func (e *Engine) Evaluate(ctx context.Context, req CertRequest) error {
 	if provisioner.PolicyID != nil {
 		pol, err := e.store.GetPolicy(ctx, *provisioner.PolicyID)
 		if err != nil {
-			return fmt.Errorf("policy: load provisioner policy: %w", err)
+			return nil, fmt.Errorf("policy: load provisioner policy: %w", err)
 		}
 		if pol != nil {
 			if err := evaluate(pol, req); err != nil {
-				return fmt.Errorf("policy: provisioner %q denied: %w", provisioner.Name, err)
+				return nil, fmt.Errorf("policy: provisioner %q denied: %w", provisioner.Name, err)
 			}
-			// Provisioner policy passed — result is final.
-			return nil
+			return pol, nil
 		}
 	}
 
 	caPolicy, err := e.findCAPolicy(ctx, req.CAID)
 	if err != nil {
-		return fmt.Errorf("policy: load CA policy: %w", err)
+		return nil, fmt.Errorf("policy: load CA policy: %w", err)
 	}
 	if caPolicy != nil {
 		if err := evaluate(caPolicy, req); err != nil {
-			return fmt.Errorf("policy: CA policy denied: %w", err)
+			return nil, fmt.Errorf("policy: CA policy denied: %w", err)
 		}
-		return nil
+		return caPolicy, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
 // findCAPolicy scans all policies looking for one scoped to the given CA.
