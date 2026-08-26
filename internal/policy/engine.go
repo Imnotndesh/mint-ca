@@ -254,6 +254,12 @@ func matchDomain(pattern, domain string) bool {
 		return true
 	}
 
+	// Bare "*" matches any single label with no dots (RFC-style single-label
+	// wildcard). E.g. "*" matches "foo" but not "foo.com" or "foo.bar.com".
+	if pattern == "*" {
+		return domain != "" && !strings.Contains(domain, ".")
+	}
+
 	// Wildcard match: pattern must start with "*." and the remainder must
 	// be a non-empty suffix of the domain with exactly one label before it.
 	if strings.HasPrefix(pattern, "*.") {
