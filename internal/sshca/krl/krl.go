@@ -6,20 +6,27 @@ package krl
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"time"
 
 	"mint-ca/internal/storage"
 
 	"github.com/google/uuid"
+	"golang.org/x/crypto/ssh"
 )
 
+// KRL section types (OpenSSH PROTOCOL.krl).
 const (
 	krlMagic       = "SSHKRL\x00\x00" // 8 bytes: "SSHKRL" + 2 NUL padding
 	krlFormatVers  = uint32(1)
-	sectCertificat = byte(1) // KRL_SECTION_CERTIFICATES
-	certSectSerial = byte(2) // KRL_CERT_SECTION_SERIAL_LIST
+	sectCertificat = byte(1)  // KRL_SECTION_CERTIFICATES
+	sectExplicitKey = byte(2) // KRL_SECTION_EXPLICIT_KEY
+	sectFpSHA1     = byte(3)  // KRL_SECTION_FINGERPRINT_SHA1
+	sectFpSHA256   = byte(5)  // KRL_SECTION_FINGERPRINT_SHA256
+	certSectSerial = byte(2)  // KRL_CERT_SECTION_SERIAL_LIST
 )
 
 // Manager generates and caches KRLs for SSH CAs, mirroring
@@ -173,7 +180,73 @@ func encode(version uint64, generated time.Time, revoked []*storage.SSHCertifica
 		buf.Write(certSect.Bytes())
 	}
 
+	// Revoke the revoked certificates' underlying PLAIN keys too, so a raw key
+	// is rejected even without its certificate. Two sections are emitted:
+	//   KRL_SECTION_EXPLICIT_KEY        — the raw public key blobs
+	//   KRL_SECTION_FINGERPRINT_SHA256  — SHA256 hash of each key blob
+	keys, err := plainKeyBlobs(revoked)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeStringListSection(&buf, sectExplicitKey, keys); err != nil {
+		return nil, err
+	}
+
+	hashes := make([][]byte, 0, len(keys))
+	for _, k := range keys {
+		sum := sha256.Sum256(k)
+		hashes = append(hashes, sum[:])
+	}
+	// OpenSSH requires fingerprint hashes in ascending numeric (big-endian) order.
+	sort.Slice(hashes, func(i, j int) bool { return bytes.Compare(hashes[i], hashes[j]) < 0 })
+	if err := writeStringListSection(&buf, sectFpSHA256, hashes); err != nil {
+		return nil, err
+	}
+
 	return buf.Bytes(), nil
+}
+
+// plainKeyBlobs extracts, for each revoked certificate, the raw wire-format
+// blob of its plain (signed) public key. The stored PublicKey field is an
+// OpenSSH authorized_keys line; we re-parse it to recover the raw blob.
+func plainKeyBlobs(revoked []*storage.SSHCertificate) ([][]byte, error) {
+	seen := make(map[string]bool)
+	var out [][]byte
+	for _, c := range revoked {
+		if c.PublicKey == "" {
+			continue
+		}
+		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(c.PublicKey))
+		if err != nil {
+			continue // skip unparseable; serial-based revocation still applies
+		}
+		blob := pub.Marshal()
+		if seen[string(blob)] {
+			continue
+		}
+		seen[string(blob)] = true
+		out = append(out, blob)
+	}
+	return out, nil
+}
+
+// writeStringListSection writes a KRL section (type byte + u32 length prefixed
+// string body) whose body is a sequence of length-prefixed strings, per the
+// PROTOCOL.krl explicit-key / fingerprint section layout. Writes nothing when
+// items is empty.
+func writeStringListSection(buf *bytes.Buffer, sectionType byte, items [][]byte) error {
+	if len(items) == 0 {
+		return nil
+	}
+	var body bytes.Buffer
+	for _, it := range items {
+		writeU32(&body, uint32(len(it)))
+		body.Write(it)
+	}
+	buf.WriteByte(sectionType)
+	writeU32(buf, uint32(body.Len()))
+	buf.Write(body.Bytes())
+	return nil
 }
 
 func writeU32(buf *bytes.Buffer, v uint32) {

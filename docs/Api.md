@@ -501,6 +501,11 @@ Revoke an SSH certificate. No request body.
 ### `GET /pki/sshca/{caID}/krl`
 Public (no auth). Binary OpenSSH Key Revocation List (`application/octet-stream`), unsigned —
 authenticity relies on HTTPS transport, same trust model as the x509 CRL/OCSP endpoints.
+Each revoked certificate is revoked three ways in the KRL: by certificate serial
+(`KRL_SECTION_CERTIFICATES`), by explicit raw key (`KRL_SECTION_EXPLICIT_KEY`), and by
+SHA256 key fingerprint (`KRL_SECTION_FINGERPRINT_SHA256`). The explicit-key and fingerprint
+sections reject the revoked certificate's underlying plain key even if the certificate is
+never presented — covering both cert- and raw-key-based use.
 
 **Note:** unlike CRL, sshd does not fetch KRLs live. Configure `sshd_config`:
 ---
