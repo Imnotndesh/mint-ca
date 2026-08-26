@@ -1119,6 +1119,42 @@ func (s *Service) CertificateURL(provisionerID, certID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/certificate/%s", s.baseURL, provisionerID, certID)
 }
 
+func (s *Service) RenewalInfoURL(provisionerID, certID uuid.UUID) string {
+	return fmt.Sprintf("%s/acme/%s/renewal-info/%s", s.baseURL, provisionerID, certID)
+}
+
+// renewThresholdFraction is the fraction of a certificate's lifetime after
+// which the renewal window opens. 0.8 = start renewing after 80% of the
+// lifetime has elapsed. RFC 9779 leaves the exact policy to the CA.
+const renewThresholdFraction = 0.8
+
+// RenewalWindow is the RFC 9779 renewal window for a certificate.
+type RenewalWindow struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+// RenewalInfo returns the RFC 9779 renewal window for the given certificate.
+// The window opens at renewThresholdFraction of the certificate's lifetime and
+// closes at NotAfter. Returns nil if the certificate is not found.
+func (s *Service) RenewalInfo(ctx context.Context, certID uuid.UUID) (*RenewalWindow, *Problem) {
+	cert, err := s.store.GetCertificate(ctx, certID)
+	if err != nil {
+		return nil, ErrServerInternalProblem("load certificate: " + err.Error())
+	}
+	if cert == nil {
+		return nil, NewProblem(ErrMalformed, 404, "renewal info: certificate not found")
+	}
+
+	total := cert.NotAfter.Sub(cert.NotBefore)
+	if total <= 0 {
+		// Degenerate lifetime — open the window immediately.
+		return &RenewalWindow{Start: cert.NotBefore, End: cert.NotAfter}, nil
+	}
+	start := cert.NotBefore.Add(time.Duration(float64(total) * renewThresholdFraction))
+	return &RenewalWindow{Start: start, End: cert.NotAfter}, nil
+}
+
 func (s *Service) AuthorizationURL(provisionerID, authID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/auth/%s", s.baseURL, provisionerID, authID)
 }

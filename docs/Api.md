@@ -532,7 +532,16 @@ Authentication is done via the JWS signature.
 | `/acme/{provisionerID}/order/{orderID}/finalize` | POST | Finalize order with CSR |
 | `/acme/{provisionerID}/challenge/{challengeID}` | POST | Notify server that challenge is ready |
 | `/acme/{provisionerID}/certificate/{certID}` | POST | Download issued certificate |
+| `/acme/{provisionerID}/renewal-info/{certID}` | GET / POST | Renewal window (RFC 9779); the cert/finalize responses also carry a `Link: <...>;rel=renewalInfo` header |
 | `/acme/{provisionerID}/key-change` | POST | Roll account over to a new key (RFC 8555 §7.3.5) |
+
+The renewal-info response body:
+```json
+{
+  "renewalWindow": { "start": "2026-08-16T00:00:00Z", "end": "2026-11-24T00:00:00Z" }
+}
+```
+The window opens at 80% of the certificate's lifetime and closes at `notAfter`.
 
 See [RFC 8555](https://tools.ietf.org/html/rfc8555) for the exact JWS payloads.  
 The directory response also includes `"keyChange"` alongside `newNonce`, `newAccount`, `newOrder`, `newAuthz`.
