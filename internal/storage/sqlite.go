@@ -2005,8 +2005,13 @@ const sqliteSSHCertSelectSQL = `
 func sqliteScanSSHCert(row *sql.Row) (*SSHCertificate, error) {
 	var c SSHCertificate
 	var idStr, caIDStr, provIDStr, principalsStr string
+	// The sqlite driver returns INTEGER as int64. The SSH serial is a uint64
+	// that we store via an int64 cast, so on read we must flow it through an
+	// int64 intermediate and reinterpret the bits — otherwise a serial with the
+	// high bit set (negative as int64) fails to scan into a uint64.
+	var serialInt int64
 	err := row.Scan(
-		&idStr, &caIDStr, &c.Serial, &c.CertType, &c.KeyID, &principalsStr,
+		&idStr, &caIDStr, &serialInt, &c.CertType, &c.KeyID, &principalsStr,
 		&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
 		&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
 	)
@@ -2016,6 +2021,7 @@ func sqliteScanSSHCert(row *sql.Row) (*SSHCertificate, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.Serial = uint64(serialInt)
 	c.ID = uuid.MustParse(idStr)
 	c.CAID = uuid.MustParse(caIDStr)
 	c.ProvisionerID = uuid.MustParse(provIDStr)
@@ -2048,24 +2054,7 @@ func (s *sqliteStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUI
 		return nil, fmt.Errorf("sqlite: ListSSHCertificatesByCA: %w", err)
 	}
 	defer rows.Close()
-	var out []*SSHCertificate
-	for rows.Next() {
-		var c SSHCertificate
-		var idStr, caIDStr, provIDStr, principalsStr string
-		if err := rows.Scan(
-			&idStr, &caIDStr, &c.Serial, &c.CertType, &c.KeyID, &principalsStr,
-			&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
-			&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
-		); err != nil {
-			return nil, err
-		}
-		c.ID = uuid.MustParse(idStr)
-		c.CAID = uuid.MustParse(caIDStr)
-		c.ProvisionerID = uuid.MustParse(provIDStr)
-		c.Principals, _ = unmarshalStringSlice(principalsStr)
-		out = append(out, &c)
-	}
-	return out, rows.Err()
+	return scanSSHCertList(rows)
 }
 
 func (s *sqliteStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
@@ -2258,17 +2247,26 @@ func (s *sqliteStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID u
 		return nil, fmt.Errorf("sqlite: ListRevokedSSHCertificatesByCA: %w", err)
 	}
 	defer rows.Close()
+	return scanSSHCertList(rows)
+}
+
+// scanSSHCertList scans all rows from a query into SSHCertificates, handling
+// the sqlite int64->uint64 serial conversion (see sqliteScanSSHCert). Shared by
+// ListSSHCertificatesByCA and ListRevokedSSHCertificatesByCA.
+func scanSSHCertList(rows *sql.Rows) ([]*SSHCertificate, error) {
 	var out []*SSHCertificate
 	for rows.Next() {
 		var c SSHCertificate
 		var idStr, caIDStr, provIDStr, principalsStr string
+		var serialInt int64
 		if err := rows.Scan(
-			&idStr, &caIDStr, &c.Serial, &c.CertType, &c.KeyID, &principalsStr,
+			&idStr, &caIDStr, &serialInt, &c.CertType, &c.KeyID, &principalsStr,
 			&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
 			&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
+		c.Serial = uint64(serialInt)
 		c.ID = uuid.MustParse(idStr)
 		c.CAID = uuid.MustParse(caIDStr)
 		c.ProvisionerID = uuid.MustParse(provIDStr)

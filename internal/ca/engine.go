@@ -1126,6 +1126,19 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		return nil, fmt.Errorf("ca: IssueCert: %w", err)
 	}
 
+	// Enforce every ancestor CA's name constraints before signing, exactly as
+	// SignCSR does. x509.CreateCertificate does NOT enforce name constraints —
+	// only x509.Verify does at validation time — so without this check a caller
+	// could mint a spec-non-compliant certificate that relies on a validator
+	// (correctly) refusing it. Failing here gives an immediate, actionable error.
+	constraintsChain, err := e.collectNameConstraints(ctx, issuerRecord)
+	if err != nil {
+		return nil, fmt.Errorf("ca: IssueCert: collect name constraints: %w", err)
+	}
+	if err := enforceNameConstraints(constraintsChain, req.SANsDNS, req.SANsIP, req.SANsEmail); err != nil {
+		return nil, fmt.Errorf("ca: IssueCert: %w", err)
+	}
+
 	certDER, err := x509.CreateCertificate(rand.Reader, template, issuerCert, pubkey(leafKey), issuerKey)
 	if err != nil {
 		return nil, fmt.Errorf("ca: IssueCert: sign certificate: %w", err)
