@@ -15,6 +15,7 @@ import (
 
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/sshca"
+	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -29,6 +30,7 @@ type sshFakeStore struct {
 	mu    sync.Mutex
 	cas   map[uuid.UUID]*storage.SSHCertificateAuthority
 	certs map[uuid.UUID]*storage.SSHCertificate
+	krls  map[uuid.UUID]*storage.SSHKRLCache
 }
 
 func newSSHFakeStore() *sshFakeStore {
@@ -92,6 +94,31 @@ func (f *sshFakeStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.
 		}
 	}
 	return nil, nil
+}
+func (f *sshFakeStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.SSHCertificate
+	for _, c := range f.certs {
+		if c.CAID == caID && c.Status == storage.SSHCertStatusRevoked {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+func (f *sshFakeStore) UpsertSSHKRL(ctx context.Context, k *storage.SSHKRLCache) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.krls == nil {
+		f.krls = make(map[uuid.UUID]*storage.SSHKRLCache)
+	}
+	f.krls[k.CAID] = k
+	return nil
+}
+func (f *sshFakeStore) GetSSHKRL(ctx context.Context, caID uuid.UUID) (*storage.SSHKRLCache, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.krls[caID], nil
 }
 func (f *sshFakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
 	f.mu.Lock()
@@ -311,6 +338,22 @@ func (f *sshFakeStore) GetCRL(ctx context.Context, caID uuid.UUID) (*storage.CRL
 	sshNotImplemented("GetCRL")
 	return nil, nil
 }
+func (f *sshFakeStore) NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error) {
+	sshNotImplemented("NextCRLNumber")
+	return 0, nil
+}
+func (f *sshFakeStore) ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*storage.Certificate, error) {
+	sshNotImplemented("ListRevokedByCASince")
+	return nil, nil
+}
+func (f *sshFakeStore) UpsertDeltaCRL(ctx context.Context, d *storage.DeltaCRLCache) error {
+	sshNotImplemented("UpsertDeltaCRL")
+	return nil
+}
+func (f *sshFakeStore) GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*storage.DeltaCRLCache, error) {
+	sshNotImplemented("GetDeltaCRL")
+	return nil, nil
+}
 func (f *sshFakeStore) CreateAPIKey(ctx context.Context, k *storage.APIKey) error {
 	sshNotImplemented("CreateAPIKey")
 	return nil
@@ -415,7 +458,8 @@ func setupSSHRouter(t *testing.T) (*sshFakeStore, *SSHCAHandler, chi.Router) {
 		t.Fatalf("keystore: %v", err)
 	}
 	engine := sshca.NewEngine(store, ks)
-	h := NewSSHCAHandler(engine, store)
+	krlMgr := krl.NewManager(store)
+	h := NewSSHCAHandler(engine, store, krlMgr)
 
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)

@@ -157,7 +157,26 @@ type SSHCertificateAuthority struct {
 	Status    CAStatus   `json:"status"`
 	CreatedAt time.Time  `json:"created_at"`
 }
+// CRLCache holds the most recently generated base CRL PEM for each CA.
+type CRLCache struct {
+	ID         uuid.UUID `json:"id"`
+	CAID       uuid.UUID `json:"ca_id"`
+	CRLPEM     string    `json:"crl_pem"`
+	CRLNumber  int64     `json:"crl_number"` // NEW: persisted monotonic CRL Number
+	ThisUpdate time.Time `json:"this_update"`
+	NextUpdate time.Time `json:"next_update"`
+}
 
+// DeltaCRLCache holds the most recently generated delta CRL for each CA.
+type DeltaCRLCache struct {
+	ID            uuid.UUID `json:"id"`
+	CAID          uuid.UUID `json:"ca_id"`
+	CRLPEM        string    `json:"crl_pem"`
+	CRLNumber     int64     `json:"crl_number"`
+	BaseCRLNumber int64     `json:"base_crl_number"`
+	ThisUpdate    time.Time `json:"this_update"`
+	NextUpdate    time.Time `json:"next_update"`
+}
 // SSHCertificate is an issued SSH user or host certificate.
 type SSHCertificate struct {
 	ID            uuid.UUID     `json:"id"`
@@ -322,14 +341,7 @@ type AuditLog struct {
 	CreatedAt time.Time  `json:"created_at"`
 }
 
-// CRLCache holds the most recently generated CRL PEM for each CA.
-type CRLCache struct {
-	ID         uuid.UUID `json:"id"`
-	CAID       uuid.UUID `json:"ca_id"`
-	CRLPEM     string    `json:"crl_pem"`
-	ThisUpdate time.Time `json:"this_update"`
-	NextUpdate time.Time `json:"next_update"`
-}
+
 
 // APIKey is a bearer token used to authenticate calls to the management API.
 type APIKey struct {
@@ -596,6 +608,20 @@ type Store interface {
 
 	// GetSSHKRL returns the cached KRL for an SSH CA, or (nil, nil).
 	GetSSHKRL(ctx context.Context, caID uuid.UUID) (*SSHKRLCache, error)
+		// NextCRLNumber atomically returns the next monotonic CRL Number for
+	// caID, shared across base and delta CRLs so the sequence is global
+	// per-CA as RFC 5280 §5.2.4 requires.
+	NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error)
+
+	// ListRevokedByCASince returns certificates revoked after `since`,
+	// used to compute delta CRL contents relative to a base CRL.
+	ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*Certificate, error)
+
+	// UpsertDeltaCRL inserts or replaces the cached delta CRL for a CA.
+	UpsertDeltaCRL(ctx context.Context, delta *DeltaCRLCache) error
+
+	// GetDeltaCRL returns the cached delta CRL for a CA, or (nil, nil).
+	GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*DeltaCRLCache, error)
 	// Close releases all connections held by the store.
 	Close() error
 }

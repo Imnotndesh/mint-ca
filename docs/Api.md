@@ -356,10 +356,21 @@ mintca_certs_revoked_total 3
 These are served without authentication and are meant for clients to retrieve CRLs, OCSP responses, and CA chains.
 
 ### `GET /pki/{caID}/crl`
-PEM‑encoded CRL.
+PEM‑encoded **base** CRL.
 
 ### `GET /pki/{caID}/crl.der`
-DER‑encoded CRL (content-type `application/pkix-crl`).
+DER‑encoded base CRL (content-type `application/pkix-crl`).
+
+### `GET /pki/{caID}/crl/delta`
+PEM‑encoded **delta** CRL (RFC 5280 §5.2.4). Only populated when delta CRLs are
+enabled (`MINT_CRL_DELTA_ENABLED=true`). A delta carries only the certificates
+revoked after the base CRL's `ThisUpdate` and includes a `deltaCRLIndicator`
+extension pointing back to the base CRL Number. When deltas are enabled and a
+`MINT_ACME_BASE_URL` is set, the base CRL also advertises this address in a
+Freshest CRL extension so RFC 5280‑aware clients can discover it.
+
+### `GET /pki/{caID}/crl/delta.der`
+DER‑encoded delta CRL (content-type `application/pkix-crl`).
 
 ### `POST /pki/{caID}/ocsp`
 OCSP request (DER) in the body, returns DER‑encoded OCSP response.

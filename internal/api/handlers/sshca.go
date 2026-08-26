@@ -253,13 +253,14 @@ func (h *SSHCAHandler) getCertBySerial(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, cert)
 }
 
+// revokeCert now routes through krlMgr so KRL stays in sync with revocations.
 func (h *SSHCAHandler) revokeCert(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "certID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid cert ID")
 		return
 	}
-	if err := h.store.RevokeSSHCertificate(r.Context(), id); err != nil {
+	if err := h.krlMgr.RevokeAndRefresh(r.Context(), id); err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			writeError(w, http.StatusNotFound, "SSH certificate not found or already revoked")
 			return

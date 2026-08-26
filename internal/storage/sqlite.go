@@ -106,7 +106,10 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 		"ALTER TABLE policies ADD COLUMN cps_uri TEXT DEFAULT ''"); err != nil {
 		return err
 	}
-
+	if err := addColumnIfAbsentSQLite(ctx, s.db, "crl_cache", "crl_number",
+		"ALTER TABLE crl_cache ADD COLUMN crl_number INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, sqliteNonceSchema); err != nil {
 		return err
 	}
@@ -292,7 +295,19 @@ CREATE TABLE IF NOT EXISTS crl_cache (
 	this_update DATETIME NOT NULL,
 	next_update DATETIME NOT NULL
 );
-
+CREATE TABLE IF NOT EXISTS crl_delta_cache (
+	id              TEXT    NOT NULL PRIMARY KEY,
+	ca_id           TEXT    NOT NULL UNIQUE REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	crl_pem         TEXT    NOT NULL,
+	crl_number      INTEGER NOT NULL,
+	base_crl_number INTEGER NOT NULL,
+	this_update     DATETIME NOT NULL,
+	next_update     DATETIME NOT NULL
+);
+CREATE TABLE IF NOT EXISTS crl_number_counters (
+	ca_id       TEXT    NOT NULL PRIMARY KEY,
+	next_number INTEGER NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS api_keys (
 	id         TEXT    NOT NULL PRIMARY KEY,
 	name       TEXT    NOT NULL,
@@ -1525,16 +1540,16 @@ func scanAuditLogs(rows *sql.Rows) ([]*AuditLog, error) {
 	}
 	return out, rows.Err()
 }
-
 func (s *sqliteStore) UpsertCRL(ctx context.Context, crl *CRLCache) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO crl_cache (id, ca_id, crl_pem, this_update, next_update)
-		VALUES (?, ?, ?, ?, ?)
+		INSERT INTO crl_cache (id, ca_id, crl_pem, crl_number, this_update, next_update)
+		VALUES (?, ?, ?, ?, ?, ?)
 		ON CONFLICT(ca_id) DO UPDATE SET
 			crl_pem     = excluded.crl_pem,
+			crl_number  = excluded.crl_number,
 			this_update = excluded.this_update,
 			next_update = excluded.next_update`,
-		crl.ID.String(), crl.CAID.String(), crl.CRLPEM,
+		crl.ID.String(), crl.CAID.String(), crl.CRLPEM, crl.CRLNumber,
 		crl.ThisUpdate.UTC(), crl.NextUpdate.UTC(),
 	)
 	if err != nil {
@@ -1545,11 +1560,11 @@ func (s *sqliteStore) UpsertCRL(ctx context.Context, crl *CRLCache) error {
 
 func (s *sqliteStore) GetCRL(ctx context.Context, caID uuid.UUID) (*CRLCache, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, ca_id, crl_pem, this_update, next_update
+		SELECT id, ca_id, crl_pem, crl_number, this_update, next_update
 		FROM crl_cache WHERE ca_id = ?`, caID.String())
 	var c CRLCache
 	var idStr, caIDStr string
-	err := row.Scan(&idStr, &caIDStr, &c.CRLPEM, &c.ThisUpdate, &c.NextUpdate)
+	err := row.Scan(&idStr, &caIDStr, &c.CRLPEM, &c.CRLNumber, &c.ThisUpdate, &c.NextUpdate)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1559,6 +1574,84 @@ func (s *sqliteStore) GetCRL(ctx context.Context, caID uuid.UUID) (*CRLCache, er
 	c.ID = uuid.MustParse(idStr)
 	c.CAID = uuid.MustParse(caIDStr)
 	return &c, nil
+}
+
+// NextCRLNumber atomically increments and returns the per-CA counter.
+func (s *sqliteStore) NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: NextCRLNumber: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO crl_number_counters (ca_id, next_number) VALUES (?, 1)
+		ON CONFLICT(ca_id) DO NOTHING`, caID.String())
+	if err != nil {
+		return 0, fmt.Errorf("sqlite: NextCRLNumber: seed: %w", err)
+	}
+
+	var n int64
+	row := tx.QueryRowContext(ctx, `SELECT next_number FROM crl_number_counters WHERE ca_id = ?`, caID.String())
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("sqlite: NextCRLNumber: read: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE crl_number_counters SET next_number = next_number + 1 WHERE ca_id = ?`, caID.String()); err != nil {
+		return 0, fmt.Errorf("sqlite: NextCRLNumber: increment: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("sqlite: NextCRLNumber: commit: %w", err)
+	}
+	return n, nil
+}
+
+func (s *sqliteStore) ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*Certificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		certSelectSQL+" WHERE c.ca_id = ? AND c.status = 'revoked' AND c.revoked_at > ? ORDER BY c.revoked_at DESC",
+		caID.String(), since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListRevokedByCASince: %w", err)
+	}
+	defer rows.Close()
+	return scanCerts(rows)
+}
+
+func (s *sqliteStore) UpsertDeltaCRL(ctx context.Context, d *DeltaCRLCache) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO crl_delta_cache (id, ca_id, crl_pem, crl_number, base_crl_number, this_update, next_update)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ca_id) DO UPDATE SET
+			crl_pem         = excluded.crl_pem,
+			crl_number      = excluded.crl_number,
+			base_crl_number = excluded.base_crl_number,
+			this_update     = excluded.this_update,
+			next_update     = excluded.next_update`,
+		d.ID.String(), d.CAID.String(), d.CRLPEM, d.CRLNumber, d.BaseCRLNumber,
+		d.ThisUpdate.UTC(), d.NextUpdate.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpsertDeltaCRL: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*DeltaCRLCache, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, ca_id, crl_pem, crl_number, base_crl_number, this_update, next_update
+		FROM crl_delta_cache WHERE ca_id = ?`, caID.String())
+	var d DeltaCRLCache
+	var idStr, caIDStr string
+	err := row.Scan(&idStr, &caIDStr, &d.CRLPEM, &d.CRLNumber, &d.BaseCRLNumber, &d.ThisUpdate, &d.NextUpdate)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetDeltaCRL: %w", err)
+	}
+	d.ID = uuid.MustParse(idStr)
+	d.CAID = uuid.MustParse(caIDStr)
+	return &d, nil
 }
 
 func (s *sqliteStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
@@ -1760,7 +1853,7 @@ func (s *sqliteStore) CreateSSHCertificate(ctx context.Context, cert *SSHCertifi
 			(id, ca_id, serial, cert_type, key_id, principals, public_key, cert_data,
 			 valid_after, valid_before, status, provisioner_id, requester, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		cert.ID.String(), cert.CAID.String(), cert.Serial, string(cert.CertType),
+		cert.ID.String(), cert.CAID.String(), int64(cert.Serial), string(cert.CertType),
 		cert.KeyID, principals, cert.PublicKey, cert.CertData,
 		cert.ValidAfter.UTC(), cert.ValidBefore.UTC(), string(cert.Status),
 		cert.ProvisionerID.String(), cert.Requester, cert.CreatedAt.UTC(),
@@ -1807,7 +1900,7 @@ func (s *sqliteStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*SSH
 }
 
 func (s *sqliteStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*SSHCertificate, error) {
-	row := s.db.QueryRowContext(ctx, sqliteSSHCertSelectSQL+" WHERE ca_id = ? AND serial = ?", caID.String(), serial)
+	row := s.db.QueryRowContext(ctx, sqliteSSHCertSelectSQL+" WHERE ca_id = ? AND serial = ?", caID.String(), int64(serial))
 	c, err := sqliteScanSSHCert(row)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: GetSSHCertificateBySerial: %w", err)

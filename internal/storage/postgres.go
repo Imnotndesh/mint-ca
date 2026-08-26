@@ -16,7 +16,21 @@ import (
 type postgresStore struct {
 	db *sql.DB
 }
-
+const postgresDeltaCRLSchema = `
+CREATE TABLE IF NOT EXISTS crl_delta_cache (
+	id              TEXT        NOT NULL PRIMARY KEY,
+	ca_id           TEXT        NOT NULL UNIQUE REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	crl_pem         TEXT        NOT NULL,
+	crl_number      BIGINT      NOT NULL,
+	base_crl_number BIGINT      NOT NULL,
+	this_update     TIMESTAMPTZ NOT NULL,
+	next_update     TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS crl_number_counters (
+	ca_id       TEXT   NOT NULL PRIMARY KEY,
+	next_number BIGINT NOT NULL DEFAULT 1
+);
+`
 const postgresNonceSchema = `
 CREATE TABLE IF NOT EXISTS acme_nonces (
 	nonce      TEXT        NOT NULL PRIMARY KEY,
@@ -63,11 +77,12 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 		return err
 	}
 	if _, err := s.db.ExecContext(ctx, `
-		ALTER TABLE certificate_authorities ADD COLUMN IF NOT EXISTS name_constraints TEXT;
-		ALTER TABLE policies ADD COLUMN IF NOT EXISTS policy_oids TEXT DEFAULT '[]';
-		ALTER TABLE policies ADD COLUMN IF NOT EXISTS cps_uri TEXT DEFAULT '';
+		ALTER TABLE crl_cache ADD COLUMN IF NOT EXISTS crl_number BIGINT NOT NULL DEFAULT 0;
 	`); err != nil {
-		return fmt.Errorf("postgres: migrate additive columns: %w", err)
+		return fmt.Errorf("postgres: migrate crl_number column: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, postgresDeltaCRLSchema); err != nil {
+		return fmt.Errorf("postgres: migrate delta CRL schema: %w", err)
 	}
 	return nil
 }
@@ -1468,13 +1483,14 @@ func pgScanAuditLogs(rows *sql.Rows) ([]*AuditLog, error) {
 
 func (s *postgresStore) UpsertCRL(ctx context.Context, crl *CRLCache) error {
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO crl_cache (id, ca_id, crl_pem, this_update, next_update)
-		VALUES ($1,$2,$3,$4,$5)
+		INSERT INTO crl_cache (id, ca_id, crl_pem, crl_number, this_update, next_update)
+		VALUES ($1,$2,$3,$4,$5,$6)
 		ON CONFLICT(ca_id) DO UPDATE SET
 			crl_pem     = EXCLUDED.crl_pem,
+			crl_number  = EXCLUDED.crl_number,
 			this_update = EXCLUDED.this_update,
 			next_update = EXCLUDED.next_update`,
-		crl.ID.String(), crl.CAID.String(), crl.CRLPEM,
+		crl.ID.String(), crl.CAID.String(), crl.CRLPEM, crl.CRLNumber,
 		crl.ThisUpdate.UTC(), crl.NextUpdate.UTC(),
 	)
 	if err != nil {
@@ -1485,11 +1501,11 @@ func (s *postgresStore) UpsertCRL(ctx context.Context, crl *CRLCache) error {
 
 func (s *postgresStore) GetCRL(ctx context.Context, caID uuid.UUID) (*CRLCache, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, ca_id, crl_pem, this_update, next_update
+		SELECT id, ca_id, crl_pem, crl_number, this_update, next_update
 		FROM crl_cache WHERE ca_id = $1`, caID.String())
 	var c CRLCache
 	var idStr, caIDStr string
-	err := row.Scan(&idStr, &caIDStr, &c.CRLPEM, &c.ThisUpdate, &c.NextUpdate)
+	err := row.Scan(&idStr, &caIDStr, &c.CRLPEM, &c.CRLNumber, &c.ThisUpdate, &c.NextUpdate)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1499,6 +1515,69 @@ func (s *postgresStore) GetCRL(ctx context.Context, caID uuid.UUID) (*CRLCache, 
 	c.ID = uuid.MustParse(idStr)
 	c.CAID = uuid.MustParse(caIDStr)
 	return &c, nil
+}
+
+func (s *postgresStore) NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error) {
+	row := s.db.QueryRowContext(ctx, `
+		INSERT INTO crl_number_counters (ca_id, next_number) VALUES ($1, 1)
+		ON CONFLICT(ca_id) DO UPDATE SET next_number = crl_number_counters.next_number + 1
+		RETURNING next_number - 1`, caID.String())
+	var n int64
+	if err := row.Scan(&n); err != nil {
+		return 0, fmt.Errorf("postgres: NextCRLNumber: %w", err)
+	}
+	if n == 0 {
+		n = 1 // first call: row was just inserted at 1, "returned - 1" logic below handles subsequent calls
+	}
+	return n, nil
+}
+
+func (s *postgresStore) ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*Certificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		pgCertSelectSQL+" WHERE c.ca_id = $1 AND c.status = 'revoked' AND c.revoked_at > $2 ORDER BY c.revoked_at DESC",
+		caID.String(), since.UTC())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListRevokedByCASince: %w", err)
+	}
+	defer rows.Close()
+	return pgScanCerts(rows)
+}
+
+func (s *postgresStore) UpsertDeltaCRL(ctx context.Context, d *DeltaCRLCache) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO crl_delta_cache (id, ca_id, crl_pem, crl_number, base_crl_number, this_update, next_update)
+		VALUES ($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT(ca_id) DO UPDATE SET
+			crl_pem         = EXCLUDED.crl_pem,
+			crl_number      = EXCLUDED.crl_number,
+			base_crl_number = EXCLUDED.base_crl_number,
+			this_update     = EXCLUDED.this_update,
+			next_update     = EXCLUDED.next_update`,
+		d.ID.String(), d.CAID.String(), d.CRLPEM, d.CRLNumber, d.BaseCRLNumber,
+		d.ThisUpdate.UTC(), d.NextUpdate.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpsertDeltaCRL: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*DeltaCRLCache, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, ca_id, crl_pem, crl_number, base_crl_number, this_update, next_update
+		FROM crl_delta_cache WHERE ca_id = $1`, caID.String())
+	var d DeltaCRLCache
+	var idStr, caIDStr string
+	err := row.Scan(&idStr, &caIDStr, &d.CRLPEM, &d.CRLNumber, &d.BaseCRLNumber, &d.ThisUpdate, &d.NextUpdate)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetDeltaCRL: %w", err)
+	}
+	d.ID = uuid.MustParse(idStr)
+	d.CAID = uuid.MustParse(caIDStr)
+	return &d, nil
 }
 
 func (s *postgresStore) CreateAPIKey(ctx context.Context, k *APIKey) error {

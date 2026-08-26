@@ -70,7 +70,7 @@ func main() {
 
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
 	sshcaEngine := sshca.NewEngine(store, ks)
-	crlManager := revocation.NewCRLManager(store, ks)
+	crlManager := revocation.NewCRLManager(store, ks, cfg.ACME.BaseURL, cfg.CRL.DeltaEnabled)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
 	policyEngine := policy.NewEngine(store)
 	sshKRLManager := krl.NewManager(store)

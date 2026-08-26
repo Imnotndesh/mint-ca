@@ -11,13 +11,19 @@ import (
 )
 
 // krlFakeStore is a minimal in-memory storage.Store covering only what the
-// krl.Manager touches. Everything else panics loudly.
+// krl.Manager touches. It embeds a nil storage.Store so it satisfies the full
+// interface; any method not overridden below will panic on the nil embedded
+// interface, which is the "fails loudly" behaviour we want for the methods
+// the KRL tests never exercise.
 type krlFakeStore struct {
+	storage.Store
 	mu    sync.Mutex
 	cas   map[uuid.UUID]*storage.SSHCertificateAuthority
 	certs map[uuid.UUID]*storage.SSHCertificate
 	krls  map[uuid.UUID]*storage.SSHKRLCache
 }
+
+func (f *krlFakeStore) Close() error { return nil }
 
 func newKRLFakeStore() *krlFakeStore {
 	return &krlFakeStore{

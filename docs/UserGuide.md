@@ -271,6 +271,14 @@ curl -X PUT http://localhost:8080/api/v1/certs/cert-uuid/revoke \
 
 The revocation is immediately reflected in the next CRL (which is regenerated automatically at a background interval).
 
+**Delta CRLs (optional).** When `MINT_CRL_DELTA_ENABLED=true`, mint‑ca also
+serves a delta CRL at `/pki/{caID}/crl/delta` that carries only the certificates
+revoked since the base CRL. Bases are rebuilt on `MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS`
+and deltas on every `MINT_CRL_REFRESH_INTERVAL_SECONDS` tick (and immediately
+after each revocation), so delta clients get fresh incremental lists without
+waiting for a full re‑scan. Delta mode is opt‑in and leaves existing CRL
+behaviour unchanged when disabled.
+
 ---
 
 ## 3.10 SSH Certificate Authorities (User & Host Certificates)

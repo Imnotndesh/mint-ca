@@ -100,6 +100,25 @@ func (f *fakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) erro
 	c.RevokedAt = &now
 	return nil
 }
+func (f *fakeStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.SSHCertificate
+	for _, c := range f.certs {
+		if c.CAID == caID && c.Status == storage.SSHCertStatusRevoked {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) UpsertSSHKRL(ctx context.Context, k *storage.SSHKRLCache) error {
+	notImplemented("UpsertSSHKRL")
+	return nil
+}
+func (f *fakeStore) GetSSHKRL(ctx context.Context, caID uuid.UUID) (*storage.SSHKRLCache, error) {
+	notImplemented("GetSSHKRL")
+	return nil, nil
+}
 
 // --- everything below is unused by sshca but required to satisfy storage.Store ---
 
@@ -290,6 +309,22 @@ func (f *fakeStore) UpsertCRL(ctx context.Context, crl *storage.CRLCache) error 
 }
 func (f *fakeStore) GetCRL(ctx context.Context, caID uuid.UUID) (*storage.CRLCache, error) {
 	notImplemented("GetCRL")
+	return nil, nil
+}
+func (f *fakeStore) NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error) {
+	notImplemented("NextCRLNumber")
+	return 0, nil
+}
+func (f *fakeStore) ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*storage.Certificate, error) {
+	notImplemented("ListRevokedByCASince")
+	return nil, nil
+}
+func (f *fakeStore) UpsertDeltaCRL(ctx context.Context, d *storage.DeltaCRLCache) error {
+	notImplemented("UpsertDeltaCRL")
+	return nil
+}
+func (f *fakeStore) GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*storage.DeltaCRLCache, error) {
+	notImplemented("GetDeltaCRL")
 	return nil, nil
 }
 func (f *fakeStore) CreateAPIKey(ctx context.Context, k *storage.APIKey) error {
