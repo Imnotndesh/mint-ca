@@ -18,7 +18,7 @@ Create a new self‑signed root CA.
   "country": "US",                    // optional
   "state": "California",              // optional
   "locality": "San Francisco",        // optional
-  "key_algo": "ecdsa-p256",           // ecdsa-p256, ecdsa-p384, rsa-2048, rsa-4096
+  "key_algo": "ecdsa-p256",           // ecdsa-p256, ecdsa-p384, rsa-2048, rsa-4096, ed25519
   "ttl_days": 3650                    // validity in days, default 3650
 }
 ```
