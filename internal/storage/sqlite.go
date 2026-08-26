@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -110,8 +111,62 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 		"ALTER TABLE crl_cache ADD COLUMN crl_number INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	// Widen the certificate_authorities.status CHECK to accept 'superseded' for
+	// databases created before re-key support. SQLite cannot ALTER a CHECK, so
+	// we rebuild the table (the standard 12-step approach) and copy rows over.
+	if err := rebuildCAStatusConstraintSQLite(ctx, s.db); err != nil {
+		return err
+	}
 	if _, err := s.db.ExecContext(ctx, sqliteNonceSchema); err != nil {
 		return err
+	}
+	return nil
+}
+
+// sqliteCASchema is the certificate_authorities CREATE used when rebuilding the
+// table to widen the status CHECK to include 'superseded'.
+const sqliteCASchema = `CREATE TABLE IF NOT EXISTS certificate_authorities (
+	id               TEXT    NOT NULL PRIMARY KEY,
+	parent_id        TEXT    REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
+	name             TEXT    NOT NULL UNIQUE,
+	type             TEXT    NOT NULL CHECK(type IN ('root','intermediate')),
+	status           TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired','superseded')),
+	cert_pem         TEXT    NOT NULL,
+	key_enc          BLOB    NOT NULL,
+	key_algo         TEXT    NOT NULL,
+	name_constraints TEXT,
+	not_before       DATETIME NOT NULL,
+	not_after        DATETIME NOT NULL,
+	created_at       DATETIME NOT NULL
+)`
+
+// rebuildCAStatusConstraintSQLite recreates certificate_authorities with a
+// CHECK that permits 'superseded'. It inspects the table's current SQL; if it
+// already allows superseded, it is a no-op.
+func rebuildCAStatusConstraintSQLite(ctx context.Context, db *sql.DB) error {
+	var current string
+	row := db.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name='certificate_authorities'")
+	if err := row.Scan(&current); err != nil {
+		return fmt.Errorf("sqlite: read certificate_authorities schema: %w", err)
+	}
+	if strings.Contains(current, "superseded") {
+		return nil
+	}
+
+	_, err := db.ExecContext(ctx, `
+		BEGIN;
+		DROP TABLE IF EXISTS certificate_authorities_old;
+		ALTER TABLE certificate_authorities RENAME TO certificate_authorities_old;
+		`+sqliteCASchema+`;
+		INSERT INTO certificate_authorities
+			(id, parent_id, name, type, status, cert_pem, key_enc, key_algo, name_constraints, not_before, not_after, created_at)
+			SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo, name_constraints, not_before, not_after, created_at
+			FROM certificate_authorities_old;
+		DROP TABLE certificate_authorities_old;
+		COMMIT;
+	`)
+	if err != nil {
+		return fmt.Errorf("sqlite: rebuild certificate_authorities constraint: %w", err)
 	}
 	return nil
 }
@@ -158,7 +213,7 @@ CREATE TABLE IF NOT EXISTS certificate_authorities (
 	parent_id        TEXT    REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
 	name             TEXT    NOT NULL UNIQUE,
 	type             TEXT    NOT NULL CHECK(type IN ('root','intermediate')),
-	status           TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	status           TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired','superseded')),
 	cert_pem         TEXT    NOT NULL,
 	key_enc          BLOB    NOT NULL,
 	key_algo         TEXT    NOT NULL,
@@ -166,6 +221,18 @@ CREATE TABLE IF NOT EXISTS certificate_authorities (
 	not_before       DATETIME NOT NULL,
 	not_after        DATETIME NOT NULL,
 	created_at       DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ca_cross_certs (
+	id           TEXT    NOT NULL PRIMARY KEY,
+	target_ca_id TEXT    NOT NULL REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	signing_ca_id TEXT   NOT NULL REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	cert_pem     TEXT    NOT NULL,
+	serial       TEXT    NOT NULL,
+	not_before   DATETIME NOT NULL,
+	not_after    DATETIME NOT NULL,
+	created_at   DATETIME NOT NULL,
+	UNIQUE(target_ca_id, signing_ca_id)
 );
 
 CREATE TABLE IF NOT EXISTS policies (
@@ -574,6 +641,72 @@ func (s *sqliteStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status C
 		return fmt.Errorf("sqlite: UpdateCAStatus: CA %s not found", id)
 	}
 	return nil
+}
+
+func (s *sqliteStore) CreateCrossCert(ctx context.Context, cc *CrossCert) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ca_cross_certs
+			(id, target_ca_id, signing_ca_id, cert_pem, serial, not_before, not_after, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(target_ca_id, signing_ca_id) DO UPDATE SET
+			cert_pem = excluded.cert_pem,
+			serial = excluded.serial,
+			not_before = excluded.not_before,
+			not_after = excluded.not_after,
+			created_at = excluded.created_at`,
+		cc.ID.String(), cc.TargetCAID.String(), cc.SigningCAID.String(), cc.CertPEM, cc.Serial,
+		cc.NotBefore.UTC(), cc.NotAfter.UTC(), cc.CreatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateCrossCert: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetCrossCert(ctx context.Context, targetCAID, signingCAID uuid.UUID) (*CrossCert, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, target_ca_id, signing_ca_id, cert_pem, serial, not_before, not_after, created_at
+		FROM ca_cross_certs WHERE target_ca_id = ? AND signing_ca_id = ?`,
+		targetCAID.String(), signingCAID.String())
+	return scanCrossCert(row)
+}
+
+func (s *sqliteStore) ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*CrossCert, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, target_ca_id, signing_ca_id, cert_pem, serial, not_before, not_after, created_at
+		FROM ca_cross_certs WHERE target_ca_id = ? ORDER BY created_at ASC`, targetCAID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListCrossCertsByTarget: %w", err)
+	}
+	defer rows.Close()
+	var out []*CrossCert
+	for rows.Next() {
+		cc, err := scanCrossCert(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cc)
+	}
+	return out, rows.Err()
+}
+
+type crossCertScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanCrossCert(row crossCertScanner) (*CrossCert, error) {
+	var cc CrossCert
+	var idStr, targetStr, signStr string
+	err := row.Scan(&idStr, &targetStr, &signStr, &cc.CertPEM, &cc.Serial, &cc.NotBefore, &cc.NotAfter, &cc.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: scanCrossCert: %w", err)
+	}
+	cc.ID = uuid.MustParse(idStr)
+	cc.TargetCAID = uuid.MustParse(targetStr)
+	cc.SigningCAID = uuid.MustParse(signStr)
+	return &cc, nil
 }
 
 func scanCA(row *sql.Row) (*CertificateAuthority, error) {

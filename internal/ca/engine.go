@@ -125,6 +125,67 @@ func (r *CreateIntermediateCARequest) setDefaults() {
 	}
 }
 
+// RekeyCARequest contains the parameters for rotating a CA's signing key
+// while preserving its identity/hierarchy position. The result is a NEW,
+// active CA row (new ID, new key, new SKI) with the same subject, signed by
+// the same issuer (or self for a root). The previous CA row is marked
+// superseded: it no longer signs new certificates but already-issued leafs
+// remain valid and keep their original CAID.
+type RekeyCARequest struct {
+	// CAID is the existing CA to re-key.
+	CAID uuid.UUID
+
+	// KeyAlgo for the new key. Defaults to the re-keyed CA's current algo if
+	// empty.
+	KeyAlgo KeyAlgo
+
+	// TTLDays for the new CA certificate. Defaults to the re-keyed CA's
+	// remaining lifetime if <= 0.
+	TTLDays int
+}
+
+func (r *RekeyCARequest) validate() error {
+	if r.CAID == uuid.Nil {
+		return errors.New("ca: RekeyCARequest: CAID is required")
+	}
+	if r.KeyAlgo != "" && !r.KeyAlgo.Valid() {
+		return fmt.Errorf("ca: RekeyCARequest: unsupported KeyAlgo %q", r.KeyAlgo)
+	}
+	return nil
+}
+
+// CrossSignCARequest contains the parameters for issuing a cross-signed
+// certificate: a second, parallel certificate for an existing CA's public key
+// and subject, signed by a DIFFERENT CA (the signer). This builds a trust
+// bridge during root/intermediate transitions — e.g. an old root cross-signs
+// a new root so clients that trust the old root can validate the new one's
+// chain. The target CA's keypair is shared, not regenerated.
+type CrossSignCARequest struct {
+	// SigningCAID is the CA whose private key signs the cross certificate.
+	SigningCAID uuid.UUID
+
+	// TargetCAID is the existing CA whose public key+subject get a second
+	// certificate from the signer.
+	TargetCAID uuid.UUID
+
+	// TTLDays for the cross certificate. Cannot exceed the signer or target
+	// CA certificate's NotAfter.
+	TTLDays int
+}
+
+func (r *CrossSignCARequest) validate() error {
+	if r.SigningCAID == uuid.Nil {
+		return errors.New("ca: CrossSignCARequest: SigningCAID is required")
+	}
+	if r.TargetCAID == uuid.Nil {
+		return errors.New("ca: CrossSignCARequest: TargetCAID is required")
+	}
+	if r.SigningCAID == r.TargetCAID {
+		return errors.New("ca: CrossSignCARequest: signing CA and target CA must differ (a CA cannot cross-sign itself)")
+	}
+	return nil
+}
+
 // validateNameConstraints checks that every entry is well-formed per
 // RFC 5280 §4.2.1.10: DNS entries are plain suffixes (no wildcards), IP
 // entries are valid CIDR, email entries are either a bare domain or a
@@ -731,6 +792,271 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 	return record, nil
 }
 
+// RekeyCA rotates a CA's signing key while keeping its identity and hierarchy
+// position. It creates a NEW active CA row: new ID, new key, new SubjectKeyId,
+// same Subject — signed by the same issuer (or self for a root), with the same
+// name constraints. The original CA row is marked superseded so it stops
+// signing new certificates but its already-issued leafs stay valid (they keep
+// their immutable CAID; the old row is never revoked or destroyed).
+func (e *Engine) RekeyCA(ctx context.Context, req RekeyCARequest) (*storage.CertificateAuthority, error) {
+	if err := req.validate(); err != nil {
+		return nil, err
+	}
+
+	old, err := e.store.GetCA(ctx, req.CAID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: load CA: %w", err)
+	}
+	if old == nil {
+		return nil, fmt.Errorf("ca: RekeyCA: CA %s not found", req.CAID)
+	}
+	if old.Status != storage.CAStatusActive {
+		return nil, fmt.Errorf("ca: RekeyCA: CA %q is not active (status: %s)", old.Name, old.Status)
+	}
+
+	algo := req.KeyAlgo
+	if algo == "" {
+		algo = KeyAlgo(old.KeyAlgo)
+	}
+	if algo == "" {
+		algo = DefaultKeyAlgo
+	}
+
+	ttlDays := req.TTLDays
+	if ttlDays <= 0 {
+		ttlDays = int(time.Until(old.NotAfter).Hours() / 24)
+		if ttlDays <= 0 {
+			ttlDays = 365
+		}
+	}
+
+	oldCert, err := parseCertPEM([]byte(old.CertPEM))
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: parse old cert: %w", err)
+	}
+
+	// Determine the issuer: the CA's parent for an intermediate, itself for a root.
+	issuerCAID := old.ID
+	if old.ParentID != nil {
+		issuerCAID = *old.ParentID
+	}
+	issuerRecord, issuerCert, issuerKey, err := e.loadIssuer(ctx, issuerCAID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: load issuer: %w", err)
+	}
+	_ = issuerRecord
+	// For self-signed root re-key, the new key signs its own cert, so the issuer
+	// is the NEW certificate itself (we generate it below). For an intermediate,
+	// the parent signs.
+
+	privKey, privKeyPEM, err := generateKey(algo)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: generate key: %w", err)
+	}
+
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: generate serial: %w", err)
+	}
+
+	now := time.Now().UTC()
+	notAfter := now.AddDate(0, 0, ttlDays)
+	if notAfter.After(oldCert.NotAfter) {
+		notAfter = oldCert.NotAfter
+	}
+	if notAfter.After(issuerCert.NotAfter) {
+		notAfter = issuerCert.NotAfter
+	}
+
+	ski, err := subjectKeyID(pubkey(privKey))
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: compute subject key id: %w", err)
+	}
+	aki, err := ensureSKI(issuerCert)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: compute issuer authority key id: %w", err)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               oldCert.Subject,
+		NotBefore:             now,
+		NotAfter:              notAfter,
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		MaxPathLen:            oldCert.MaxPathLen,
+		MaxPathLenZero:        oldCert.MaxPathLenZero,
+		SubjectKeyId:          ski,
+		AuthorityKeyId:        aki,
+		CRLDistributionPoints: oldCert.CRLDistributionPoints,
+		OCSPServer:            oldCert.OCSPServer,
+		IssuingCertificateURL: oldCert.IssuingCertificateURL,
+	}
+
+	// Sign with the issuer's key (for a root, issuerCert/key are the OLD self-signed
+	// cert — but the new root should be self-signed by its OWN new key, so override
+	// the signing authority for the root case).
+	var signerCert *x509.Certificate
+	var signerKey crypto.Signer
+	if old.ParentID == nil {
+		// Root: the new root cert is self-signed by the new key.
+		signerCert = template
+		signerKey = privKey
+		template.AuthorityKeyId = ski
+	} else {
+		signerCert = issuerCert
+		signerKey = issuerKey
+	}
+
+	if err := applyNameConstraintsToTemplate(template, old.NameConstraints); err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: apply name constraints: %w", err)
+	}
+
+	certDER, err := x509.CreateCertificate(rand.Reader, template, signerCert, pubkey(privKey), signerKey)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: sign certificate: %w", err)
+	}
+	certPEM := encodeCertPEM(certDER)
+
+	encKey, err := e.keystore.EncryptPEM(privKeyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: encrypt key: %w", err)
+	}
+
+	newRecord := &storage.CertificateAuthority{
+		ID:              uuid.New(),
+		ParentID:        old.ParentID,
+		Name:            old.Name,
+		Type:            old.Type,
+		Status:          storage.CAStatusActive,
+		CertPEM:         string(certPEM),
+		KeyEnc:          encKey,
+		KeyAlgo:         string(algo),
+		NameConstraints: old.NameConstraints,
+		NotBefore:       now,
+		NotAfter:        notAfter,
+		CreatedAt:       now,
+	}
+
+	// Mark the old CA superseded first.
+	if err := e.store.UpdateCAStatus(ctx, old.ID, storage.CAStatusSuperseded); err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: supersede old CA: %w", err)
+	}
+	if err := e.store.CreateCA(ctx, newRecord); err != nil {
+		return nil, fmt.Errorf("ca: RekeyCA: store: %w", err)
+	}
+
+	return newRecord, nil
+}
+
+// CrossSignCA issues a cross-signed certificate for an existing CA's public key
+// and subject, signed by a different CA. The target's keypair is reused — this
+// is a second, parallel certificate from another issuer, used to build trust
+// bridges during CA transitions (e.g. an old root cross-signing a new root so
+// clients that trust the old root can validate the new root). The result is
+// stored in ca_cross_certs, keyed by (target, signer).
+func (e *Engine) CrossSignCA(ctx context.Context, req CrossSignCARequest) (*storage.CrossCert, error) {
+	if err := req.validate(); err != nil {
+		return nil, err
+	}
+
+	signerRecord, signerCert, signerKey, err := e.loadIssuer(ctx, req.SigningCAID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: load signer: %w", err)
+	}
+	_ = signerRecord
+
+	targetRecord, err := e.store.GetCA(ctx, req.TargetCAID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: load target: %w", err)
+	}
+	if targetRecord == nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: target CA %s not found", req.TargetCAID)
+	}
+	if targetRecord.Status == storage.CAStatusRevoked {
+		return nil, fmt.Errorf("ca: CrossSignCA: target CA %q is revoked — refusing to cross-sign a compromised CA", targetRecord.Name)
+	}
+
+	targetCert, err := parseCertPEM([]byte(targetRecord.CertPEM))
+	if err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: parse target cert: %w", err)
+	}
+
+	now := time.Now().UTC()
+	notAfter := now.AddDate(0, 0, req.TTLDays)
+	if notAfter.After(signerCert.NotAfter) {
+		notAfter = signerCert.NotAfter
+	}
+	if notAfter.After(targetCert.NotAfter) {
+		notAfter = targetCert.NotAfter
+	}
+
+	serial, err := randomSerial()
+	if err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: generate serial: %w", err)
+	}
+	aki, err := ensureSKI(signerCert)
+	if err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: compute signer aki: %w", err)
+	}
+
+	// The cross cert reuses the TARGET's public key and subject; only the SKI
+	// stays the target's (it identifies the subject key), the AKI becomes the
+	// signer's.
+	template := &x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               targetCert.Subject,
+		NotBefore:             now,
+		NotAfter:              notAfter,
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		MaxPathLen:            targetCert.MaxPathLen,
+		MaxPathLenZero:        targetCert.MaxPathLenZero,
+		SubjectKeyId:          targetCert.SubjectKeyId,
+		AuthorityKeyId:        aki,
+		CRLDistributionPoints: signerCert.CRLDistributionPoints,
+		OCSPServer:            signerCert.OCSPServer,
+		IssuingCertificateURL: []string{
+			fmt.Sprintf("%s/v1/pki/ca/%s/crt", e.baseUrl, req.SigningCAID),
+		},
+	}
+
+	if err := applyNameConstraintsToTemplate(template, targetRecord.NameConstraints); err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: apply name constraints: %w", err)
+	}
+
+	// Sign with the signer's key over the TARGET's public key.
+	certDER, err := x509.CreateCertificate(rand.Reader, template, signerCert, pubkeyForCert(targetCert), signerKey)
+	if err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: sign certificate: %w", err)
+	}
+	certPEM := encodeCertPEM(certDER)
+
+	cc := &storage.CrossCert{
+		ID:          uuid.New(),
+		TargetCAID:  req.TargetCAID,
+		SigningCAID: req.SigningCAID,
+		CertPEM:     string(certPEM),
+		Serial:      serial.String(),
+		NotBefore:   now,
+		NotAfter:    notAfter,
+		CreatedAt:   now,
+	}
+
+	if err := e.store.CreateCrossCert(ctx, cc); err != nil {
+		return nil, fmt.Errorf("ca: CrossSignCA: store: %w", err)
+	}
+	return cc, nil
+}
+
+// pubkeyForCert extracts the public key from a parsed certificate as a
+// crypto.PublicKey, panicking-safe helper for cross-sign reuse.
+func pubkeyForCert(c *x509.Certificate) interface{} {
+	return c.PublicKey
+}
+
 // IssueCert generates a keypair, signs a leaf certificate with the specified CA,
 func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCertificate, error) {
 	req.setDefaults()
@@ -979,6 +1305,34 @@ func (e *Engine) GetChainPEM(ctx context.Context, caID uuid.UUID) ([]byte, error
 	}
 	// buildChain with nil leafPEM returns only the CA chain.
 	return e.buildChain(ctx, caRecord, nil)
+}
+
+// GetCrossChainPEM returns the cross-signing chain for a target CA: the
+// cross certificate (target's public key+subject signed by the signer)
+// followed by the signer's own chain up to its root. This lets clients that
+// trust the signing CA (but not the target's native issuer) validate the
+// target during a CA transition.
+func (e *Engine) GetCrossChainPEM(ctx context.Context, targetCAID, signingCAID uuid.UUID) ([]byte, error) {
+	cc, err := e.store.GetCrossCert(ctx, targetCAID, signingCAID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: GetCrossChainPEM: load cross cert: %w", err)
+	}
+	if cc == nil {
+		return nil, fmt.Errorf("ca: GetCrossChainPEM: no cross cert for target %s signed by %s", targetCAID, signingCAID)
+	}
+	signer, err := e.store.GetCA(ctx, signingCAID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: GetCrossChainPEM: load signer: %w", err)
+	}
+	if signer == nil {
+		return nil, fmt.Errorf("ca: GetCrossChainPEM: signer CA %s not found", signingCAID)
+	}
+	// Cross cert + signer's chain up to root.
+	chain, err := e.buildChain(ctx, signer, []byte(cc.CertPEM))
+	if err != nil {
+		return nil, fmt.Errorf("ca: GetCrossChainPEM: build signer chain: %w", err)
+	}
+	return chain, nil
 }
 
 // buildChain assembles: leafPEM (if non-nil) + issuerCert + all ancestors up to root.

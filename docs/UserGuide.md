@@ -279,6 +279,24 @@ after each revocation), so delta clients get fresh incremental lists without
 waiting for a full re‑scan. Delta mode is opt‑in and leaves existing CRL
 behaviour unchanged when disabled.
 
+## 3.9b Re-keying and Cross-signing (key lifecycle)
+
+**Re-key** (`POST /api/v1/ca/{caID}/rekey`) rotates a CA's signing key while
+preserving its identity. It creates a new active CA row (new key/SKI, same
+Subject), marks the old row **superseded**, and keeps already-issued leafs
+valid (they keep their original CAID). After re-keying, repoint your
+provisioners to the new CA ID before issuing new certificates, and distribute
+the new CA cert where clients need it. Superseded is distinct from revoked:
+superseded CA certificate can't sign new things, but its existing leaves are
+not treated as compromised.
+
+**Cross-sign** (`POST /api/v1/ca/{caID}/cross-sign`, body carries a different
+`signing_ca_id`) issues a second, parallel certificate for a CA's existing
+public key and subject, signed by a different CA. The classic use is rolling a
+root: create the new root, have the old root cross-sign it, then serve the
+cross chain at `GET /pki/{new_root}/chain/cross/{old_root}` so clients that
+trust the old root can validate the new one during the transition window.
+
 ---
 
 ## 3.10 SSH Certificate Authorities (User & Host Certificates)

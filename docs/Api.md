@@ -84,6 +84,49 @@ Revoke a CA (no longer usable for issuing). No request body.
 { "status": "revoked" }
 ```
 
+### `POST /api/v1/ca/{caID}/rekey`
+Rotate a CA's signing key while preserving its identity and hierarchy position.
+Creates a NEW active CA row (new ID, new key, new SubjectKeyId, same Subject,
+same name constraints) signed by the same issuer (or self for a root). The
+previous CA row is marked **`superseded`** — it stops signing new certificates
+but already-issued leafs remain valid (they keep their original CAID). You must
+then repoint provisioners to the new CA ID.
+
+**Request body**
+```json
+{
+  "key_algo": "ecdsa-p256", // optional; defaults to the current key algorithm
+  "ttl_days": 365            // optional; defaults to remaining lifetime of the old CA
+}
+```
+
+**Response (201 Created)**: the new (active) `CertificateAuthority` object.
+
+### `POST /api/v1/ca/{caID}/cross-sign`
+Issue a cross-signed certificate for CA `{caID}`'s existing public key + subject,
+signed by a different CA. This builds a trust bridge during CA transitions
+(e.g. an old root cross-signing a new root so clients trusting the old root can
+validate the new root). The target CA's keypair is reused — this is a parallel
+certificate from another issuer, stored in `ca_cross_certs`.
+
+**Request body**
+```json
+{
+  "signing_ca_id": "signer-ca-uuid", // required; must differ from {caID}
+  "ttl_days": 1825                   // optional
+}
+```
+
+**Response (201 Created)**: the stored cross-signed `CrossCert` object.
+
+### `GET /api/v1/ca/{caID}/cross-certs`
+List all cross-signed certificates issued for `{caID}`.
+
+### `GET /pki/{caID}/chain/cross/{signingCAID}`
+Public (no auth). PEM chain of the cross cert (target's public key signed by
+`{signingCAID}`) followed by the signer's own chain up to its root. For clients
+that trust the signing CA but not the target's native issuer.
+
 ---
 
 ## 1.2 Certificates

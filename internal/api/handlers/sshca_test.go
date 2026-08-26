@@ -173,6 +173,18 @@ func (f *sshFakeStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status 
 	sshNotImplemented("UpdateCAStatus")
 	return nil
 }
+func (f *sshFakeStore) CreateCrossCert(ctx context.Context, cc *storage.CrossCert) error {
+	sshNotImplemented("CreateCrossCert")
+	return nil
+}
+func (f *sshFakeStore) GetCrossCert(ctx context.Context, targetCAID, signingCAID uuid.UUID) (*storage.CrossCert, error) {
+	sshNotImplemented("GetCrossCert")
+	return nil, nil
+}
+func (f *sshFakeStore) ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*storage.CrossCert, error) {
+	sshNotImplemented("ListCrossCertsByTarget")
+	return nil, nil
+}
 func (f *sshFakeStore) CreateCertificate(ctx context.Context, cert *storage.Certificate) error {
 	sshNotImplemented("CreateCertificate")
 	return nil
