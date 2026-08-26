@@ -60,6 +60,8 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/order/{orderID}/finalize", h.finalizeOrder)
 		r.Post("/challenge/{challengeID}", h.validateChallenge)
 		r.Post("/certificate/{certID}", h.getCertificate)
+		r.Post("/renewal-info/{certID}", h.getRenewalInfo)
+		r.Get("/renewal-info/{certID}", h.getRenewalInfo)
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/account/{accountID}/orders", h.listOrders)
 		r.Post("/revoke-cert", h.revokeCert)
@@ -845,6 +847,10 @@ func (h *ACMEHandler) finalizeOrder(w http.ResponseWriter, r *http.Request) {
 
 	orderURL := h.service.OrderURL(prov.ID, order.ID)
 	w.Header().Set("Location", orderURL)
+	// Advertise the renewal-info endpoint when the order has a certificate.
+	if order.CertificateID != nil {
+		w.Header().Set("Link", "<"+h.service.RenewalInfoURL(prov.ID, *order.CertificateID)+">;rel=\"renewalInfo\"")
+	}
 	h.acmeWriteJSON(w, r, http.StatusOK, h.orderResponse(r.Context(), prov.ID, order))
 }
 
@@ -948,8 +954,58 @@ func (h *ACMEHandler) getCertificate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Replay-Nonce", nonce)
 	w.Header().Set("Content-Type", "application/pem-certificate-chain")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Link", "<"+h.service.RenewalInfoURL(prov.ID, certID)+">;rel=\"renewalInfo\"")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(chainPEM)
+}
+
+func (h *ACMEHandler) getRenewalInfo(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	if _, prob := h.loadProvisioner(r); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	certID, err := uuid.Parse(chi.URLParam(r, "certID"))
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid certificate ID"))
+		return
+	}
+
+	// POST-as-GET requires a valid JWS over an empty payload (unauthenticated
+	// GET is also permitted, since knowing the high-entropy cert ID is enough).
+	if r.Method == http.MethodPost {
+		jws, hdr, jwsProb := parseJWS(r)
+		if jwsProb != nil {
+			h.acmeProblem(w, r, jwsProb)
+			return
+		}
+		p, _ := jws.PayloadBytes()
+		if len(p) != 0 {
+			h.acmeProblem(w, r, internalacme.ErrMalformedProblem("renewal-info POST-as-GET requires an empty body"))
+			return
+		}
+		if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+			h.acmeProblem(w, r, prob)
+			return
+		}
+	}
+
+	window, prob := h.service.RenewalInfo(ctx, certID)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	nonce, _ := h.service.IssueNonce(ctx)
+	w.Header().Set("Replay-Nonce", nonce)
+	w.Header().Set("Cache-Control", "no-store")
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
+		"renewalWindow": map[string]string{
+			"start": window.Start.UTC().Format(time.RFC3339),
+			"end":   window.End.UTC().Format(time.RFC3339),
+		},
+	})
 }
 
 func accountResponse(a *storage.ACMEAccount, accountURL string) map[string]interface{} {
