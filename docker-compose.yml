@@ -16,6 +16,8 @@ services:
       - MINT_WRITE_TIMEOUT_SECONDS=60
       - MINT_IDLE_TIMEOUT_SECONDS=120
       - MINT_CRL_REFRESH_INTERVAL_SECONDS=3600
+      # - MINT_CRL_DELTA_ENABLED=true          # serve delta CRLs at /pki/{caID}/crl/delta
+      # - MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS=86400  # optional, >= refresh interval
       - MINT_TLS_DISABLED=false
       - MINT_LOG_LEVEL=debug
       - MINT_TLS_CERT=/data/server.crt

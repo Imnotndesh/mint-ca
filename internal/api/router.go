@@ -4,7 +4,6 @@ import (
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ratelimit"
 	"net/http"
-	"testing/quick"
 
 	"mint-ca/internal/api/handlers"
 	apimiddleware "mint-ca/internal/api/middleware"

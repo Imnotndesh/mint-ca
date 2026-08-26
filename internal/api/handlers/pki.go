@@ -34,6 +34,8 @@ func (h *PKIHandler) RegisterRoutes(r chi.Router) {
 	r.Route("/pki/{caID}", func(r chi.Router) {
 		r.Get("/crl", h.getCRLPEM)
 		r.Get("/crl.der", h.getCRLDER)
+		r.Get("/crl/delta", h.getDeltaCRLPEM)
+		r.Get("/crl/delta.der", h.getDeltaCRLDER)
 		r.Post("/ocsp", h.respondOCSP)
 		r.Get("/chain", h.getChain)
 	})
@@ -69,6 +71,38 @@ func (h *PKIHandler) getCRLDER(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/pkix-crl")
 	w.WriteHeader(http.StatusOK)
 	w.Write(crlDER)
+}
+
+func (h *PKIHandler) getDeltaCRLPEM(w http.ResponseWriter, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	deltaPEM, err := h.crl.GetDeltaCRL(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.WriteHeader(http.StatusOK)
+	w.Write(deltaPEM)
+}
+
+func (h *PKIHandler) getDeltaCRLDER(w http.ResponseWriter, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	deltaDER, err := h.crl.GetDeltaCRLDER(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/pkix-crl")
+	w.WriteHeader(http.StatusOK)
+	w.Write(deltaDER)
 }
 
 func (h *PKIHandler) respondOCSP(w http.ResponseWriter, r *http.Request) {

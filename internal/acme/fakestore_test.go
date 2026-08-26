@@ -26,6 +26,8 @@ type fakeStore struct {
 	certsBySerial  map[string]*storage.Certificate
 	retiredKeys    map[string]bool
 	crls           map[uuid.UUID]*storage.CRLCache
+	deltaCRLs      map[uuid.UUID]*storage.DeltaCRLCache
+	crlCounter     map[uuid.UUID]int64
 	nonces         map[string]time.Time
 }
 
@@ -40,6 +42,8 @@ func NewFakeStore() *fakeStore {
 		certsBySerial:  make(map[string]*storage.Certificate),
 		retiredKeys:    make(map[string]bool),
 		crls:           make(map[uuid.UUID]*storage.CRLCache),
+		deltaCRLs:      make(map[uuid.UUID]*storage.DeltaCRLCache),
+		crlCounter:     make(map[uuid.UUID]int64),
 		nonces:         make(map[string]time.Time),
 	}
 }
@@ -370,6 +374,37 @@ func (f *fakeStore) GetCRL(ctx context.Context, caID uuid.UUID) (*storage.CRLCac
 	defer f.mu.Unlock()
 	return f.crls[caID], nil
 }
+func (f *fakeStore) NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.crlCounter[caID]++
+	return f.crlCounter[caID], nil
+}
+func (f *fakeStore) ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*storage.Certificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.Certificate
+	for _, c := range f.certsBySerial {
+		if c.CAID == caID && c.RevokedAt != nil && c.RevokedAt.UTC().After(since) {
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+func (f *fakeStore) UpsertDeltaCRL(ctx context.Context, d *storage.DeltaCRLCache) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.deltaCRLs == nil {
+		f.deltaCRLs = make(map[uuid.UUID]*storage.DeltaCRLCache)
+	}
+	f.deltaCRLs[d.CAID] = d
+	return nil
+}
+func (f *fakeStore) GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*storage.DeltaCRLCache, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.deltaCRLs[caID], nil
+}
 
 // ---- API keys ----
 
@@ -471,6 +506,18 @@ func (f *fakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID)
 func (f *fakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
 	notImplemented("RevokeSSHCertificate")
 	return nil
+}
+func (f *fakeStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
+	notImplemented("ListRevokedSSHCertificatesByCA")
+	return nil, nil
+}
+func (f *fakeStore) UpsertSSHKRL(ctx context.Context, k *storage.SSHKRLCache) error {
+	notImplemented("UpsertSSHKRL")
+	return nil
+}
+func (f *fakeStore) GetSSHKRL(ctx context.Context, caID uuid.UUID) (*storage.SSHKRLCache, error) {
+	notImplemented("GetSSHKRL")
+	return nil, nil
 }
 
 // GetACMEAuthorizationByIdentifier returns the most recent standalone

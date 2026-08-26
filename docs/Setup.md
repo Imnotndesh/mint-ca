@@ -101,6 +101,8 @@ Default values are shown; variables marked **Required** must be set.
 | **CRL** | | | |
 | `MINT_CRL_REFRESH_INTERVAL_SECONDS` | How often (seconds) to regenerate CRLs for all active CAs. | `3600` (1h) | No |
 | `MINT_CRL_VALIDITY_SECONDS` | How long (seconds) a generated CRL is valid (`NextUpdate`). | `86400` (24h) | No |
+| `MINT_CRL_DELTA_ENABLED` | Publish delta CRLs (`/pki/{caID}/crl/delta`) alongside the full base CRL. Opt‑in; off by default so existing deployments are unchanged. Base CRLs then carry a Freshest CRL extension (when `MINT_ACME_BASE_URL` is set). | `false` | No |
+| `MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS` | How often (seconds) to regenerate the full base CRL while delta mode is on. Deltas refresh every `MINT_CRL_REFRESH_INTERVAL_SECONDS`; bases can be rebuilt less often to reduce churn. Must be ≥ the refresh interval. | defaults to `MINT_CRL_REFRESH_INTERVAL_SECONDS` | No |
 | **Logging** | | | |
 | `MINT_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error`. | `info` | No |
 | `MINT_LOG_JSON` | Output logs as JSON (structured) instead of human‑readable. | `false` | No |

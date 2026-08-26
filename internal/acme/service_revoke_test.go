@@ -23,7 +23,7 @@ func setupRevokeTestEnv(t *testing.T) (*fakeStore, *ca.Engine, *revocation.CRLMa
 	}
 
 	engine := ca.NewEngine(store, ks, "https://ca.test")
-	crlMgr := revocation.NewCRLManager(store, ks)
+	crlMgr := revocation.NewCRLManager(store, ks, "https://ca.test", false)
 
 	rootCA, err := engine.CreateRootCA(context.Background(), ca.CreateRootCARequest{
 		Name: "root", CommonName: "Test Root", KeyAlgo: ca.KeyAlgoECDSAP256, TTLDays: 3650,

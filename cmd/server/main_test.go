@@ -31,6 +31,7 @@ import (
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
+	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
 
 	"golang.org/x/crypto/ssh"
@@ -187,8 +188,9 @@ func runLiveStack(m *testing.M) (int, error) {
 
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
 	sshcaEngine := sshca.NewEngine(store, ks)
-	crlManager := revocation.NewCRLManager(store, ks)
+	crlManager := revocation.NewCRLManager(store, ks, baseURL, false)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
+	sshKRLManager := krl.NewManager(store)
 	policyEngine := policy.NewEngine(store)
 
 	// ---- setup mode over real HTTP (separate ephemeral server; doesn't
@@ -219,7 +221,7 @@ func runLiveStack(m *testing.M) (int, error) {
 	}
 
 	// ---- full API, bound to the SAME address baked into cfg.ACME.BaseURL ----
-	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine)
+	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager)
 	fullSrv := httptest.NewUnstartedServer(fullRouter)
 	_ = fullSrv.Listener.Close()
 	fullSrv.Listener = listener

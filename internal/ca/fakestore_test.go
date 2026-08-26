@@ -272,6 +272,22 @@ func (f *caFakeStore) GetCRL(ctx context.Context, caID uuid.UUID) (*storage.CRLC
 	caNotImplemented("GetCRL")
 	return nil, nil
 }
+func (f *caFakeStore) NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error) {
+	caNotImplemented("NextCRLNumber")
+	return 0, nil
+}
+func (f *caFakeStore) ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*storage.Certificate, error) {
+	caNotImplemented("ListRevokedByCASince")
+	return nil, nil
+}
+func (f *caFakeStore) UpsertDeltaCRL(ctx context.Context, d *storage.DeltaCRLCache) error {
+	caNotImplemented("UpsertDeltaCRL")
+	return nil
+}
+func (f *caFakeStore) GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*storage.DeltaCRLCache, error) {
+	caNotImplemented("GetDeltaCRL")
+	return nil, nil
+}
 
 // ---- API keys ----
 
@@ -365,6 +381,18 @@ func (f *caFakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUI
 func (f *caFakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
 	caNotImplemented("RevokeSSHCertificate")
 	return nil
+}
+func (f *caFakeStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
+	caNotImplemented("ListRevokedSSHCertificatesByCA")
+	return nil, nil
+}
+func (f *caFakeStore) UpsertSSHKRL(ctx context.Context, k *storage.SSHKRLCache) error {
+	caNotImplemented("UpsertSSHKRL")
+	return nil
+}
+func (f *caFakeStore) GetSSHKRL(ctx context.Context, caID uuid.UUID) (*storage.SSHKRLCache, error) {
+	caNotImplemented("GetSSHKRL")
+	return nil, nil
 }
 func (f *caFakeStore) GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*storage.ACMEAuthorization, error) {
 	caNotImplemented("GetACMEAuthorizationByIdentifier")

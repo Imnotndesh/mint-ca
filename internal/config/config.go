@@ -118,6 +118,21 @@ type CRLConfig struct {
 	// Default: 24h
 	// Env: MINT_CRL_VALIDITY_SECONDS
 	Validity time.Duration
+
+	// DeltaEnabled turns on delta CRL generation/serving. Opt-in — default
+	// false so existing deployments see no behavior change.
+	// Default: false
+	// Env: MINT_CRL_DELTA_ENABLED
+	DeltaEnabled bool
+
+	// BaseRefreshInterval is how often the full base CRL is regenerated while
+	// delta CRLs are enabled. Deltas are refreshed on every revocation and on
+	// the main RefreshInterval ticker; base CRLs can be rebuilt less frequently
+	// to reduce churn. Ignored when DeltaEnabled is false.
+	// Must be >= RefreshInterval.
+	// Default: RefreshInterval
+	// Env: MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS
+	BaseRefreshInterval time.Duration
 }
 
 // RateLimitOverride holds an optional first-boot-only override for one
@@ -247,6 +262,14 @@ func Load() (*Config, error) {
 
 	c.CRL.RefreshInterval = envDuration("MINT_CRL_REFRESH_INTERVAL_SECONDS", 1*time.Hour)
 	c.CRL.Validity = envDuration("MINT_CRL_VALIDITY_SECONDS", 24*time.Hour)
+	c.CRL.DeltaEnabled = envBool("MINT_CRL_DELTA_ENABLED")
+	c.CRL.BaseRefreshInterval = envDuration("MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS", 0)
+	if c.CRL.BaseRefreshInterval == 0 {
+		// Default the base refresh cadence to the delta refresh cadence when
+		// unset, so an operator only has to think about one number unless they
+		// explicitly want a longer base lifecycle.
+		c.CRL.BaseRefreshInterval = c.CRL.RefreshInterval
+	}
 
 	if c.CRL.RefreshInterval < 1*time.Minute {
 		errs = append(errs,
@@ -257,6 +280,11 @@ func Load() (*Config, error) {
 		errs = append(errs,
 			"MINT_CRL_VALIDITY_SECONDS must be greater than MINT_CRL_REFRESH_INTERVAL_SECONDS — "+
 				"a CRL must be valid for longer than the refresh interval or clients will see expired CRLs",
+		)
+	}
+	if c.CRL.DeltaEnabled && c.CRL.BaseRefreshInterval < c.CRL.RefreshInterval {
+		errs = append(errs,
+			"MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS must be at least MINT_CRL_REFRESH_INTERVAL_SECONDS when delta CRLs are enabled",
 		)
 	}
 
@@ -326,8 +354,10 @@ func (c *Config) Redact() map[string]interface{} {
 			"eab_required": c.ACME.EABRequired,
 		},
 		"crl": map[string]interface{}{
-			"refresh_interval": c.CRL.RefreshInterval.String(),
-			"validity":         c.CRL.Validity.String(),
+			"refresh_interval":     c.CRL.RefreshInterval.String(),
+			"validity":             c.CRL.Validity.String(),
+			"delta_enabled":        c.CRL.DeltaEnabled,
+			"base_refresh_interval": c.CRL.BaseRefreshInterval.String(),
 		},
 		"log": map[string]interface{}{
 			"level": c.Log.Level,
