@@ -66,6 +66,18 @@ func (f *caFakeStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status s
 	caNotImplemented("UpdateCAStatus")
 	return nil
 }
+func (f *caFakeStore) CreateCrossCert(ctx context.Context, cc *storage.CrossCert) error {
+	caNotImplemented("CreateCrossCert")
+	return nil
+}
+func (f *caFakeStore) GetCrossCert(ctx context.Context, targetCAID, signingCAID uuid.UUID) (*storage.CrossCert, error) {
+	caNotImplemented("GetCrossCert")
+	return nil, nil
+}
+func (f *caFakeStore) ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*storage.CrossCert, error) {
+	caNotImplemented("ListCrossCertsByTarget")
+	return nil, nil
+}
 
 // ---- Certificates ----
 

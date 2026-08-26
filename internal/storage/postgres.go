@@ -31,6 +31,19 @@ CREATE TABLE IF NOT EXISTS crl_number_counters (
 	next_number BIGINT NOT NULL DEFAULT 1
 );
 `
+const postgresCrossCertSchema = `
+CREATE TABLE IF NOT EXISTS ca_cross_certs (
+	id            TEXT        NOT NULL PRIMARY KEY,
+	target_ca_id  TEXT        NOT NULL REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	signing_ca_id TEXT        NOT NULL REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	cert_pem      TEXT        NOT NULL,
+	serial        TEXT        NOT NULL,
+	not_before    TIMESTAMPTZ NOT NULL,
+	not_after     TIMESTAMPTZ NOT NULL,
+	created_at    TIMESTAMPTZ NOT NULL,
+	UNIQUE(target_ca_id, signing_ca_id)
+);
+`
 const postgresNonceSchema = `
 CREATE TABLE IF NOT EXISTS acme_nonces (
 	nonce      TEXT        NOT NULL PRIMARY KEY,
@@ -84,6 +97,19 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, postgresDeltaCRLSchema); err != nil {
 		return fmt.Errorf("postgres: migrate delta CRL schema: %w", err)
 	}
+	// Widen the status CHECK to accept 'superseded' for databases created
+	// before re-key support. IF EXISTS guards against the constraint having a
+	// different auto-generated name.
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE certificate_authorities DROP CONSTRAINT IF EXISTS certificate_authorities_status_check;
+		ALTER TABLE certificate_authorities ADD CONSTRAINT certificate_authorities_status_check
+			CHECK(status IN ('active','revoked','expired','superseded'));
+	`); err != nil {
+		return fmt.Errorf("postgres: migrate superseded status constraint: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, postgresCrossCertSchema); err != nil {
+		return fmt.Errorf("postgres: migrate cross cert schema: %w", err)
+	}
 	return nil
 }
 
@@ -93,7 +119,7 @@ CREATE TABLE IF NOT EXISTS certificate_authorities (
 	parent_id        TEXT        REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
 	name             TEXT        NOT NULL UNIQUE,
 	type             TEXT        NOT NULL CHECK(type IN ('root','intermediate')),
-	status           TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
+	status           TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired','superseded')),
 	cert_pem         TEXT        NOT NULL,
 	key_enc          BYTEA       NOT NULL,
 	key_algo         TEXT        NOT NULL,
@@ -474,6 +500,72 @@ func (s *postgresStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, status
 	}
 	return nil
 }
+
+func (s *postgresStore) CreateCrossCert(ctx context.Context, cc *CrossCert) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ca_cross_certs
+			(id, target_ca_id, signing_ca_id, cert_pem, serial, not_before, not_after, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		ON CONFLICT(target_ca_id, signing_ca_id) DO UPDATE SET
+			cert_pem = EXCLUDED.cert_pem,
+			serial = EXCLUDED.serial,
+			not_before = EXCLUDED.not_before,
+			not_after = EXCLUDED.not_after,
+			created_at = EXCLUDED.created_at`,
+		cc.ID.String(), cc.TargetCAID.String(), cc.SigningCAID.String(), cc.CertPEM, cc.Serial,
+		cc.NotBefore.UTC(), cc.NotAfter.UTC(), cc.CreatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: CreateCrossCert: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetCrossCert(ctx context.Context, targetCAID, signingCAID uuid.UUID) (*CrossCert, error) {
+	row := s.db.QueryRowContext(ctx, pgCrossCertSelectSQL+" WHERE target_ca_id = $1 AND signing_ca_id = $2",
+		targetCAID.String(), signingCAID.String())
+	return pgScanCrossCert(row)
+}
+
+func (s *postgresStore) ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*CrossCert, error) {
+	rows, err := s.db.QueryContext(ctx, pgCrossCertSelectSQL+" WHERE target_ca_id = $1 ORDER BY created_at ASC", targetCAID.String())
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListCrossCertsByTarget: %w", err)
+	}
+	defer rows.Close()
+	var out []*CrossCert
+	for rows.Next() {
+		cc, err := pgScanCrossCert(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, cc)
+	}
+	return out, rows.Err()
+}
+
+type crossCertScannerPG interface {
+	Scan(dest ...interface{}) error
+}
+
+func pgScanCrossCert(row crossCertScannerPG) (*CrossCert, error) {
+	var cc CrossCert
+	var idStr, targetStr, signStr string
+	err := row.Scan(&idStr, &targetStr, &signStr, &cc.CertPEM, &cc.Serial, &cc.NotBefore, &cc.NotAfter, &cc.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("postgres: scanCrossCert: %w", err)
+	}
+	cc.ID = uuid.MustParse(idStr)
+	cc.TargetCAID = uuid.MustParse(targetStr)
+	cc.SigningCAID = uuid.MustParse(signStr)
+	return &cc, nil
+}
+
+const pgCrossCertSelectSQL = `
+	SELECT id, target_ca_id, signing_ca_id, cert_pem, serial, not_before, not_after, created_at
+	FROM ca_cross_certs`
 
 const pgCASelectSQL = `
 	SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,

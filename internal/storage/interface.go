@@ -27,6 +27,11 @@ const (
 	CAStatusActive  CAStatus = "active"
 	CAStatusRevoked CAStatus = "revoked"
 	CAStatusExpired CAStatus = "expired"
+	// CAStatusSuperseded marks a CA that has been re-keyed. It no longer signs
+	// new certificates, but already-issued leafs remain valid and are NOT to be
+	// treated as compromised (unlike revoked). Distinct from revoked: the leaf
+	// CRL/OCSP status of a superseded CA's issued certificates is unchanged.
+	CAStatusSuperseded CAStatus = "superseded"
 )
 // SSHKRLCache holds the most recently generated KRL for each SSH CA.
 type SSHKRLCache struct {
@@ -157,6 +162,22 @@ type SSHCertificateAuthority struct {
 	Status    CAStatus   `json:"status"`
 	CreatedAt time.Time  `json:"created_at"`
 }
+// CrossCert is a cross-signed certificate: a certificate issued for an
+// existing CA's public key and subject, signed by a DIFFERENT CA (the
+// signer). Used to build trust bridges during root/intermediate transitions
+// (e.g. an old root cross-signs a new root). It shares the target's keypair
+// and identity but carries a different issuer/chain.
+type CrossCert struct {
+	ID            uuid.UUID  `json:"id"`
+	TargetCAID    uuid.UUID  `json:"target_ca_id"`
+	SigningCAID   uuid.UUID  `json:"signing_ca_id"`
+	CertPEM       string     `json:"cert_pem"`
+	NotBefore     time.Time  `json:"not_before"`
+	NotAfter      time.Time  `json:"not_after"`
+	Serial        string     `json:"serial"`
+	CreatedAt     time.Time  `json:"created_at"`
+}
+
 // CRLCache holds the most recently generated base CRL PEM for each CA.
 type CRLCache struct {
 	ID         uuid.UUID `json:"id"`
@@ -376,6 +397,16 @@ type Store interface {
 
 	// ListChildCAs returns all CAs whose parent_id equals parentID.
 	ListChildCAs(ctx context.Context, parentID uuid.UUID) ([]*CertificateAuthority, error)
+
+	// CreateCrossCert stores a cross-signed certificate for the target CA.
+	CreateCrossCert(ctx context.Context, cc *CrossCert) error
+
+	// GetCrossCert returns the cross cert for targetCAID signed by signingCAID,
+	// or (nil, nil) if none exists.
+	GetCrossCert(ctx context.Context, targetCAID, signingCAID uuid.UUID) (*CrossCert, error)
+
+	// ListCrossCertsByTarget returns all cross certs issued for the target CA.
+	ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*CrossCert, error)
 
 	// UpdateCAStatus changes the status field of a CA (active → revoked/expired).
 	UpdateCAStatus(ctx context.Context, id uuid.UUID, status CAStatus) error

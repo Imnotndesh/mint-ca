@@ -38,6 +38,7 @@ func (h *PKIHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/crl/delta.der", h.getDeltaCRLDER)
 		r.Post("/ocsp", h.respondOCSP)
 		r.Get("/chain", h.getChain)
+		r.Get("/chain/cross/{signingCAID}", h.getCrossChain)
 	})
 }
 
@@ -134,6 +135,27 @@ func (h *PKIHandler) getChain(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	chainPEM, err := h.ca.GetChainPEM(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-pem-file")
+	w.WriteHeader(http.StatusOK)
+	w.Write(chainPEM)
+}
+
+func (h *PKIHandler) getCrossChain(w http.ResponseWriter, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	signingCAID, err := uuid.Parse(chi.URLParam(r, "signingCAID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid signing CA ID")
+		return
+	}
+	chainPEM, err := h.ca.GetCrossChainPEM(r.Context(), caID, signingCAID)
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return

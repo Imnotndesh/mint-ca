@@ -27,6 +27,9 @@ func (h *CAHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/{caID}", h.get)
 		r.Get("/{caID}/children", h.listChildren)
 		r.Put("/{caID}/revoke", h.revoke)
+		r.Post("/{caID}/rekey", h.rekey)
+		r.Post("/{caID}/cross-sign", h.crossSign)
+		r.Get("/{caID}/cross-certs", h.listCrossCerts)
 	})
 }
 
@@ -150,6 +153,81 @@ func (h *CAHandler) listChildren(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, children)
+}
+
+type createRekeyRequest struct {
+	KeyAlgo string `json:"key_algo"`
+	TTLDays int    `json:"ttl_days"`
+}
+
+type createCrossSignRequest struct {
+	SigningCAID string `json:"signing_ca_id"`
+	TTLDays     int    `json:"ttl_days"`
+}
+
+func (h *CAHandler) rekey(w http.ResponseWriter, r *http.Request) {
+	var req createRekeyRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	record, err := h.engine.RekeyCA(r.Context(), ca.RekeyCARequest{
+		CAID:    caID,
+		KeyAlgo: ca.KeyAlgo(req.KeyAlgo),
+		TTLDays: req.TTLDays,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, record)
+}
+
+func (h *CAHandler) crossSign(w http.ResponseWriter, r *http.Request) {
+	var req createCrossSignRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	signingID, err := uuid.Parse(req.SigningCAID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid signing_ca_id")
+		return
+	}
+	cc, err := h.engine.CrossSignCA(r.Context(), ca.CrossSignCARequest{
+		SigningCAID: signingID,
+		TargetCAID:  caID,
+		TTLDays:     req.TTLDays,
+	})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, cc)
+}
+
+func (h *CAHandler) listCrossCerts(w http.ResponseWriter, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	certs, err := h.store.ListCrossCertsByTarget(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, certs)
 }
 
 func (h *CAHandler) revoke(w http.ResponseWriter, r *http.Request) {
