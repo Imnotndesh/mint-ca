@@ -444,6 +444,11 @@ Revoke an SSH certificate. No request body.
 { "status": "revoked" }
 ```
 
+### `GET /pki/sshca/{caID}/krl`
+Public (no auth). Binary OpenSSH Key Revocation List (`application/octet-stream`), unsigned —
+authenticity relies on HTTPS transport, same trust model as the x509 CRL/OCSP endpoints.
+
+**Note:** unlike CRL, sshd does not fetch KRLs live. Configure `sshd_config`:
 ---
 
 ## 1.11 ACME Endpoints

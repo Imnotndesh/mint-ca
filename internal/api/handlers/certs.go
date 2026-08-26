@@ -48,7 +48,7 @@ type issueCertRequest struct {
 	Metadata      storage.JSON `json:"metadata"`
 }
 
-func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request){ 
+func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 	var req issueCertRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())

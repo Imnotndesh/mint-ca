@@ -10,15 +10,17 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"mint-ca/internal/sshca/krl"
 )
 
 type SSHCAHandler struct {
 	engine *sshca.Engine
 	store  storage.Store
+	krlMgr *krl.Manager
 }
 
-func NewSSHCAHandler(engine *sshca.Engine, store storage.Store) *SSHCAHandler {
-	return &SSHCAHandler{engine: engine, store: store}
+func NewSSHCAHandler(engine *sshca.Engine, store storage.Store, krlMgr *krl.Manager) *SSHCAHandler {
+	return &SSHCAHandler{engine: engine, store: store, krlMgr: krlMgr}
 }
 
 func (h *SSHCAHandler) RegisterRoutes(r chi.Router) {
@@ -41,8 +43,27 @@ func (h *SSHCAHandler) RegisterRoutes(r chi.Router) {
 
 // RegisterPublicRoutes mounts the unauthenticated SSH CA endpoints on the
 // public group, alongside the other /pki/* endpoints.
+// RegisterPublicRoutes mounts the unauthenticated SSH CA endpoints.
 func (h *SSHCAHandler) RegisterPublicRoutes(r chi.Router) {
 	r.Get("/pki/sshca/{caID}/public-key", h.getPublicKey)
+	r.Get("/pki/sshca/{caID}/krl", h.getKRL) // NEW
+}
+
+func (h *SSHCAHandler) getKRL(w http.ResponseWriter, r *http.Request) {
+	caID, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	data, err := h.krlMgr.GetKRL(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 }
 
 type createSSHCARequest struct {
@@ -248,3 +269,4 @@ func (h *SSHCAHandler) revokeCert(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
+

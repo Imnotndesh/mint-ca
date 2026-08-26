@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/pem"
 	"net"
 	"strings"
 	"testing"
 
+	"crypto/x509/pkix"
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/storage"
 

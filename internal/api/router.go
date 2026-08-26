@@ -4,6 +4,7 @@ import (
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ratelimit"
 	"net/http"
+	"testing/quick"
 
 	"mint-ca/internal/api/handlers"
 	apimiddleware "mint-ca/internal/api/middleware"
@@ -13,6 +14,7 @@ import (
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
+	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -29,7 +31,8 @@ func BuildRouter(
 	crlMgr *revocation.CRLManager,
 	ocspResponder *revocation.OCSPResponder,
 	policyEngine *policy.Engine,
-	rlEngine *ratelimit.Engine, // NEW parameter
+	rlEngine *ratelimit.Engine,
+	sshKRLMgr *krl.Manager,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -49,16 +52,16 @@ func BuildRouter(
 
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
-		handlers.NewSSHCAHandler(sshcaEngine, store).RegisterPublicRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store,sshKRLMgr).RegisterPublicRoutes(r)
 	})
 
 	r.Group(func(r chi.Router) {
 		r.Use(apimiddleware.Auth(store))
-		r.Use(apimiddleware.RateLimit(rlEngine, store)) // NEW — after Auth, before Audit
+		r.Use(apimiddleware.RateLimit(rlEngine, store))
 		r.Use(apimiddleware.Audit(store))
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
-		handlers.NewSSHCAHandler(sshcaEngine, store).RegisterRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store,sshKRLMgr).RegisterRoutes(r)
 		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)

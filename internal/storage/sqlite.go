@@ -197,7 +197,14 @@ CREATE TABLE IF NOT EXISTS setup_state (
     state      TEXT    NOT NULL DEFAULT 'uninitialized',
     updated_at DATETIME NOT NULL
 );
-
+CREATE TABLE IF NOT EXISTS ssh_krl_cache (
+	id          TEXT    NOT NULL PRIMARY KEY,
+	ca_id       TEXT    NOT NULL UNIQUE REFERENCES ssh_certificate_authorities(id) ON DELETE CASCADE,
+	krl_data    BLOB    NOT NULL,
+	krl_version INTEGER NOT NULL,
+	this_update DATETIME NOT NULL,
+	next_update DATETIME NOT NULL
+);
 CREATE TABLE IF NOT EXISTS certificates (
 	id             TEXT    NOT NULL PRIMARY KEY,
 	ca_id          TEXT    NOT NULL REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
@@ -2017,7 +2024,71 @@ func (s *sqliteStore) MarkKeyIDRetired(ctx context.Context, keyID string) error 
 	}
 	return nil
 }
+// ListRevokedSSHCertificatesByCA returns only revoked SSH certs for caID.
+func (s *sqliteStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error) {
+	rows, err := s.db.QueryContext(ctx,
+		sqliteSSHCertSelectSQL+" WHERE ca_id = ? AND status = 'revoked' ORDER BY revoked_at DESC", caID.String())
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListRevokedSSHCertificatesByCA: %w", err)
+	}
+	defer rows.Close()
+	var out []*SSHCertificate
+	for rows.Next() {
+		var c SSHCertificate
+		var idStr, caIDStr, provIDStr, principalsStr string
+		if err := rows.Scan(
+			&idStr, &caIDStr, &c.Serial, &c.CertType, &c.KeyID, &principalsStr,
+			&c.PublicKey, &c.CertData, &c.ValidAfter, &c.ValidBefore, &c.Status,
+			&c.RevokedAt, &provIDStr, &c.Requester, &c.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		c.ID = uuid.MustParse(idStr)
+		c.CAID = uuid.MustParse(caIDStr)
+		c.ProvisionerID = uuid.MustParse(provIDStr)
+		c.Principals, _ = unmarshalStringSlice(principalsStr)
+		out = append(out, &c)
+	}
+	return out, rows.Err()
+}
 
+func (s *sqliteStore) UpsertSSHKRL(ctx context.Context, k *SSHKRLCache) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO ssh_krl_cache (id, ca_id, krl_data, krl_version, this_update, next_update)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(ca_id) DO UPDATE SET
+			krl_data    = excluded.krl_data,
+			krl_version = excluded.krl_version,
+			this_update = excluded.this_update,
+			next_update = excluded.next_update`,
+		k.ID.String(), k.CAID.String(), k.KRLData, int64(k.KRLVersion),
+		k.ThisUpdate.UTC(), k.NextUpdate.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpsertSSHKRL: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetSSHKRL(ctx context.Context, caID uuid.UUID) (*SSHKRLCache, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, ca_id, krl_data, krl_version, this_update, next_update
+		FROM ssh_krl_cache WHERE ca_id = ?`, caID.String())
+	var k SSHKRLCache
+	var idStr, caIDStr string
+	var version int64
+	err := row.Scan(&idStr, &caIDStr, &k.KRLData, &version, &k.ThisUpdate, &k.NextUpdate)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetSSHKRL: %w", err)
+	}
+	k.ID = uuid.MustParse(idStr)
+	k.CAID = uuid.MustParse(caIDStr)
+	k.KRLVersion = uint64(version)
+	return &k, nil
+}
 func (s *sqliteStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT 1 FROM acme_retired_keys WHERE key_id = ?`, keyID)
 	var x int

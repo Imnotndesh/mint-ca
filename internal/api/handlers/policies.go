@@ -25,7 +25,6 @@ func (h *PolicyHandler) RegisterRoutes(r chi.Router) {
 		r.Delete("/{policyID}", h.delete)
 	})
 }
-
 type policyRequest struct {
 	Name           string              `json:"name"`
 	Scope          storage.PolicyScope `json:"scope"`
@@ -38,7 +37,7 @@ type policyRequest struct {
 	KeyAlgos       []string            `json:"key_algos"`
 	PolicyOIDs     []string            `json:"policy_oids"`
 	CPSURI         string              `json:"cps_uri"`
-}
+} 
 
 func (h *PolicyHandler) create(w http.ResponseWriter, r *http.Request) {
 	var req policyRequest

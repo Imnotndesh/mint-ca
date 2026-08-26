@@ -28,7 +28,15 @@ const (
 	CAStatusRevoked CAStatus = "revoked"
 	CAStatusExpired CAStatus = "expired"
 )
-
+// SSHKRLCache holds the most recently generated KRL for each SSH CA.
+type SSHKRLCache struct {
+	ID         uuid.UUID `json:"id"`
+	CAID       uuid.UUID `json:"ca_id"`
+	KRLData    []byte    `json:"-"`
+	KRLVersion uint64    `json:"krl_version"`
+	ThisUpdate time.Time `json:"this_update"`
+	NextUpdate time.Time `json:"next_update"`
+}
 type CertStatus string
 
 const (
@@ -580,7 +588,14 @@ type Store interface {
 
 	// IsKeyIDRetired reports whether keyID was retired via a prior key-change.
 	IsKeyIDRetired(ctx context.Context, keyID string) (bool, error)
+	// ListRevokedSSHCertificatesByCA returns only revoked SSH certs for caID.
+	ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error)
 
+	// UpsertSSHKRL inserts or replaces the cached KRL for an SSH CA.
+	UpsertSSHKRL(ctx context.Context, krl *SSHKRLCache) error
+
+	// GetSSHKRL returns the cached KRL for an SSH CA, or (nil, nil).
+	GetSSHKRL(ctx context.Context, caID uuid.UUID) (*SSHKRLCache, error)
 	// Close releases all connections held by the store.
 	Close() error
 }
