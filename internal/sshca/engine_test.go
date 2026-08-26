@@ -220,6 +220,105 @@ func TestParsePublicKeyInput_AutoDetectsBothFormats(t *testing.T) {
 	}
 }
 
+// TestIssueCert_CriticalOptionsAndExtensions verifies operator-supplied
+// critical options (e.g. force-command, source-address) and custom extensions
+// (e.g. permit-open) are embedded in the signed user certificate, merged over
+// the built-in default permit-* set (which must still be present).
+func TestIssueCert_CriticalOptionsAndExtensions(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+
+	ca, err := engine.CreateCA(ctx, CreateCARequest{Name: "critical-test", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+
+	issued, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID:           ca.ID,
+		Requester:      "test",
+		CertType:       storage.SSHCertTypeUser,
+		PublicKeyInput: generateTestClientKey(t),
+		KeyID:          "bob",
+		Principals:     []string{"bob"},
+		TTLSeconds:     3600,
+		CriticalOptions: map[string]string{
+			"force-command":  "/usr/local/bin/gateway",
+			"source-address": "203.0.113.0/24",
+		},
+		Extensions: map[string]string{
+			"permit-open": "host:22",
+		},
+	})
+	if err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+
+	certPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(issued.CertData))
+	if err != nil {
+		t.Fatalf("parse issued cert: %v", err)
+	}
+	cert, ok := certPub.(*ssh.Certificate)
+	if !ok {
+		t.Fatal("issued cert is not an *ssh.Certificate")
+	}
+
+	// Critical options present.
+	if cert.Permissions.CriticalOptions["force-command"] != "/usr/local/bin/gateway" {
+		t.Errorf("force-command critical option missing, got %v", cert.Permissions.CriticalOptions)
+	}
+	if cert.Permissions.CriticalOptions["source-address"] != "203.0.113.0/24" {
+		t.Errorf("source-address critical option missing, got %v", cert.Permissions.CriticalOptions)
+	}
+
+	// Custom extension present.
+	if cert.Permissions.Extensions["permit-open"] != "host:22" {
+		t.Errorf("permit-open extension missing, got %v", cert.Permissions.Extensions)
+	}
+	// Default permit-* set must be retained (merge-over semantics).
+	if _, ok := cert.Permissions.Extensions["permit-X11-forwarding"]; !ok {
+		t.Errorf("default permit-X11-forwarding dropped after merge, got %v", cert.Permissions.Extensions)
+	}
+}
+
+// TestIssueCert_HostCert_CriticalOptionsCarried verifies critical options and
+// extensions are also embedded on host certs when supplied (OpenSSH ignores
+// critical options there, but we carry them through faithfully).
+func TestIssueCert_HostCert_CriticalOptionsCarried(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+
+	ca, err := engine.CreateCA(ctx, CreateCARequest{Name: "host-critical-test", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+
+	issued, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID:           ca.ID,
+		Requester:      "test",
+		CertType:       storage.SSHCertTypeHost,
+		PublicKeyInput: generateTestClientKey(t),
+		KeyID:          "web1",
+		Principals:     []string{"web1"},
+		TTLSeconds:     3600,
+		CriticalOptions: map[string]string{"force-command": "/bin/true"},
+	})
+	if err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+
+	certPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(issued.CertData))
+	if err != nil {
+		t.Fatalf("parse issued cert: %v", err)
+	}
+	cert, ok := certPub.(*ssh.Certificate)
+	if !ok {
+		t.Fatal("issued cert is not an *ssh.Certificate")
+	}
+	if cert.Permissions.CriticalOptions["force-command"] != "/bin/true" {
+		t.Errorf("host cert force-command missing, got %v", cert.Permissions.CriticalOptions)
+	}
+}
+
 // generateTestClientKey creates a throwaway ed25519 SSH keypair and returns
 // its public key as an authorized_keys line, for use as request input.
 func generateTestClientKey(t *testing.T) string {
