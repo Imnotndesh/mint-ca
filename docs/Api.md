@@ -469,7 +469,12 @@ Issue (sign) an SSH certificate. `/sign/user` and `/sign/host` are fixed-type al
   "public_key": "ssh-ed25519 AAAA... mykey",   // authorized_keys line OR raw base64 wire format
   "principals": ["alice", "ops"],              // usernames (user) or hostnames (host); at least one
   "key_id": "alice",                            // free-text label in the certificate
-  "ttl_seconds": 28800                           // optional; default 8h user / 1y host
+  "ttl_seconds": 28800,                          // optional; default 8h user / 1y host
+  // optional OpenSSH critical options (force-command, source-address, ...):
+  "critical_options": { "force-command": "/opt/gateway", "source-address": "203.0.113.0/24" },
+  // optional extra extensions (permit-open, permit-listen, ...). Merged over
+  // the built-in default permit-* set — defaults are retained unless overridden:
+  "extensions": { "permit-open": "host:22" }
 }
 ```
 

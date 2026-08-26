@@ -114,12 +114,14 @@ func (h *SSHCAHandler) getCA(w http.ResponseWriter, r *http.Request) {
 }
 
 type issueSSHCertRequest struct {
-	ProvisionerID string   `json:"provisioner_id"`
-	CertType      string   `json:"cert_type"`
-	PublicKey     string   `json:"public_key"`
-	KeyID         string   `json:"key_id"`
-	Principals    []string `json:"principals"`
-	TTLSeconds    int64    `json:"ttl_seconds"`
+	ProvisionerID   string            `json:"provisioner_id"`
+	CertType        string            `json:"cert_type"`
+	PublicKey       string            `json:"public_key"`
+	KeyID           string            `json:"key_id"`
+	Principals      []string          `json:"principals"`
+	TTLSeconds      int64             `json:"ttl_seconds"`
+	CriticalOptions map[string]string `json:"critical_options,omitempty"`
+	Extensions      map[string]string `json:"extensions,omitempty"`
 }
 
 func (h *SSHCAHandler) issueCert(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +180,8 @@ func (h *SSHCAHandler) issue(w http.ResponseWriter, certType storage.SSHCertType
 		KeyID:          req.KeyID,
 		Principals:     req.Principals,
 		TTLSeconds:     req.TTLSeconds,
+		CriticalOptions: req.CriticalOptions,
+		Extensions:      req.Extensions,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
