@@ -67,18 +67,19 @@ func (h *CAHandler) createRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 type createIntermediateRequest struct {
-	ParentCAID      string                   `json:"parent_ca_id"`
-	Name            string                   `json:"name"`
-	CommonName      string                   `json:"common_name"`
-	Organization    string                   `json:"organization"`
-	Country         string                   `json:"country"`
-	State           string                   `json:"state"`
-	Locality        string                   `json:"locality"`
-	KeyAlgo         string                   `json:"key_algo"`
-	TTLDays         int                      `json:"ttl_days"`
-	MaxPathLen      int                      `json:"max_path_len"`
-	NameConstraints *storage.NameConstraints `json:"name_constraints,omitempty"`
+	ParentCAID      string                     `json:"parent_ca_id"`
+	Name            string                     `json:"name"`
+	CommonName      string                     `json:"common_name"`
+	Organization    string                     `json:"organization"`
+	Country         string                     `json:"country"`
+	State           string                     `json:"state"`
+	Locality        string                     `json:"locality"`
+	KeyAlgo         string                     `json:"key_algo"`
+	TTLDays         int                        `json:"ttl_days"`
+	MaxPathLen      int                        `json:"max_path_len"`
+	NameConstraints *storage.NameConstraints   `json:"name_constraints,omitempty"`
 }
+
 
 func (h *CAHandler) createIntermediate(w http.ResponseWriter, r *http.Request) {
 	var req createIntermediateRequest

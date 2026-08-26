@@ -1,4 +1,3 @@
-// cmd/server/main.go
 package main
 
 import (
@@ -25,6 +24,7 @@ import (
 	"mint-ca/internal/sshca"
 	"mint-ca/internal/storage"
 	"mint-ca/internal/workers"
+	"mint-ca/internal/sshca/krl"
 )
 
 func main() {
@@ -73,15 +73,15 @@ func main() {
 	crlManager := revocation.NewCRLManager(store, ks)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
 	policyEngine := policy.NewEngine(store)
-
+	sshKRLManager := krl.NewManager(store)
 	slog.Info("core services initialised")
 
 	apiWorkers := workers.NewWorkerGroup()
 	apiWorkers.Add(workers.NewCRLWorker(crlManager, cfg.CRL))
 	apiWorkers.Add(workers.NewNonceWorker(store))
+	apiWorkers.Add(workers.NewSSHKRLWorker(sshKRLManager,cfg.CRL))
 	apiWorkers.Add(workers.NewRateLimitPruneWorker(store))
 	apiWorkers.Start(context.Background())
-
 	// Read state before starting the listener so we know which router to mount.
 	state, err := store.GetSetupState(context.Background())
 	if err != nil {
@@ -161,7 +161,7 @@ func main() {
 
 	case storage.StateReady:
 		slog.Info("setup complete — starting full API")
-		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine)
+		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine,sshKRLManager)
 	}
 
 	srv := &http.Server{
