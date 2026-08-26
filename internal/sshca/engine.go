@@ -101,6 +101,18 @@ type IssueCertRequest struct {
 	// TTLSeconds is the certificate validity window. Defaults to 8 hours
 	// for user certs — short-lived by design — and 1 year for host certs.
 	TTLSeconds int64
+
+	// CriticalOptions are OpenSSH certificate critical options (e.g.
+	// "force-command", "source-address"), applied to both user and host certs
+	// when set. Values carry the option payload as OpenSSH expects; empty-string
+	// values are permitted. If nil, no critical options are added.
+	CriticalOptions map[string]string
+
+	// Extensions are additional OpenSSH certificate extensions (e.g.
+	// "permit-open", "permit-listen"). These MERGE OVER the built-in default
+	// permit-* set: keys supplied here override/join the defaults, they never
+	// silently drop them.
+	Extensions map[string]string
 }
 
 func (r *IssueCertRequest) setDefaults() {
@@ -246,6 +258,12 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		}
 	}
 
+	// Merge operator-supplied extensions over the OpenSSH default set (defaults
+	// stay unless explicitly overridden, so existing behaviour is unchanged).
+	for k, v := range req.Extensions {
+		extensions[k] = v
+	}
+
 	cert := &ssh.Certificate{
 		Key:             pub,
 		Serial:          serial,
@@ -255,7 +273,10 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		ValidAfter:      uint64(validAfter.Unix()),
 		ValidBefore:     uint64(validBefore.Unix()),
 		Permissions: ssh.Permissions{
-			Extensions: extensions,
+			// Critical options are only meaningful on user certs; OpenSSH ignores
+			// them on host certs, but we still carry whatever the operator set.
+			CriticalOptions: req.CriticalOptions,
+			Extensions:      extensions,
 		},
 	}
 
