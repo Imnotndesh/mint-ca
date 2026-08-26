@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -35,6 +36,7 @@ const (
 	KeyAlgoECDSAP384 KeyAlgo = "ecdsa-p384"
 	KeyAlgoRSA2048   KeyAlgo = "rsa-2048"
 	KeyAlgoRSA4096   KeyAlgo = "rsa-4096"
+	KeyAlgoEd25519   KeyAlgo = "ed25519"
 )
 
 // DefaultKeyAlgo is what the engine uses when no algorithm is specified.
@@ -43,7 +45,7 @@ const DefaultKeyAlgo = KeyAlgoECDSAP256
 // Valid returns true if the algorithm string is one we support.
 func (a KeyAlgo) Valid() bool {
 	switch a {
-	case KeyAlgoECDSAP256, KeyAlgoECDSAP384, KeyAlgoRSA2048, KeyAlgoRSA4096:
+	case KeyAlgoECDSAP256, KeyAlgoECDSAP384, KeyAlgoRSA2048, KeyAlgoRSA4096, KeyAlgoEd25519:
 		return true
 	}
 	return false
@@ -1432,6 +1434,9 @@ func generateKey(algo KeyAlgo) (crypto.Signer, []byte, error) {
 		key, err = rsa.GenerateKey(rand.Reader, 2048)
 	case KeyAlgoRSA4096:
 		key, err = rsa.GenerateKey(rand.Reader, 4096)
+	case KeyAlgoEd25519:
+		_, priv, genErr := ed25519.GenerateKey(rand.Reader)
+		key, err = priv, genErr
 	default:
 		return nil, nil, fmt.Errorf("generateKey: unsupported algorithm %q", algo)
 	}
@@ -1459,6 +1464,12 @@ func encodeKeyPEM(key crypto.Signer) ([]byte, error) {
 	case *rsa.PrivateKey:
 		der := x509.MarshalPKCS1PrivateKey(k)
 		return pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: der}), nil
+	case ed25519.PrivateKey:
+		der, err := x509.MarshalPKCS8PrivateKey(k)
+		if err != nil {
+			return nil, err
+		}
+		return pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}), nil
 	default:
 		return nil, fmt.Errorf("encodeKeyPEM: unsupported key type %T", key)
 	}
