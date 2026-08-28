@@ -89,8 +89,10 @@ Rotate a CA's signing key while preserving its identity and hierarchy position.
 Creates a NEW active CA row (new ID, new key, new SubjectKeyId, same Subject,
 same name constraints) signed by the same issuer (or self for a root). The
 previous CA row is marked **`superseded`** — it stops signing new certificates
-but already-issued leafs remain valid (they keep their original CAID). You must
-then repoint provisioners to the new CA ID.
+but already-issued leafs remain valid (they keep their original CAID). The new
+row keeps the same **`logical_ca_id`** as its predecessor, so provisioners and
+`ResolveActiveCA` keep resolving to it automatically — **no provisioner
+repointing is required** after a re-key.
 
 **Request body**
 ```json
