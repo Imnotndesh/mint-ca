@@ -111,6 +111,16 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 		"ALTER TABLE crl_cache ADD COLUMN crl_number INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}
+	// Add logical_ca_id for the provisioner->logical-CA indirection, then
+	// backfill existing rows so a pre-existing CA's logical id is itself.
+	if err := addColumnIfAbsentSQLite(ctx, s.db, "certificate_authorities", "logical_ca_id",
+		"ALTER TABLE certificate_authorities ADD COLUMN logical_ca_id TEXT"); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE certificate_authorities SET logical_ca_id = id WHERE logical_ca_id IS NULL`); err != nil {
+		return fmt.Errorf("sqlite: backfill logical_ca_id: %w", err)
+	}
+
 	// Widen the certificate_authorities.status CHECK to accept 'superseded' for
 	// databases created before re-key support. SQLite cannot ALTER a CHECK, so
 	// we rebuild the table (the standard 12-step approach) and copy rows over.
@@ -127,6 +137,7 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 // table to widen the status CHECK to include 'superseded'.
 const sqliteCASchema = `CREATE TABLE IF NOT EXISTS certificate_authorities (
 	id               TEXT    NOT NULL PRIMARY KEY,
+	logical_ca_id    TEXT,
 	parent_id        TEXT    REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
 	name             TEXT    NOT NULL UNIQUE,
 	type             TEXT    NOT NULL CHECK(type IN ('root','intermediate')),
@@ -159,8 +170,8 @@ func rebuildCAStatusConstraintSQLite(ctx context.Context, db *sql.DB) error {
 		ALTER TABLE certificate_authorities RENAME TO certificate_authorities_old;
 		`+sqliteCASchema+`;
 		INSERT INTO certificate_authorities
-			(id, parent_id, name, type, status, cert_pem, key_enc, key_algo, name_constraints, not_before, not_after, created_at)
-			SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo, name_constraints, not_before, not_after, created_at
+			(id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo, name_constraints, not_before, not_after, created_at)
+			SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo, name_constraints, not_before, not_after, created_at
 			FROM certificate_authorities_old;
 		DROP TABLE certificate_authorities_old;
 		COMMIT;
@@ -210,6 +221,7 @@ func addColumnIfAbsentSQLite(ctx context.Context, db *sql.DB, table, columnName,
 const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS certificate_authorities (
 	id               TEXT    NOT NULL PRIMARY KEY,
+	logical_ca_id    TEXT,
 	parent_id        TEXT    REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
 	name             TEXT    NOT NULL UNIQUE,
 	type             TEXT    NOT NULL CHECK(type IN ('root','intermediate')),
@@ -559,10 +571,11 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificate_authorities
-			(id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+			(id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 			 name_constraints, not_before, not_after, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ca.ID.String(),
+		uuidToSQL(ca.LogicalCAID),
 		uuidToSQL(ca.ParentID),
 		ca.Name,
 		string(ca.Type),
@@ -583,7 +596,7 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 
 func (s *sqliteStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuthority, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities WHERE id = ?`, id.String())
 	ca, err := scanCA(row)
@@ -595,7 +608,7 @@ func (s *sqliteStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuth
 
 func (s *sqliteStore) GetCAByName(ctx context.Context, name string) (*CertificateAuthority, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities WHERE name = ?`, name)
 	ca, err := scanCA(row)
@@ -607,7 +620,7 @@ func (s *sqliteStore) GetCAByName(ctx context.Context, name string) (*Certificat
 
 func (s *sqliteStore) ListCAs(ctx context.Context) ([]*CertificateAuthority, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities ORDER BY created_at ASC`)
 	if err != nil {
@@ -619,7 +632,7 @@ func (s *sqliteStore) ListCAs(ctx context.Context) ([]*CertificateAuthority, err
 
 func (s *sqliteStore) ListChildCAs(ctx context.Context, parentID uuid.UUID) ([]*CertificateAuthority, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 		       name_constraints, not_before, not_after, created_at
 		FROM certificate_authorities WHERE parent_id = ? ORDER BY created_at ASC`,
 		parentID.String())
@@ -712,10 +725,11 @@ func scanCrossCert(row crossCertScanner) (*CrossCert, error) {
 func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 	var ca CertificateAuthority
 	var idStr string
+	var logicalCAIDStr *string
 	var parentIDStr *string
 	var ncStr *string
 	err := row.Scan(
-		&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
+		&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 		&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 		&ncStr,
 		&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
@@ -727,6 +741,7 @@ func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.LogicalCAID = sqlToUUID(logicalCAIDStr)
 	ca.ParentID = sqlToUUID(parentIDStr)
 	ca.NameConstraints, err = unmarshalNameConstraints(ncStr)
 	if err != nil {
@@ -740,10 +755,11 @@ func scanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 	for rows.Next() {
 		var ca CertificateAuthority
 		var idStr string
+		var logicalCAIDStr *string
 		var parentIDStr *string
 		var ncStr *string
 		if err := rows.Scan(
-			&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
+			&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 			&ncStr,
 			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
@@ -751,6 +767,7 @@ func scanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.LogicalCAID = sqlToUUID(logicalCAIDStr)
 		ca.ParentID = sqlToUUID(parentIDStr)
 		nc, err := unmarshalNameConstraints(ncStr)
 		if err != nil {

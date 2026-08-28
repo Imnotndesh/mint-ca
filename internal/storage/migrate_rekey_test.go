@@ -69,6 +69,44 @@ func TestMigrate_RekeySchemaOnOldDB(t *testing.T) {
 	}
 }
 
+// TestMigrate_BackfillsLogicalCAID ensures the sqlite migration adds
+// logical_ca_id and backfills NULL rows to each CA's own id.
+func TestMigrate_BackfillsLogicalCAID(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	// Old schema without logical_ca_id.
+	if _, err := db.ExecContext(ctx, `CREATE TABLE certificate_authorities (
+		id TEXT NOT NULL PRIMARY KEY,
+		parent_id TEXT, name TEXT NOT NULL UNIQUE,
+		type TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+		cert_pem TEXT NOT NULL, key_enc BLOB NOT NULL, key_algo TEXT NOT NULL, name_constraints TEXT,
+		not_before DATETIME NOT NULL, not_after DATETIME NOT NULL, created_at DATETIME NOT NULL)`); err != nil {
+		t.Fatalf("create old table: %v", err)
+	}
+	caID := uuid.New().String()
+	if _, err := db.ExecContext(ctx, `INSERT INTO certificate_authorities (id,name,type,status,cert_pem,key_enc,key_algo,not_before,not_after,created_at) VALUES (?, 'lc','root','active','PEM',X'00','ecdsa-p256',?,?,?)`, caID, time.Now().UTC(), time.Now().Add(time.Hour), time.Now().UTC()); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	s := &sqliteStore{db: db}
+	if err := s.Migrate(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	var logical *string
+	if err := db.QueryRowContext(ctx, `SELECT logical_ca_id FROM certificate_authorities WHERE id=?`, caID).Scan(&logical); err != nil {
+		t.Fatalf("read logical_ca_id: %v", err)
+	}
+	if logical == nil || *logical != caID {
+		t.Fatalf("expected logical_ca_id backfill to own id, got %v", logical)
+	}
+}
+
 // TestSQLiteStore_CrossCertCRUD exercises the cross-cert store methods.
 func TestSQLiteStore_CrossCertCRUD(t *testing.T) {
 	ctx := context.Background()

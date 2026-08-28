@@ -110,12 +110,19 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, postgresCrossCertSchema); err != nil {
 		return fmt.Errorf("postgres: migrate cross cert schema: %w", err)
 	}
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE certificate_authorities ADD COLUMN IF NOT EXISTS logical_ca_id TEXT;
+		UPDATE certificate_authorities SET logical_ca_id = id WHERE logical_ca_id IS NULL;
+	`); err != nil {
+		return fmt.Errorf("postgres: migrate logical_ca_id: %w", err)
+	}
 	return nil
 }
 
 const postgresSchema = `
 CREATE TABLE IF NOT EXISTS certificate_authorities (
 	id               TEXT        NOT NULL PRIMARY KEY,
+	logical_ca_id    TEXT,
 	parent_id        TEXT        REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
 	name             TEXT        NOT NULL UNIQUE,
 	type             TEXT        NOT NULL CHECK(type IN ('root','intermediate')),
@@ -426,10 +433,10 @@ func (s *postgresStore) CreateCA(ctx context.Context, ca *CertificateAuthority) 
 	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificate_authorities
-			(id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+			(id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 			 name_constraints, not_before, not_after, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		ca.ID.String(), pgUUIDToSQL(ca.ParentID), ca.Name,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		ca.ID.String(), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), ca.Name,
 		string(ca.Type), string(ca.Status), ca.CertPEM, ca.KeyEnc, ca.KeyAlgo,
 		ncStr, ca.NotBefore.UTC(), ca.NotAfter.UTC(), ca.CreatedAt.UTC(),
 	)
@@ -568,17 +575,18 @@ const pgCrossCertSelectSQL = `
 	FROM ca_cross_certs`
 
 const pgCASelectSQL = `
-	SELECT id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
+	SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
 	       name_constraints, not_before, not_after, created_at
 	FROM certificate_authorities`
 
 func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
 	var ca CertificateAuthority
 	var idStr string
+	var logicalCAIDStr *string
 	var parentIDStr *string
 	var ncStr *string
 	err := row.Scan(
-		&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
+		&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 		&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 		&ncStr,
 		&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
@@ -590,6 +598,7 @@ func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.LogicalCAID = pgSQLToUUID(logicalCAIDStr)
 	ca.ParentID = pgSQLToUUID(parentIDStr)
 	nc, err := pgUnmarshalNameConstraints(ncStr)
 	if err != nil {
@@ -604,10 +613,11 @@ func pgScanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 	for rows.Next() {
 		var ca CertificateAuthority
 		var idStr string
+		var logicalCAIDStr *string
 		var parentIDStr *string
 		var ncStr *string
 		if err := rows.Scan(
-			&idStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
+			&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 			&ncStr,
 			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
@@ -615,6 +625,7 @@ func pgScanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.LogicalCAID = pgSQLToUUID(logicalCAIDStr)
 		ca.ParentID = pgSQLToUUID(parentIDStr)
 		nc, err := pgUnmarshalNameConstraints(ncStr)
 		if err != nil {

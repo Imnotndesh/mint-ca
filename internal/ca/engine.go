@@ -635,18 +635,20 @@ func (e *Engine) CreateRootCA(ctx context.Context, req CreateRootCARequest) (*st
 	}
 
 	record := &storage.CertificateAuthority{
-		ID:        uuid.New(),
-		ParentID:  nil, // root has no parent
-		Name:      req.Name,
-		Type:      storage.CATypeRoot,
-		Status:    storage.CAStatusActive,
-		CertPEM:   string(certPEM),
-		KeyEnc:    encKey,
-		KeyAlgo:   string(req.KeyAlgo),
-		NotBefore: now,
-		NotAfter:  notAfter,
-		CreatedAt: now,
+		ID:          uuid.New(),
+		LogicalCAID: nil, // set below to self
+		ParentID:    nil, // root has no parent
+		Name:        req.Name,
+		Type:        storage.CATypeRoot,
+		Status:      storage.CAStatusActive,
+		CertPEM:     string(certPEM),
+		KeyEnc:      encKey,
+		KeyAlgo:     string(req.KeyAlgo),
+		NotBefore:   now,
+		NotAfter:    notAfter,
+		CreatedAt:   now,
 	}
+	record.LogicalCAID = &record.ID
 
 	if err := e.store.CreateCA(ctx, record); err != nil {
 		return nil, fmt.Errorf("ca: CreateRootCA: store: %w", err)
@@ -774,6 +776,7 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 	parentID := req.ParentCAID
 	record := &storage.CertificateAuthority{
 		ID:              uuid.New(),
+		LogicalCAID:     nil, // set below to self
 		ParentID:        &parentID,
 		Name:            req.Name,
 		Type:            storage.CATypeIntermediate,
@@ -786,6 +789,7 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 		NotAfter:        notAfter,
 		CreatedAt:       now,
 	}
+	record.LogicalCAID = &record.ID
 
 	if err := e.store.CreateCA(ctx, record); err != nil {
 		return nil, fmt.Errorf("ca: CreateIntermediateCA: store: %w", err)
@@ -926,8 +930,12 @@ func (e *Engine) RekeyCA(ctx context.Context, req RekeyCARequest) (*storage.Cert
 		return nil, fmt.Errorf("ca: RekeyCA: encrypt key: %w", err)
 	}
 
+	// The re-keyed CA belongs to the same LOGICAL CA as its predecessor, so
+	// provisioners pointed at that logical CA keep resolving to the new row.
+	// Fresh CAs use own ID; prefer an existing logical id if present.
 	newRecord := &storage.CertificateAuthority{
 		ID:              uuid.New(),
+		LogicalCAID:     old.LogicalCAID,
 		ParentID:        old.ParentID,
 		Name:            old.Name,
 		Type:            old.Type,
@@ -939,6 +947,9 @@ func (e *Engine) RekeyCA(ctx context.Context, req RekeyCARequest) (*storage.Cert
 		NotBefore:       now,
 		NotAfter:        notAfter,
 		CreatedAt:       now,
+	}
+	if newRecord.LogicalCAID == nil {
+		newRecord.LogicalCAID = &old.ID
 	}
 
 	// Mark the old CA superseded first.
@@ -1412,6 +1423,30 @@ func (e *Engine) loadIssuer(ctx context.Context, caID uuid.UUID) (
 }
 
 // loadKey decrypts the private key stored in a CA record.
+// ResolveActiveCA returns the ACTIVE CA row belonging to a logical CA identity.
+// After a re-key the old row is superseded and a new row carries the same
+// LogicalCAID, so this returns the newest active row automatically. Returns an
+// error if no active row exists (e.g. the CA was revoked).
+func (e *Engine) ResolveActiveCA(ctx context.Context, logicalCAID uuid.UUID) (*storage.CertificateAuthority, error) {
+	cas, err := e.store.ListCAs(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("ca: ResolveActiveCA: list CAs: %w", err)
+	}
+	var active *storage.CertificateAuthority
+	for _, ca := range cas {
+		if ca.LogicalCAID != nil && *ca.LogicalCAID == logicalCAID && ca.Status == storage.CAStatusActive {
+			// Prefer the most recently created active row.
+			if active == nil || ca.CreatedAt.After(active.CreatedAt) {
+				active = ca
+			}
+		}
+	}
+	if active == nil {
+		return nil, fmt.Errorf("ca: ResolveActiveCA: no active CA for logical CA %s", logicalCAID)
+	}
+	return active, nil
+}
+
 func (e *Engine) loadKey(record *storage.CertificateAuthority) (crypto.Signer, error) {
 	keyPEM, err := e.keystore.DecryptPEM(record.KeyEnc)
 	if err != nil {

@@ -284,9 +284,10 @@ behaviour unchanged when disabled.
 **Re-key** (`POST /api/v1/ca/{caID}/rekey`) rotates a CA's signing key while
 preserving its identity. It creates a new active CA row (new key/SKI, same
 Subject), marks the old row **superseded**, and keeps already-issued leafs
-valid (they keep their original CAID). After re-keying, repoint your
-provisioners to the new CA ID before issuing new certificates, and distribute
-the new CA cert where clients need it. Superseded is distinct from revoked:
+valid (they keep their original CAID). The re-keyed row keeps the same
+`logical_ca_id`, so provisioners and issuance keep resolving to it — there is
+**no need to repoint provisioners** after re-keying. Just distribute the new CA
+cert where clients need it. Superseded is distinct from revoked:
 superseded CA certificate can't sign new things, but its existing leaves are
 not treated as compromised.
 
