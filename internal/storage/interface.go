@@ -138,6 +138,11 @@ type SANs struct {
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.
 type CertificateAuthority struct {
 	ID              uuid.UUID        `json:"id"`
+	// LogicalCAID is the stable identity a CA row belongs to. Re-key creates a
+	// new row with a new physical ID but the SAME LogicalCAID, so provisioners
+	// can keep pointing at one logical CA across rotations. Fresh CAs get their
+	// own ID as their LogicalCAID (backfilled on migration for existing rows).
+	LogicalCAID     *uuid.UUID       `json:"logical_ca_id,omitempty"`
 	ParentID        *uuid.UUID       `json:"parent_id,omitempty"`
 	Name            string           `json:"name"`
 	Type            CAType           `json:"type"`
