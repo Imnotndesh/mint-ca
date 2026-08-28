@@ -10,53 +10,91 @@ import (
 	"github.com/google/uuid"
 )
 
-// TestRenewalInfo_WindowOpensLateInLifetime verifies the RFC 9779 window opens
-// at 80% of the certificate's lifetime and closes at NotAfter.
-func TestRenewalInfo_WindowOpensLateInLifetime(t *testing.T) {
-	ctx := context.Background()
-
-	notBefore := time.Now().UTC().Add(-10 * 24 * time.Hour) // issued 10 days ago
-	notAfter := time.Now().UTC().Add(90 * 24 * time.Hour)   // expires in 90 days
-	certID := uuid.New()
-
+func newRenewalService(t *testing.T, cert *storage.Certificate) (*Service, *fakeStore) {
+	t.Helper()
 	store := NewFakeStore()
-	_ = store.CreateCertificate(ctx, &storage.Certificate{
+	if cert != nil {
+		_ = store.CreateCertificate(ctxTest, cert)
+	}
+	svc := NewService(store, nil, NewNonceManager(NewFakeStore(), 0), nil, "https://ca.test")
+	return svc, store
+}
+
+var ctxTest = context.Background()
+
+func certRecord(certID uuid.UUID, nb, na time.Time) *storage.Certificate {
+	return &storage.Certificate{
 		ID: certID, CAID: uuid.New(), Serial: "123",
 		CertPEM: "PEM", Status: storage.CertStatusActive,
-		NotBefore: notBefore, NotAfter: notAfter, IssuedAt: notBefore,
-	})
-	svc2 := NewService(store, nil, NewNonceManager(NewFakeStore(), 0), nil, "https://ca.test")
-
-	win, prob := svc2.RenewalInfo(ctx, certID)
-	if prob != nil {
-		t.Fatalf("RenewalInfo: %v", prob)
-	}
-	// Compute the expected start from the ACTUAL stored lifetime.
-	rec, _ := store.GetCertificate(ctx, certID)
-	life := rec.NotAfter.Sub(rec.NotBefore)
-	wantStart := rec.NotBefore.Add(time.Duration(float64(life) * 0.8))
-	if !win.Start.Equal(wantStart) {
-		t.Errorf("expected window.start %v, got %v", wantStart, win.Start)
-	}
-	if !win.End.Equal(notAfter) {
-		t.Errorf("expected window.end %v, got %v", notAfter, win.End)
-	}
-	// Window must open in the future (clearly after issuance, before expiry).
-	if !win.Start.After(notBefore) || !win.Start.Before(notAfter) {
-		t.Errorf("window.start %v not strictly within (notBefore, notAfter)", win.Start)
+		NotBefore: nb, NotAfter: na, IssuedAt: nb,
 	}
 }
 
-// TestRenewalInfo_NotFound ensures a missing cert returns a problem.
-func TestRenewalInfo_NotFound(t *testing.T) {
-	ctx := context.Background()
-	svc := NewService(NewFakeStore(), nil, NewNonceManager(NewFakeStore(), 0), nil, "https://ca.test")
+// floor: start = end - max(lifetime/5, 24h), never before notBefore.
+func TestRenewalInfo_DefaultLeadIsFractionWithFloor(t *testing.T) {
+	certID := uuid.New()
+	now := time.Now().UTC()
+	// lifetime 100 days -> leadTime = max(20d,24h)=20d -> start = notAfter-20d.
+	nb := now.Add(-10 * 24 * time.Hour)
+	na := now.Add(90 * 24 * time.Hour)
+	svc, store := newRenewalService(t, certRecord(certID, nb, na))
 
-	_, prob := svc.RenewalInfo(ctx, uuid.New())
-	if prob == nil {
-		t.Fatal("expected a 404 problem for an unknown certificate")
+	win, prob := svc.RenewalInfo(ctxTest, certID, 0)
+	if prob != nil {
+		t.Fatalf("RenewalInfo: %v", prob)
 	}
-	if prob.Status != 404 {
-		t.Errorf("expected status 404, got %d", prob.Status)
+	wantStart := na.Add(-20 * 24 * time.Hour)
+	if !win.End.Equal(na) {
+		t.Errorf("end: got %v want %v", win.End, na)
+	}
+	if !win.Start.Equal(wantStart) {
+		t.Errorf("start: got %v want %v", win.Start, wantStart)
+	}
+	_ = store
+}
+
+// Short lifetime (< ~1 day) triggers the 24h floor; start must clamp to notAfter.
+func TestRenewalInfo_ShortLifetimeUsesFloor(t *testing.T) {
+	certID := uuid.New()
+	now := time.Now().UTC()
+	nb := now.Add(-1 * time.Hour)
+	na := now.Add(12 * time.Hour) // lifetime 13h -> fraction/5 = 2.6h, floor 24h wins
+	svc, _ := newRenewalService(t, certRecord(certID, nb, na))
+
+	win, prob := svc.RenewalInfo(ctxTest, certID, 0)
+	if prob != nil {
+		t.Fatalf("RenewalInfo: %v", prob)
+	}
+	if !win.End.Equal(na) {
+		t.Errorf("end: got %v want %v", win.End, na)
+	}
+	// start must not be before notBefore (clamp).
+	if win.Start.Before(nb) {
+		t.Errorf("start %v clamped below notBefore %v", win.Start, nb)
+	}
+}
+
+// Explicit override wins over fraction/floor.
+func TestRenewalInfo_OverrideLead(t *testing.T) {
+	certID := uuid.New()
+	now := time.Now().UTC()
+	nb := now.Add(-10 * 24 * time.Hour)
+	na := now.Add(90 * 24 * time.Hour)
+	svc, _ := newRenewalService(t, certRecord(certID, nb, na))
+
+	override := 5 * 24 * time.Hour
+	win, prob := svc.RenewalInfo(ctxTest, certID, override)
+	if prob != nil {
+		t.Fatalf("RenewalInfo: %v", prob)
+	}
+	if want := na.Add(-override); !win.Start.Equal(want) {
+		t.Errorf("override start: got %v want %v", win.Start, want)
+	}
+}
+
+func TestRenewalInfo_NotFound(t *testing.T) {
+	svc, _ := newRenewalService(t, nil)
+	if _, prob := svc.RenewalInfo(ctxTest, uuid.New(), 0); prob == nil || prob.Status != 404 {
+		t.Fatalf("expected 404, got %v", prob)
 	}
 }

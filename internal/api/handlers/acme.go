@@ -60,7 +60,6 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/order/{orderID}/finalize", h.finalizeOrder)
 		r.Post("/challenge/{challengeID}", h.validateChallenge)
 		r.Post("/certificate/{certID}", h.getCertificate)
-		r.Post("/renewal-info/{certID}", h.getRenewalInfo)
 		r.Get("/renewal-info/{certID}", h.getRenewalInfo)
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/account/{accountID}/orders", h.listOrders)
@@ -847,10 +846,6 @@ func (h *ACMEHandler) finalizeOrder(w http.ResponseWriter, r *http.Request) {
 
 	orderURL := h.service.OrderURL(prov.ID, order.ID)
 	w.Header().Set("Location", orderURL)
-	// Advertise the renewal-info endpoint when the order has a certificate.
-	if order.CertificateID != nil {
-		w.Header().Set("Link", "<"+h.service.RenewalInfoURL(prov.ID, *order.CertificateID)+">;rel=\"renewalInfo\"")
-	}
 	h.acmeWriteJSON(w, r, http.StatusOK, h.orderResponse(r.Context(), prov.ID, order))
 }
 
@@ -961,7 +956,8 @@ func (h *ACMEHandler) getCertificate(w http.ResponseWriter, r *http.Request) {
 
 func (h *ACMEHandler) getRenewalInfo(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	if _, prob := h.loadProvisioner(r); prob != nil {
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
 		h.acmeProblem(w, r, prob)
 		return
 	}
@@ -972,33 +968,21 @@ func (h *ACMEHandler) getRenewalInfo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// POST-as-GET requires a valid JWS over an empty payload (unauthenticated
-	// GET is also permitted, since knowing the high-entropy cert ID is enough).
-	if r.Method == http.MethodPost {
-		jws, hdr, jwsProb := parseJWS(r)
-		if jwsProb != nil {
-			h.acmeProblem(w, r, jwsProb)
-			return
-		}
-		p, _ := jws.PayloadBytes()
-		if len(p) != 0 {
-			h.acmeProblem(w, r, internalacme.ErrMalformedProblem("renewal-info POST-as-GET requires an empty body"))
-			return
-		}
-		if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
-			h.acmeProblem(w, r, prob)
-			return
-		}
+	// Provisioner may override the renewal lead time; 0 means service default.
+	var cfg internalacme.ProvisionerConfig
+	if raw, err := json.Marshal(prov.Config); err == nil {
+		_ = json.Unmarshal(raw, &cfg)
 	}
+	cfg.SetDefaults()
+	override := time.Duration(cfg.RenewalLeadPeriodSeconds) * time.Second
 
-	window, prob := h.service.RenewalInfo(ctx, certID)
+	window, prob := h.service.RenewalInfo(ctx, certID, override)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
 		return
 	}
 
-	nonce, _ := h.service.IssueNonce(ctx)
-	w.Header().Set("Replay-Nonce", nonce)
+	// GET endpoint: no Replay-Nonce required (no subsequent POST in the same flow).
 	w.Header().Set("Cache-Control", "no-store")
 	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
 		"renewalWindow": map[string]string{
