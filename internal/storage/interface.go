@@ -273,6 +273,32 @@ type Certificate struct {
 }
 
 // Provisioner is the entity authorised to request certificates from a CA.
+// Profile is a named set of issuance constraints that can be pinned to a
+// provisioner (Provisioner.ProfileID) or requested per issuance. An empty
+// profile imposes no constraints.
+type Profile struct {
+	ID              uuid.UUID `json:"id"`
+	Name            string    `json:"name"`
+
+	// AllowedKeyAlgos restricts the leaf key algorithm (e.g. "ecdsa-p256",
+	// "rsa-2048", "ed25519"). Empty means any.
+	AllowedKeyAlgos []string  `json:"allowed_key_algos,omitempty"`
+
+	// MinTTLSeconds / MaxTTLSeconds bound the certificate lifetime. 0 means
+	// "no constraint" on that side.
+	MinTTLSeconds   int64     `json:"min_ttl_seconds"`
+	MaxTTLSeconds   int64     `json:"max_ttl_seconds"`
+
+	// RequireSAN forces every issued certificate to carry at least one SAN.
+	RequireSAN      bool      `json:"require_san"`
+
+	// AllowWildcard permits wildcard DNS SANs (e.g. "*.example.com").
+	// Default false = wildcard SANs rejected.
+	AllowWildcard   bool      `json:"allow_wildcard"`
+
+	CreatedAt       time.Time `json:"created_at"`
+}
+
 type Provisioner struct {
 	ID        uuid.UUID         `json:"id"`
 	CAID      uuid.UUID         `json:"ca_id"`
@@ -280,6 +306,7 @@ type Provisioner struct {
 	Type      ProvisionerType   `json:"type"`
 	Config    JSON              `json:"config"`
 	PolicyID  *uuid.UUID        `json:"policy_id,omitempty"`
+	ProfileID *uuid.UUID        `json:"profile_id,omitempty"`
 	Status    ProvisionerStatus `json:"status"`
 	CreatedAt time.Time         `json:"created_at"`
 }

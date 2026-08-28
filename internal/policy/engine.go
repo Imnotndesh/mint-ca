@@ -231,6 +231,55 @@ func evaluate(pol *storage.Policy, req CertRequest) error {
 	return nil
 }
 
+// EvaluateProfile checks a certificate issuance request against a named
+// profile's constraints. An empty profile (all zero values) allows everything.
+// It is independent of the database-backed Policy evaluation and can be used
+// for provisioner-pinned or per-request profiles.
+func EvaluateProfile(prof *storage.Profile, req CertRequest) error {
+	if prof == nil {
+		return nil
+	}
+
+	if len(prof.AllowedKeyAlgos) > 0 && req.KeyAlgo != "" {
+		if !containsString(prof.AllowedKeyAlgos, req.KeyAlgo) {
+			return fmt.Errorf(
+				"profile: key algorithm %q is not permitted; allowed: %s",
+				req.KeyAlgo, strings.Join(prof.AllowedKeyAlgos, ", "),
+			)
+		}
+	}
+
+	if prof.MaxTTLSeconds > 0 && req.TTLSeconds > prof.MaxTTLSeconds {
+		return fmt.Errorf(
+			"profile: requested TTL %d exceeds profile maximum of %d",
+			req.TTLSeconds, prof.MaxTTLSeconds,
+		)
+	}
+	if prof.MinTTLSeconds > 0 && req.TTLSeconds > 0 && req.TTLSeconds < prof.MinTTLSeconds {
+		return fmt.Errorf(
+			"profile: requested TTL %d is below profile minimum of %d",
+			req.TTLSeconds, prof.MinTTLSeconds,
+		)
+	}
+
+	if prof.RequireSAN {
+		hasSAN := len(req.SANsDNS) > 0 || len(req.SANsIP) > 0 || len(req.SANsEmail) > 0
+		if !hasSAN {
+			return errors.New("profile requires at least one Subject Alternative Name")
+		}
+	}
+
+	if !prof.AllowWildcard {
+		for _, dns := range req.SANsDNS {
+			if strings.HasPrefix(dns, "*.") || dns == "*" {
+				return fmt.Errorf("profile: wildcard DNS SAN %q is not permitted", dns)
+			}
+		}
+	}
+
+	return nil
+}
+
 // matchDomain reports whether domain matches pattern.
 //
 // Rules:
