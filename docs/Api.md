@@ -247,6 +247,11 @@ Disable a provisioner. No request body.
 
 ## 1.4 Policies
 
+Certificates can also be constrained by a **profile** (`storage.Profile`) — a
+reusable set of constraints (`allowed_key_algos`, `min/max_ttl_seconds`,
+`require_san`, `allow_wildcard`) evaluated by `policy.EvaluateProfile`. A
+provisioner may pin one via its `profile_id`.
+
 ### `POST /api/v1/policies`
 Create a new certificate issuance policy.
 
