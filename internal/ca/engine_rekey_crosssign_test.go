@@ -46,6 +46,16 @@ func (f *rekeyFakeStore) GetCrossCert(ctx context.Context, targetCAID, signingCA
 	return f.cross[targetCAID.String()+"|"+signingCAID.String()], nil
 }
 
+func (f *rekeyFakeStore) ListCAs(ctx context.Context) ([]*storage.CertificateAuthority, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.CertificateAuthority
+	for _, c := range f.cas {
+		out = append(out, c)
+	}
+	return out, nil
+}
+
 func (f *rekeyFakeStore) ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*storage.CrossCert, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
