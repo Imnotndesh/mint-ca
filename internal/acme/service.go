@@ -37,6 +37,11 @@ type ProvisionerConfig struct {
 	// AllowedChallengeTypes lists the challenge types this provisioner will
 	// accept. Supported values: "http-01", "dns-01". Empty means all supported.
 	AllowedChallengeTypes []string `json:"allowed_challenge_types"`
+
+	// RenewalLeadPeriodSeconds overrides the renewal-info lead time (how long
+	// before NotAfter the renewal window opens) for this provisioner. 0 means
+	// the default (max(lifetime/5, 24h)).
+	RenewalLeadPeriodSeconds int64 `json:"renewal_lead_period_seconds"`
 }
 
 type KeyChangeRequest struct {
@@ -1123,10 +1128,14 @@ func (s *Service) RenewalInfoURL(provisionerID, certID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/renewal-info/%s", s.baseURL, provisionerID, certID)
 }
 
-// renewThresholdFraction is the fraction of a certificate's lifetime after
-// which the renewal window opens. 0.8 = start renewing after 80% of the
-// lifetime has elapsed. RFC 9779 leaves the exact policy to the CA.
-const renewThresholdFraction = 0.8
+// renewInfoFloor is the minimum lead time before NotAfter at which the renewal
+// window opens, applied when the derived fraction would be smaller (short-lived
+// certificates). RFC 9779 leaves the exact policy to the CA.
+const renewInfoFloor = 24 * time.Hour
+
+// renewInfoFraction is the fraction of a certificate's lifetime used as the
+// default renewal lead time (1/5 = open renewing in the final 20%).
+const renewInfoFraction = 0.2
 
 // RenewalWindow is the RFC 9779 renewal window for a certificate.
 type RenewalWindow struct {
@@ -1135,9 +1144,10 @@ type RenewalWindow struct {
 }
 
 // RenewalInfo returns the RFC 9779 renewal window for the given certificate.
-// The window opens at renewThresholdFraction of the certificate's lifetime and
-// closes at NotAfter. Returns nil if the certificate is not found.
-func (s *Service) RenewalInfo(ctx context.Context, certID uuid.UUID) (*RenewalWindow, *Problem) {
+// The window closes at NotAfter and opens one lead-time earlier, where
+// leadTime = override if >0, else max(lifetime*renewInfoFraction, renewInfoFloor),
+// clamped to the lifetime. Returns nil if the certificate is not found.
+func (s *Service) RenewalInfo(ctx context.Context, certID uuid.UUID, override time.Duration) (*RenewalWindow, *Problem) {
 	cert, err := s.store.GetCertificate(ctx, certID)
 	if err != nil {
 		return nil, ErrServerInternalProblem("load certificate: " + err.Error())
@@ -1146,13 +1156,29 @@ func (s *Service) RenewalInfo(ctx context.Context, certID uuid.UUID) (*RenewalWi
 		return nil, NewProblem(ErrMalformed, 404, "renewal info: certificate not found")
 	}
 
-	total := cert.NotAfter.Sub(cert.NotBefore)
-	if total <= 0 {
+	life := cert.NotAfter.Sub(cert.NotBefore)
+	if life <= 0 {
 		// Degenerate lifetime — open the window immediately.
 		return &RenewalWindow{Start: cert.NotBefore, End: cert.NotAfter}, nil
 	}
-	start := cert.NotBefore.Add(time.Duration(float64(total) * renewThresholdFraction))
-	return &RenewalWindow{Start: start, End: cert.NotAfter}, nil
+
+	lead := override
+	if lead <= 0 {
+		lead = time.Duration(float64(life) * renewInfoFraction)
+		if lead < renewInfoFloor {
+			lead = renewInfoFloor
+		}
+	}
+	if lead > life {
+		lead = life
+	}
+
+	end := cert.NotAfter
+	start := end.Add(-lead)
+	if start.Before(cert.NotBefore) {
+		start = cert.NotBefore
+	}
+	return &RenewalWindow{Start: start, End: end}, nil
 }
 
 func (s *Service) AuthorizationURL(provisionerID, authID uuid.UUID) string {
