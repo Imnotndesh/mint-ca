@@ -65,6 +65,16 @@ func (f *testFakeStore) GetCertificate(ctx context.Context, id uuid.UUID) (*stor
 	defer f.mu.Unlock()
 	return f.certs[id], nil
 }
+func (f *testFakeStore) GetCertificateBySerial(ctx context.Context, serial string) (*storage.Certificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.certs {
+		if c.Serial == serial {
+			return c, nil
+		}
+	}
+	return nil, nil
+}
 func (f *testFakeStore) RevokeCertificate(ctx context.Context, id uuid.UUID, reason int) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
