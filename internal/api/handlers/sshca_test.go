@@ -469,7 +469,7 @@ func setupSSHRouter(t *testing.T) (*sshFakeStore, *SSHCAHandler, chi.Router) {
 	if err != nil {
 		t.Fatalf("keystore: %v", err)
 	}
-	engine := sshca.NewEngine(store, ks)
+	engine := sshca.NewEngine(store, ks, nil)
 	krlMgr := krl.NewManager(store)
 	h := NewSSHCAHandler(engine, store, krlMgr)
 

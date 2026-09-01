@@ -10,6 +10,7 @@ import (
 	"time"
 
 	mintcrypto "mint-ca/internal/crypto"
+	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
 
 	"github.com/google/uuid"
@@ -158,11 +159,13 @@ type IssuedCertificate struct {
 type Engine struct {
 	store    storage.Store
 	keystore *mintcrypto.Keystore
+	pol      *policy.Engine
 }
 
-// NewEngine constructs an Engine. Both arguments are required.
-func NewEngine(store storage.Store, keystore *mintcrypto.Keystore) *Engine {
-	return &Engine{store: store, keystore: keystore}
+// NewEngine constructs an Engine. store and keystore are required; pol may be
+// nil to disable SSH policy enforcement.
+func NewEngine(store storage.Store, keystore *mintcrypto.Keystore, pol *policy.Engine) *Engine {
+	return &Engine{store: store, keystore: keystore, pol: pol}
 }
 
 // CreateCA generates a new SSH CA signing key and persists it to the store.
@@ -231,6 +234,31 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		return nil, fmt.Errorf("sshca: IssueCert: parse public key: %w", err)
 	}
 
+	// Effective values after SSH policy resolution (default to request).
+	principals := req.Principals
+	ttlSeconds := req.TTLSeconds
+	criticalOptions := req.CriticalOptions
+
+	if e.pol != nil {
+		dec, err := e.pol.EvaluateSSH(ctx, req.ProvisionerID, policy.SSHCertRequest{
+			CertType:        string(req.CertType),
+			KeyAlgo:         pub.Type(),
+			Principals:      principals,
+			TTLSeconds:      ttlSeconds,
+			CriticalOptions: criticalOptions,
+			Extensions:      req.Extensions,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("sshca: IssueCert: policy: %w", err)
+		}
+		if dec != nil {
+			principals = dec.Principals
+			ttlSeconds = dec.TTLSeconds
+			criticalOptions = dec.CriticalOptions
+			req.Extensions = dec.Extensions
+		}
+	}
+
 	serial, err := randomSerial()
 	if err != nil {
 		return nil, fmt.Errorf("sshca: IssueCert: generate serial: %w", err)
@@ -238,7 +266,7 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 
 	now := time.Now().UTC()
 	validAfter := now.Add(-1 * time.Minute) // small clock-skew buffer
-	validBefore := now.Add(time.Duration(req.TTLSeconds) * time.Second)
+	validBefore := now.Add(time.Duration(ttlSeconds) * time.Second)
 
 	var sshCertType uint32
 	var extensions map[string]string
@@ -269,13 +297,13 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		Serial:          serial,
 		CertType:        sshCertType,
 		KeyId:           req.KeyID,
-		ValidPrincipals: req.Principals,
+		ValidPrincipals: principals,
 		ValidAfter:      uint64(validAfter.Unix()),
 		ValidBefore:     uint64(validBefore.Unix()),
 		Permissions: ssh.Permissions{
 			// Critical options are only meaningful on user certs; OpenSSH ignores
 			// them on host certs, but we still carry whatever the operator set.
-			CriticalOptions: req.CriticalOptions,
+			CriticalOptions: criticalOptions,
 			Extensions:      extensions,
 		},
 	}
@@ -292,7 +320,7 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		Serial:        serial,
 		CertType:      req.CertType,
 		KeyID:         req.KeyID,
-		Principals:    req.Principals,
+		Principals:    principals,
 		PublicKey:     strings.TrimSpace(string(ssh.MarshalAuthorizedKey(pub))),
 		CertData:      certData,
 		ValidAfter:    validAfter,

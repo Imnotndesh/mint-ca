@@ -5,13 +5,16 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
 	mintcrypto "mint-ca/internal/crypto"
+	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
 
+	"github.com/google/uuid"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -23,7 +26,7 @@ func setupTestEngine(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatalf("keystore: %v", err)
 	}
-	return NewEngine(store, ks)
+	return NewEngine(store, ks, nil)
 }
 
 func TestCreateCA_Ed25519(t *testing.T) {
@@ -293,13 +296,13 @@ func TestIssueCert_HostCert_CriticalOptionsCarried(t *testing.T) {
 	}
 
 	issued, err := engine.IssueCert(ctx, IssueCertRequest{
-		CAID:           ca.ID,
-		Requester:      "test",
-		CertType:       storage.SSHCertTypeHost,
-		PublicKeyInput: generateTestClientKey(t),
-		KeyID:          "web1",
-		Principals:     []string{"web1"},
-		TTLSeconds:     3600,
+		CAID:            ca.ID,
+		Requester:       "test",
+		CertType:        storage.SSHCertTypeHost,
+		PublicKeyInput:  generateTestClientKey(t),
+		KeyID:           "web1",
+		Principals:      []string{"web1"},
+		TTLSeconds:      3600,
 		CriticalOptions: map[string]string{"force-command": "/bin/true"},
 	})
 	if err != nil {
@@ -332,4 +335,125 @@ func generateTestClientKey(t *testing.T) string {
 		t.Fatalf("wrap test client signer: %v", err)
 	}
 	return string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+}
+
+// sshPolicyStore returns a fakeStore with a provisioner(+CA policy) attached,
+// and the policy-evaluating engine wiring the same as main.go.
+func engineWithSSHPolicy(t *testing.T, body policy.SSHPolicyBody) (*Engine, *fakeStore, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	store := newFakeStore()
+	ks, err := mintcrypto.NewKeystore(make([]byte, 32))
+	if err != nil {
+		t.Fatalf("keystore: %v", err)
+	}
+	polEngine := policy.NewEngine(store)
+	engine := NewEngine(store, ks, polEngine)
+
+	ca, err := engine.CreateCA(context.Background(), CreateCARequest{Name: "policy-ca", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+	bodyRaw, _ := json.Marshal(body)
+	pol := &storage.Policy{ID: uuid.New(), Name: "ssh-policy", SSHPolicy: bodyRaw}
+	store.policies[pol.ID] = pol
+	provID := uuid.New()
+	store.provisioners[provID] = &storage.Provisioner{
+		ID: provID, Name: "ssh-prov", Status: storage.ProvisionerStatusActive, PolicyID: &pol.ID,
+	}
+	return engine, store, ca.ID, provID
+}
+
+func TestIssueCert_SSHPolicyFiltersPrincipalsAndTTL(t *testing.T) {
+	ctx := context.Background()
+	engine, _, caID, provID := engineWithSSHPolicy(t, policy.SSHPolicyBody{
+		PrincipalAllowlist: []string{"ops-*"},
+		MaxTTLSeconds:      3600,
+	})
+	key := generateTestClientKey(t)
+
+	// Requested principal outside allowlist -> must be denied.
+	if _, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID: caID, ProvisionerID: provID, CertType: storage.SSHCertTypeUser,
+		PublicKeyInput: key, KeyID: "x", Principals: []string{"alice"}, TTLSeconds: 7200,
+	}); err == nil {
+		t.Fatal("expected denial for principal not in allowlist")
+	}
+
+	// Allowed principal, but TTL over max -> clamped to 3600.
+	issued, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID: caID, ProvisionerID: provID, CertType: storage.SSHCertTypeUser,
+		PublicKeyInput: key, KeyID: "x", Principals: []string{"ops-bot"}, TTLSeconds: 7200,
+	})
+	if err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	certPub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(issued.CertData))
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	cert := certPub.(*ssh.Certificate)
+	if len(cert.ValidPrincipals) != 1 || cert.ValidPrincipals[0] != "ops-bot" {
+		t.Errorf("principals = %v, want [ops-bot]", cert.ValidPrincipals)
+	}
+	validBefore := int64(cert.ValidBefore)
+	validAfter := int64(cert.ValidAfter)
+	// TTL plus the fixed 60s clock-skew buffer.
+	if got := validBefore - validAfter; got != 3600+60 {
+		t.Errorf("duration = %d, want %d", got, 3600+60)
+	}
+}
+
+func TestIssueCert_SSHPolicyFiltersCriticalOptions(t *testing.T) {
+	ctx := context.Background()
+	engine, _, caID, provID := engineWithSSHPolicy(t, policy.SSHPolicyBody{
+		CriticalOptionAllowlist: []string{"force-command"},
+	})
+	key := generateTestClientKey(t)
+
+	// Disallowed critical option -> denied.
+	if _, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID: caID, ProvisionerID: provID, CertType: storage.SSHCertTypeUser,
+		PublicKeyInput: key, KeyID: "x", Principals: []string{"u"},
+		CriticalOptions: map[string]string{"source-address": "10.0.0.0/8"},
+	}); err == nil {
+		t.Fatal("expected denial for critical option outside allowlist")
+	}
+
+	issued, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID: caID, ProvisionerID: provID, CertType: storage.SSHCertTypeUser,
+		PublicKeyInput: key, KeyID: "x", Principals: []string{"u"},
+		CriticalOptions: map[string]string{"force-command": "/bin/true"},
+	})
+	if err != nil {
+		t.Fatalf("IssueCert: %v", err)
+	}
+	cert := parseIssuedCert(t, issued.CertData)
+	if cert.Permissions.CriticalOptions["force-command"] != "/bin/true" {
+		t.Errorf("critical option missing/incorrect: %v", cert.Permissions.CriticalOptions)
+	}
+}
+
+func TestIssueCert_NoPolicyUnrestricted(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+	ca, err := engine.CreateCA(ctx, CreateCARequest{Name: "nopol", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+	// No provisioner + no policy engine reference: must issue normally.
+	if _, err := engine.IssueCert(ctx, IssueCertRequest{
+		CAID: ca.ID, CertType: storage.SSHCertTypeUser,
+		PublicKeyInput: generateTestClientKey(t), KeyID: "u", Principals: []string{"u"},
+	}); err != nil {
+		t.Fatalf("IssueCert without policy should succeed: %v", err)
+	}
+}
+
+func parseIssuedCert(t *testing.T, certData string) *ssh.Certificate {
+	t.Helper()
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(certData))
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	return pub.(*ssh.Certificate)
 }

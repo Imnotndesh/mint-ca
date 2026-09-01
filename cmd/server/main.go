@@ -69,10 +69,10 @@ func main() {
 	}
 
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
-	sshcaEngine := sshca.NewEngine(store, ks)
+	policyEngine := policy.NewEngine(store)
+	sshcaEngine := sshca.NewEngine(store, ks, policyEngine)
 	crlManager := revocation.NewCRLManager(store, ks, cfg.ACME.BaseURL, cfg.CRL.DeltaEnabled)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
-	policyEngine := policy.NewEngine(store)
 	sshKRLManager := krl.NewManager(store)
 	slog.Info("core services initialised")
 

@@ -15,15 +15,19 @@ import (
 // sshca Engine touches. Everything else panics loudly so a missing case
 // fails fast instead of silently returning zero values.
 type fakeStore struct {
-	mu    sync.Mutex
-	cas   map[uuid.UUID]*storage.SSHCertificateAuthority
-	certs map[uuid.UUID]*storage.SSHCertificate
+	mu           sync.Mutex
+	cas          map[uuid.UUID]*storage.SSHCertificateAuthority
+	certs        map[uuid.UUID]*storage.SSHCertificate
+	provisioners map[uuid.UUID]*storage.Provisioner
+	policies     map[uuid.UUID]*storage.Policy
 }
 
 func newFakeStore() *fakeStore {
 	return &fakeStore{
-		cas:   make(map[uuid.UUID]*storage.SSHCertificateAuthority),
-		certs: make(map[uuid.UUID]*storage.SSHCertificate),
+		cas:          make(map[uuid.UUID]*storage.SSHCertificateAuthority),
+		certs:        make(map[uuid.UUID]*storage.SSHCertificate),
+		provisioners: make(map[uuid.UUID]*storage.Provisioner),
+		policies:     make(map[uuid.UUID]*storage.Policy),
 	}
 }
 
@@ -187,8 +191,9 @@ func (f *fakeStore) CreateProvisioner(ctx context.Context, p *storage.Provisione
 	return nil
 }
 func (f *fakeStore) GetProvisioner(ctx context.Context, id uuid.UUID) (*storage.Provisioner, error) {
-	notImplemented("GetProvisioner")
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.provisioners[id], nil
 }
 func (f *fakeStore) ListProvisionersByCA(ctx context.Context, caID uuid.UUID) ([]*storage.Provisioner, error) {
 	notImplemented("ListProvisionersByCA")
@@ -203,8 +208,9 @@ func (f *fakeStore) CreatePolicy(ctx context.Context, p *storage.Policy) error {
 	return nil
 }
 func (f *fakeStore) GetPolicy(ctx context.Context, id uuid.UUID) (*storage.Policy, error) {
-	notImplemented("GetPolicy")
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.policies[id], nil
 }
 func (f *fakeStore) ListPolicies(ctx context.Context) ([]*storage.Policy, error) {
 	notImplemented("ListPolicies")
