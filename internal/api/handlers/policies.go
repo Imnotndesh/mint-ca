@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -25,6 +26,7 @@ func (h *PolicyHandler) RegisterRoutes(r chi.Router) {
 		r.Delete("/{policyID}", h.delete)
 	})
 }
+
 type policyRequest struct {
 	Name           string              `json:"name"`
 	Scope          storage.PolicyScope `json:"scope"`
@@ -37,7 +39,8 @@ type policyRequest struct {
 	KeyAlgos       []string            `json:"key_algos"`
 	PolicyOIDs     []string            `json:"policy_oids"`
 	CPSURI         string              `json:"cps_uri"`
-} 
+	SSHPolicy      json.RawMessage     `json:"ssh_policy"`
+}
 
 func (h *PolicyHandler) create(w http.ResponseWriter, r *http.Request) {
 	var req policyRequest
@@ -59,6 +62,9 @@ func (h *PolicyHandler) create(w http.ResponseWriter, r *http.Request) {
 		PolicyOIDs:     req.PolicyOIDs,
 		CPSURI:         req.CPSURI,
 		CreatedAt:      time.Now().UTC(),
+	}
+	if len(req.SSHPolicy) > 0 {
+		pol.SSHPolicy = append([]byte(nil), req.SSHPolicy...)
 	}
 	if err := h.store.CreatePolicy(r.Context(), pol); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -114,6 +120,9 @@ func (h *PolicyHandler) update(w http.ResponseWriter, r *http.Request) {
 		KeyAlgos:       req.KeyAlgos,
 		PolicyOIDs:     req.PolicyOIDs,
 		CPSURI:         req.CPSURI,
+	}
+	if len(req.SSHPolicy) > 0 {
+		pol.SSHPolicy = append([]byte(nil), req.SSHPolicy...)
 	}
 	if err := h.store.UpdatePolicy(r.Context(), pol); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

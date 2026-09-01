@@ -33,6 +33,7 @@ const (
 	// CRL/OCSP status of a superseded CA's issued certificates is unchanged.
 	CAStatusSuperseded CAStatus = "superseded"
 )
+
 // SSHKRLCache holds the most recently generated KRL for each SSH CA.
 type SSHKRLCache struct {
 	ID         uuid.UUID `json:"id"`
@@ -137,7 +138,7 @@ type SANs struct {
 
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.
 type CertificateAuthority struct {
-	ID              uuid.UUID        `json:"id"`
+	ID uuid.UUID `json:"id"`
 	// LogicalCAID is the stable identity a CA row belongs to. Re-key creates a
 	// new row with a new physical ID but the SAME LogicalCAID, so provisioners
 	// can keep pointing at one logical CA across rotations. Fresh CAs get their
@@ -167,20 +168,21 @@ type SSHCertificateAuthority struct {
 	Status    CAStatus   `json:"status"`
 	CreatedAt time.Time  `json:"created_at"`
 }
+
 // CrossCert is a cross-signed certificate: a certificate issued for an
 // existing CA's public key and subject, signed by a DIFFERENT CA (the
 // signer). Used to build trust bridges during root/intermediate transitions
 // (e.g. an old root cross-signs a new root). It shares the target's keypair
 // and identity but carries a different issuer/chain.
 type CrossCert struct {
-	ID            uuid.UUID  `json:"id"`
-	TargetCAID    uuid.UUID  `json:"target_ca_id"`
-	SigningCAID   uuid.UUID  `json:"signing_ca_id"`
-	CertPEM       string     `json:"cert_pem"`
-	NotBefore     time.Time  `json:"not_before"`
-	NotAfter      time.Time  `json:"not_after"`
-	Serial        string     `json:"serial"`
-	CreatedAt     time.Time  `json:"created_at"`
+	ID          uuid.UUID `json:"id"`
+	TargetCAID  uuid.UUID `json:"target_ca_id"`
+	SigningCAID uuid.UUID `json:"signing_ca_id"`
+	CertPEM     string    `json:"cert_pem"`
+	NotBefore   time.Time `json:"not_before"`
+	NotAfter    time.Time `json:"not_after"`
+	Serial      string    `json:"serial"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 // CRLCache holds the most recently generated base CRL PEM for each CA.
@@ -203,6 +205,7 @@ type DeltaCRLCache struct {
 	ThisUpdate    time.Time `json:"this_update"`
 	NextUpdate    time.Time `json:"next_update"`
 }
+
 // SSHCertificate is an issued SSH user or host certificate.
 type SSHCertificate struct {
 	ID            uuid.UUID     `json:"id"`
@@ -277,26 +280,26 @@ type Certificate struct {
 // provisioner (Provisioner.ProfileID) or requested per issuance. An empty
 // profile imposes no constraints.
 type Profile struct {
-	ID              uuid.UUID `json:"id"`
-	Name            string    `json:"name"`
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
 
 	// AllowedKeyAlgos restricts the leaf key algorithm (e.g. "ecdsa-p256",
 	// "rsa-2048", "ed25519"). Empty means any.
-	AllowedKeyAlgos []string  `json:"allowed_key_algos,omitempty"`
+	AllowedKeyAlgos []string `json:"allowed_key_algos,omitempty"`
 
 	// MinTTLSeconds / MaxTTLSeconds bound the certificate lifetime. 0 means
 	// "no constraint" on that side.
-	MinTTLSeconds   int64     `json:"min_ttl_seconds"`
-	MaxTTLSeconds   int64     `json:"max_ttl_seconds"`
+	MinTTLSeconds int64 `json:"min_ttl_seconds"`
+	MaxTTLSeconds int64 `json:"max_ttl_seconds"`
 
 	// RequireSAN forces every issued certificate to carry at least one SAN.
-	RequireSAN      bool      `json:"require_san"`
+	RequireSAN bool `json:"require_san"`
 
 	// AllowWildcard permits wildcard DNS SANs (e.g. "*.example.com").
 	// Default false = wildcard SANs rejected.
-	AllowWildcard   bool      `json:"allow_wildcard"`
+	AllowWildcard bool `json:"allow_wildcard"`
 
-	CreatedAt       time.Time `json:"created_at"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 type Provisioner struct {
@@ -325,7 +328,10 @@ type Policy struct {
 	KeyAlgos       []string    `json:"key_algos"`
 	PolicyOIDs     []string    `json:"policy_oids,omitempty"` // dotted-decimal OID strings
 	CPSURI         string      `json:"cps_uri,omitempty"`
-	CreatedAt      time.Time   `json:"created_at"`
+	// SSHPolicy holds the SSH CA issuance constraints as an SSHPolicyBody JSON.
+	// Non-nil when the policy applies to SSH issuance; nil when X.509-only.
+	SSHPolicy []byte    `json:"ssh_policy,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 }
 type NameConstraints struct {
 	PermittedDNSDomains   []string `json:"permitted_dns_domains,omitempty"`
@@ -393,8 +399,6 @@ type AuditLog struct {
 	IPAddress string     `json:"ip_address"`
 	CreatedAt time.Time  `json:"created_at"`
 }
-
-
 
 // APIKey is a bearer token used to authenticate calls to the management API.
 type APIKey struct {
@@ -671,7 +675,7 @@ type Store interface {
 
 	// GetSSHKRL returns the cached KRL for an SSH CA, or (nil, nil).
 	GetSSHKRL(ctx context.Context, caID uuid.UUID) (*SSHKRLCache, error)
-		// NextCRLNumber atomically returns the next monotonic CRL Number for
+	// NextCRLNumber atomically returns the next monotonic CRL Number for
 	// caID, shared across base and delta CRLs so the sequence is global
 	// per-CA as RFC 5280 §5.2.4 requires.
 	NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error)
