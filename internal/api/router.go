@@ -68,6 +68,7 @@ func BuildRouter(
 		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
+		handlers.NewProfileHandler(store).RegisterRoutes(r)
 		handlers.NewEABHandler(store).RegisterRoutes(r)
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)

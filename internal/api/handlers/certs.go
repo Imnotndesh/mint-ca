@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"context"
+	"errors"
 	"net"
 	"net/http"
 
@@ -21,6 +23,16 @@ type CertHandler struct {
 
 func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store) *CertHandler {
 	return &CertHandler{engine: engine, policy: policyEngine, store: store}
+}
+
+// loadProfileByName resolves a named profile via the store, or (nil,nil) when
+// the store does not support profiles at all.
+func (h *CertHandler) loadProfileByName(ctx context.Context, name string) (*storage.Profile, error) {
+	s, ok := h.store.(profileStore)
+	if !ok {
+		return nil, errors.New("store does not support profiles")
+	}
+	return s.GetProfileByName(ctx, name)
 }
 
 func (h *CertHandler) RegisterRoutes(r chi.Router) {
@@ -53,6 +65,9 @@ type issueCertRequest struct {
 	// endpoints. Off by default: the key is returned once and never stored.
 	StoreKey    bool   `json:"store_key"`
 	KeyPasscode string `json:"key_passcode"`
+	// Profile optionally names a certificate profile to enforce against this
+	// issuance. Resolved by name and evaluated with policy.EvaluateProfile.
+	Profile string `json:"profile"`
 }
 
 func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
@@ -86,6 +101,29 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 	algo := req.KeyAlgo
 	if algo == "" {
 		algo = string(ca.DefaultKeyAlgo)
+	}
+
+	// Enforce a named profile (if requested) before any crypto work.
+	if req.Profile != "" {
+		prof, err := h.loadProfileByName(r.Context(), req.Profile)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if prof == nil {
+			writeError(w, http.StatusBadRequest, "unknown profile \""+req.Profile+"\"")
+			return
+		}
+		if err := policy.EvaluateProfile(prof, policy.CertRequest{
+			KeyAlgo:    algo,
+			TTLSeconds: req.TTLSeconds,
+			SANsDNS:    req.SANsDNS,
+			SANsIP:     ips,
+			SANsEmail:  req.SANsEmail,
+		}); err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 	}
 
 	// Policy evaluation before any crypto work. The matched policy (if any)

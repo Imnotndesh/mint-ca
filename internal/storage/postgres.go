@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -152,6 +153,17 @@ CREATE TABLE IF NOT EXISTS policies (
 	cps_uri         TEXT        NOT NULL DEFAULT '',
 	ssh_policy      TEXT        NOT NULL DEFAULT '',
 	created_at      TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS profiles (
+	id                TEXT        NOT NULL PRIMARY KEY,
+	name              TEXT        NOT NULL UNIQUE,
+	allowed_key_algos TEXT        NOT NULL DEFAULT '[]',
+	min_ttl_seconds   BIGINT      NOT NULL DEFAULT 0,
+	max_ttl_seconds   BIGINT      NOT NULL DEFAULT 0,
+	require_san       BOOLEAN     NOT NULL DEFAULT FALSE,
+	allow_wildcard    BOOLEAN     NOT NULL DEFAULT FALSE,
+	created_at        TIMESTAMPTZ NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS acme_authorizations (
@@ -1024,6 +1036,104 @@ func (s *postgresStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("postgres: DeletePolicy: %w", err)
 	}
 	return nil
+}
+
+// ---- certificate profiles ----
+
+func pgWriteProfileArgs(p *Profile) ([]interface{}, []string) {
+	aka, _ := pgMarshalStringSlice(p.AllowedKeyAlgos)
+	return []interface{}{
+			p.ID.String(), p.Name, aka, p.MinTTLSeconds, p.MaxTTLSeconds,
+			p.RequireSAN, p.AllowWildcard, p.CreatedAt.UTC(),
+		}, []string{"id", "name", "allowed_key_algos", "min_ttl_seconds",
+			"max_ttl_seconds", "require_san", "allow_wildcard", "created_at"}
+}
+
+func (s *postgresStore) CreateProfile(ctx context.Context, p *Profile) error {
+	args, cols := pgWriteProfileArgs(p)
+	ph := ""
+	for i := range cols {
+		if i > 0 {
+			ph += ","
+		}
+		ph += fmt.Sprintf("$%d", i+1)
+	}
+	_, err := s.db.ExecContext(ctx, "INSERT INTO profiles ("+strings.Join(cols, ",")+") VALUES ("+ph+")", args...)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateProfile: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetProfile(ctx context.Context, id uuid.UUID) (*Profile, error) {
+	return pgGetProfile(ctx, s.db, pgProfileSelectSQL+" WHERE id = $1", id.String())
+}
+
+func (s *postgresStore) GetProfileByName(ctx context.Context, name string) (*Profile, error) {
+	return pgGetProfile(ctx, s.db, pgProfileSelectSQL+" WHERE name = $1", name)
+}
+
+func (s *postgresStore) ListProfiles(ctx context.Context) ([]*Profile, error) {
+	rows, err := s.db.QueryContext(ctx, pgProfileSelectSQL+" ORDER BY name ASC")
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListProfiles: %w", err)
+	}
+	defer rows.Close()
+	var out []*Profile
+	for rows.Next() {
+		p, err := pgScanProfile(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateProfile(ctx context.Context, p *Profile) error {
+	aka, _ := pgMarshalStringSlice(p.AllowedKeyAlgos)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE profiles SET
+			name = $2, allowed_key_algos = $3, min_ttl_seconds = $4,
+			max_ttl_seconds = $5, require_san = $6, allow_wildcard = $7
+		WHERE id = $1`, p.ID.String(), p.Name, aka,
+		p.MinTTLSeconds, p.MaxTTLSeconds, p.RequireSAN, p.AllowWildcard)
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateProfile: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) DeleteProfile(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM profiles WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: DeleteProfile: %w", err)
+	}
+	return nil
+}
+
+const pgProfileSelectSQL = `
+	SELECT id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
+	       require_san, allow_wildcard, created_at
+	FROM profiles`
+
+func pgGetProfile(ctx context.Context, db *sql.DB, query string, arg interface{}) (*Profile, error) {
+	return pgScanProfile(func(dest ...interface{}) error { return db.QueryRowContext(ctx, query, arg).Scan(dest...) })
+}
+
+func pgScanProfile(scan func(...interface{}) error) (*Profile, error) {
+	var p Profile
+	var idStr, akaStr string
+	err := scan(&idStr, &p.Name, &akaStr, &p.MinTTLSeconds, &p.MaxTTLSeconds, &p.RequireSAN, &p.AllowWildcard, &p.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	p.ID = uuid.MustParse(idStr)
+	p.AllowedKeyAlgos, _ = pgUnmarshalStringSlice(akaStr)
+	return &p, nil
 }
 
 func (s *postgresStore) CreateACMEAccount(ctx context.Context, a *ACMEAccount) error {
