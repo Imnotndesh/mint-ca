@@ -14,6 +14,7 @@ import (
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/config"
+	"mint-ca/internal/setup"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -369,6 +370,7 @@ func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 		"meta": map[string]interface{}{
 			"externalAccountRequired": cfg.EABRequired,
 			"website":                 h.cfg.BaseURL,
+			"termsOfService":          setup.TermsURL(h.cfg.BaseURL),
 		},
 	})
 }
