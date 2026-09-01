@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS policies (
 	key_algos       TEXT    NOT NULL DEFAULT '[]',
 	policy_oids     TEXT    NOT NULL DEFAULT '[]',
 	cps_uri         TEXT    NOT NULL DEFAULT '',
+	ssh_policy      TEXT    NOT NULL DEFAULT '',
 	created_at      DATETIME NOT NULL
 );
 
@@ -1072,10 +1073,10 @@ func (s *sqliteStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO policies
 			(id, name, scope, max_ttl_seconds, allowed_domains, denied_domains,
-			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID.String(), p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI, p.CreatedAt.UTC(),
+		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreatePolicy: %w", err)
@@ -1125,10 +1126,10 @@ func (s *sqliteStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 			name = ?, scope = ?, max_ttl_seconds = ?,
 			allowed_domains = ?, denied_domains = ?,
 			allowed_ips = ?, allowed_sans = ?,
-			require_san = ?, key_algos = ?, policy_oids = ?, cps_uri = ?
+			require_san = ?, key_algos = ?, policy_oids = ?, cps_uri = ?, ssh_policy = ?
 		WHERE id = ?`,
 		p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI,
+		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI, string(p.SSHPolicy),
 		p.ID.String(),
 	)
 	if err != nil {
@@ -1143,16 +1144,16 @@ func (s *sqliteStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 const policySelectSQL = `
 	SELECT id, name, scope, max_ttl_seconds,
 	       allowed_domains, denied_domains, allowed_ips, allowed_sans,
-	       require_san, key_algos, policy_oids, cps_uri, created_at
+	       require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at
 	FROM policies`
 
 func scanPolicy(row *sql.Row) (*Policy, error) {
 	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
+	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
 	var requireSAN int
 	err := row.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1168,16 +1169,19 @@ func scanPolicy(row *sql.Row) (*Policy, error) {
 	p.AllowedSANs, _ = unmarshalStringSlice(asStr)
 	p.KeyAlgos, _ = unmarshalStringSlice(kaStr)
 	p.PolicyOIDs, _ = unmarshalStringSlice(poStr)
+	if sshStr != "" {
+		p.SSHPolicy = []byte(sshStr)
+	}
 	return &p, nil
 }
 
 func scanPolicyRows(rows *sql.Rows) (*Policy, error) {
 	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
+	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
 	var requireSAN int
 	if err := rows.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
 	); err != nil {
 		return nil, err
 	}
@@ -1189,6 +1193,9 @@ func scanPolicyRows(rows *sql.Rows) (*Policy, error) {
 	p.AllowedSANs, _ = unmarshalStringSlice(asStr)
 	p.KeyAlgos, _ = unmarshalStringSlice(kaStr)
 	p.PolicyOIDs, _ = unmarshalStringSlice(poStr)
+	if sshStr != "" {
+		p.SSHPolicy = []byte(sshStr)
+	}
 	return &p, nil
 }
 
@@ -2256,6 +2263,7 @@ func (s *sqliteStore) MarkKeyIDRetired(ctx context.Context, keyID string) error 
 	}
 	return nil
 }
+
 // ListRevokedSSHCertificatesByCA returns only revoked SSH certs for caID.
 func (s *sqliteStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error) {
 	rows, err := s.db.QueryContext(ctx,

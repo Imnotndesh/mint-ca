@@ -1,8 +1,14 @@
 package policy
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
+
+	"mint-ca/internal/storage"
+
+	"github.com/google/uuid"
 )
 
 // TestEvaluateSSH_UnconstrainedPermitsEverything with an empty body applies
@@ -223,5 +229,73 @@ func TestSortPrincipals(t *testing.T) {
 	}
 	if strings.Join(in, ",") != "bob,alice" {
 		t.Errorf("SortPrincipals mutated input: %v", in)
+	}
+}
+
+func TestEngineEvaluateSSH_NoPolicyUnrestricted(t *testing.T) {
+	ctx := context.Background()
+	store := newPolicyFakeStore()
+	prov := &storage.Provisioner{ID: uuid.New(), Name: "p", Status: storage.ProvisionerStatusActive}
+	store.provisioners[prov.ID] = prov
+
+	d, err := NewEngine(store).EvaluateSSH(ctx, prov.ID, SSHCertRequest{Principals: []string{"u"}})
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if d != nil {
+		t.Errorf("expected nil decision with no policy, got %+v", d)
+	}
+}
+
+func TestEngineEvaluateSSH_AppliesProvisionerPolicy(t *testing.T) {
+	ctx := context.Background()
+	store := newPolicyFakeStore()
+	body, _ := json.Marshal(SSHPolicyBody{
+		PrincipalAllowlist: []string{"dev-*"},
+		MaxTTLSeconds:      3600,
+	})
+	pol := &storage.Policy{ID: uuid.New(), Name: "ssh", SSHPolicy: body}
+	store.policies[pol.ID] = pol
+	prov := &storage.Provisioner{ID: uuid.New(), Name: "p", Status: storage.ProvisionerStatusActive, PolicyID: &pol.ID}
+	store.provisioners[prov.ID] = prov
+	engine := NewEngine(store)
+
+	// Allowed principal + TTL within max => decision returned.
+	d, err := engine.EvaluateSSH(ctx, prov.ID, SSHCertRequest{Principals: []string{"dev-cicd"}, TTLSeconds: 60})
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if d == nil {
+		t.Fatal("expected a decision when SSH policy applies")
+	}
+	if d.TTLSeconds != 60 {
+		t.Errorf("decision TTL = %d, want 60", d.TTLSeconds)
+	}
+
+	// Denied principal => error.
+	if _, err := engine.EvaluateSSH(ctx, prov.ID, SSHCertRequest{Principals: []string{"root"}}); err == nil {
+		t.Error("expected denial for principal not in allowlist")
+	}
+}
+
+func TestEngineEvaluateSSH_DisabledProvisionerDenied(t *testing.T) {
+	ctx := context.Background()
+	store := newPolicyFakeStore()
+	prov := &storage.Provisioner{ID: uuid.New(), Name: "p", Status: storage.ProvisionerStatusDisabled}
+	store.provisioners[prov.ID] = prov
+	if _, err := NewEngine(store).EvaluateSSH(ctx, prov.ID, SSHCertRequest{Principals: []string{"u"}}); err == nil {
+		t.Error("expected denial for disabled provisioner")
+	}
+}
+
+func TestEngineEvaluateSSH_BadBodyJSON(t *testing.T) {
+	ctx := context.Background()
+	store := newPolicyFakeStore()
+	pol := &storage.Policy{ID: uuid.New(), Name: "ssh", SSHPolicy: []byte("not json")}
+	store.policies[pol.ID] = pol
+	prov := &storage.Provisioner{ID: uuid.New(), Name: "p", Status: storage.ProvisionerStatusActive, PolicyID: &pol.ID}
+	store.provisioners[prov.ID] = prov
+	if _, err := NewEngine(store).EvaluateSSH(ctx, prov.ID, SSHCertRequest{Principals: []string{"u"}}); err == nil {
+		t.Error("expected error for malformed SSH policy JSON")
 	}
 }

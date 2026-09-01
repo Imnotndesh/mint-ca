@@ -16,6 +16,7 @@ import (
 type postgresStore struct {
 	db *sql.DB
 }
+
 const postgresDeltaCRLSchema = `
 CREATE TABLE IF NOT EXISTS crl_delta_cache (
 	id              TEXT        NOT NULL PRIMARY KEY,
@@ -149,6 +150,7 @@ CREATE TABLE IF NOT EXISTS policies (
 	key_algos       TEXT        NOT NULL DEFAULT '[]',
 	policy_oids     TEXT        NOT NULL DEFAULT '[]',
 	cps_uri         TEXT        NOT NULL DEFAULT '',
+	ssh_policy      TEXT        NOT NULL DEFAULT '',
 	created_at      TIMESTAMPTZ NOT NULL
 );
 
@@ -898,10 +900,10 @@ func (s *postgresStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO policies
 			(id, name, scope, max_ttl_seconds, allowed_domains, denied_domains,
-			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		p.ID.String(), p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, p.CreatedAt.UTC(),
+		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreatePolicy: %w", err)
@@ -918,10 +920,10 @@ func (s *postgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 	var out []*Policy
 	for rows.Next() {
 		var p Policy
-		var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
+		var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
 		if err := rows.Scan(
 			&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-			&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
+			&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -932,6 +934,9 @@ func (s *postgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 		p.AllowedSANs, _ = pgUnmarshalStringSlice(asStr)
 		p.KeyAlgos, _ = pgUnmarshalStringSlice(kaStr)
 		p.PolicyOIDs, _ = pgUnmarshalStringSlice(poStr)
+		if sshStr != "" {
+			p.SSHPolicy = []byte(sshStr)
+		}
 		out = append(out, &p)
 	}
 	return out, rows.Err()
@@ -957,10 +962,10 @@ func (s *postgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 			name = $1, scope = $2, max_ttl_seconds = $3,
 			allowed_domains = $4, denied_domains = $5,
 			allowed_ips = $6, allowed_sans = $7,
-			require_san = $8, key_algos = $9, policy_oids = $10, cps_uri = $11
-		WHERE id = $12`,
+			require_san = $8, key_algos = $9, policy_oids = $10, cps_uri = $11, ssh_policy = $12
+		WHERE id = $13`,
 		p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, p.ID.String(),
+		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), p.ID.String(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: UpdatePolicy: %w", err)
@@ -971,15 +976,15 @@ func (s *postgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 const pgPolicySelectSQL = `
 	SELECT id, name, scope, max_ttl_seconds,
 	       allowed_domains, denied_domains, allowed_ips, allowed_sans,
-	       require_san, key_algos, policy_oids, cps_uri, created_at
+	       require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at
 	FROM policies`
 
 func pgScanPolicy(row *sql.Row) (*Policy, error) {
 	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr string
+	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
 	err := row.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -994,6 +999,9 @@ func pgScanPolicy(row *sql.Row) (*Policy, error) {
 	p.AllowedSANs, _ = pgUnmarshalStringSlice(asStr)
 	p.KeyAlgos, _ = pgUnmarshalStringSlice(kaStr)
 	p.PolicyOIDs, _ = pgUnmarshalStringSlice(poStr)
+	if sshStr != "" {
+		p.SSHPolicy = []byte(sshStr)
+	}
 	return &p, nil
 }
 
