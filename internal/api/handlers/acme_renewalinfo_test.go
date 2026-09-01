@@ -10,6 +10,7 @@ import (
 
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/config"
+	"mint-ca/internal/setup"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -125,5 +126,16 @@ func TestHandler_Directory_AdvertisesRenewalInfo(t *testing.T) {
 	got, ok := body["renewalInfo"].(string)
 	if !ok || got != want {
 		t.Errorf("renewalInfo: got %v want %q", body["renewalInfo"], want)
+	}
+
+	// The directory must advertise the Terms of Service URL in meta so ACME
+	// clients can present it during account creation (RFC 8555 §7.1.1).
+	meta, ok := body["meta"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("directory missing meta object: %v", body["meta"])
+	}
+	tos, ok := meta["termsOfService"].(string)
+	if !ok || tos != "https://ca.test"+setup.TermsPath {
+		t.Errorf("meta.termsOfService: got %v want %q", meta["termsOfService"], "https://ca.test"+setup.TermsPath)
 	}
 }

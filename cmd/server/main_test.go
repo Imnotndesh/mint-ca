@@ -215,7 +215,9 @@ func runLiveStack(m *testing.M) (int, error) {
 		CAID   string `json:"ca_id"`
 	}
 	if err := postJSON(setupSrv.URL+"/setup/api-key", bk.Raw, map[string]interface{}{
-		"name": "test-admin", "scopes": []string{"*"},
+		"name":           "test-admin",
+		"scopes":         []string{"*"},
+		"terms_accepted": true,
 	}, &apiKeyResp); err != nil {
 		return 1, fmt.Errorf("setup api-key: %w", err)
 	}
