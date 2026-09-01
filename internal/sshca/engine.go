@@ -200,14 +200,16 @@ func (e *Engine) CreateCA(ctx context.Context, req CreateCARequest) (*storage.SS
 	}
 
 	record := &storage.SSHCertificateAuthority{
-		ID:        uuid.New(),
-		Name:      req.Name,
-		KeyAlgo:   req.KeyAlgo.storageAlgo(),
-		PublicKey: strings.TrimSpace(string(authorizedKey)),
-		KeyEnc:    encKey,
-		Status:    storage.CAStatusActive,
-		CreatedAt: time.Now().UTC(),
+		ID:          uuid.New(),
+		Name:        req.Name,
+		KeyAlgo:     req.KeyAlgo.storageAlgo(),
+		PublicKey:   strings.TrimSpace(string(authorizedKey)),
+		KeyEnc:      encKey,
+		Status:      storage.CAStatusActive,
+		LogicalCAID: nil,
+		CreatedAt:   time.Now().UTC(),
 	}
+	record.LogicalCAID = &record.ID
 
 	if err := e.store.CreateSSHCA(ctx, record); err != nil {
 		return nil, fmt.Errorf("sshca: CreateCA: store: %w", err)

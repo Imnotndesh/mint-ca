@@ -457,3 +457,105 @@ func parseIssuedCert(t *testing.T, certData string) *ssh.Certificate {
 	}
 	return pub.(*ssh.Certificate)
 }
+
+func TestCreateCA_SetsLogicalSelf(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+	ca, err := engine.CreateCA(ctx, CreateCARequest{Name: "logical", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+	if ca.LogicalCAID == nil || *ca.LogicalCAID != ca.ID {
+		t.Fatalf("expected LogicalCAID==own ID, got %v", ca.LogicalCAID)
+	}
+}
+
+func TestRekeyCA_NewActiveRowSameLogicalId(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+	old, err := engine.CreateCA(ctx, CreateCARequest{Name: "rekey", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+	logicalID := *old.LogicalCAID
+
+	rekeyed, err := engine.RekeyCA(ctx, RekeyCARequest{CAID: old.ID})
+	if err != nil {
+		t.Fatalf("RekeyCA: %v", err)
+	}
+	if rekeyed.ID == old.ID {
+		t.Fatal("rekeyed CA must have a new physical ID")
+	}
+	if rekeyed.LogicalCAID == nil || *rekeyed.LogicalCAID != logicalID {
+		t.Fatalf("rekeyed root must retain logical id %v, got %v", logicalID, rekeyed.LogicalCAID)
+	}
+	if rekeyed.ParentID == nil || *rekeyed.ParentID != old.ID {
+		t.Fatalf("rekeyed root must record parent %v, got %v", old.ID, rekeyed.ParentID)
+	}
+	if rekeyed.PublicKey == old.PublicKey {
+		t.Error("rekey must rotate the public key")
+	}
+
+	// Old row superseded, new row active, resolve returns the new row.
+	stale, _ := engine.store.GetSSHCA(ctx, old.ID)
+	if stale.Status != storage.CAStatusSuperseded {
+		t.Errorf("old row status = %v, want superseded", stale.Status)
+	}
+	active, err := engine.ResolveActiveCA(ctx, logicalID)
+	if err != nil {
+		t.Fatalf("ResolveActiveCA: %v", err)
+	}
+	if active.ID != rekeyed.ID {
+		t.Errorf("ResolveActiveCA returned %s, want rekeyed %s", active.ID, rekeyed.ID)
+	}
+}
+
+func TestCrossSignCA_SharingKeyBothActive(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+	base, err := engine.CreateCA(ctx, CreateCARequest{Name: "xsign", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+	logicalID := *base.LogicalCAID
+
+	signed, err := engine.CrossSignCA(ctx, CrossSignCARequest{TargetCAID: base.ID})
+	if err != nil {
+		t.Fatalf("CrossSignCA: %v", err)
+	}
+	if signed.ID == base.ID {
+		t.Fatal("cross-signed CA must have a distinct physical ID")
+	}
+	if signed.PublicKey != base.PublicKey {
+		t.Error("cross-sign must share the target public key")
+	}
+	if signed.LogicalCAID == nil || *signed.LogicalCAID != logicalID {
+		t.Fatalf("cross-signed CA lazy logical id mismatch")
+	}
+	// Both remain active.
+	stale, _ := engine.store.GetSSHCA(ctx, base.ID)
+	if stale.Status != storage.CAStatusActive {
+		t.Errorf("target must stay active after cross-sign, got %v", stale.Status)
+	}
+	if signed.Status != storage.CAStatusActive {
+		t.Errorf("cross-signed CA must be active, got %v", signed.Status)
+	}
+}
+
+func TestResolveActiveCA_LegacyRowIsOwnRoot(t *testing.T) {
+	ctx := context.Background()
+	store := newFakeStore()
+	ks, _ := mintcrypto.NewKeystore(make([]byte, 32))
+	engine := NewEngine(store, ks, nil)
+	// Simulate a pre-existing row with no LogicalCAID.
+	legacy := &storage.SSHCertificateAuthority{ID: uuid.New(), Name: "legacy", Status: storage.CAStatusActive}
+	store.cas[legacy.ID] = legacy
+
+	active, err := engine.ResolveActiveCA(ctx, legacy.ID)
+	if err != nil {
+		t.Fatalf("ResolveActiveCA: %v", err)
+	}
+	if active.ID != legacy.ID {
+		t.Errorf("expected legacy row resolved as its own root, got %s", active.ID)
+	}
+}

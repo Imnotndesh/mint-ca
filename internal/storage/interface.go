@@ -166,6 +166,13 @@ type SSHCertificateAuthority struct {
 	PublicKey string     `json:"public_key"` // OpenSSH authorized_keys format
 	KeyEnc    []byte     `json:"-"`
 	Status    CAStatus   `json:"status"`
+	// LogicalCAID is the stable identity this SSH CA belongs to. Key rotation
+	// creates a new row with a new physical ID but the SAME LogicalCAID, so
+	// downstream consumers can keep referring to one logical id. Set to the
+	// row's own ID at creation.
+	LogicalCAID *uuid.UUID `json:"logical_ca_id,omitempty"`
+	// ParentID records the SSH CA row this row supersedes (nil for a root).
+	ParentID  *uuid.UUID `json:"parent_id,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 }
 

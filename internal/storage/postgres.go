@@ -288,13 +288,15 @@ CREATE TABLE IF NOT EXISTS setup_state (
 );
 
 CREATE TABLE IF NOT EXISTS ssh_certificate_authorities (
-	id         TEXT        NOT NULL PRIMARY KEY,
-	name       TEXT        NOT NULL UNIQUE,
-	key_algo   TEXT        NOT NULL,
-	public_key TEXT        NOT NULL,
-	key_enc    BYTEA       NOT NULL,
-	status     TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
-	created_at TIMESTAMPTZ NOT NULL
+	id            TEXT        NOT NULL PRIMARY KEY,
+	name          TEXT        NOT NULL UNIQUE,
+	key_algo      TEXT        NOT NULL,
+	public_key    TEXT        NOT NULL,
+	key_enc       BYTEA       NOT NULL,
+	status        TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired','superseded')),
+	logical_ca_id TEXT,
+	parent_id     TEXT,
+	created_at    TIMESTAMPTZ NOT NULL
 );
 CREATE TABLE IF NOT EXISTS ssh_krl_cache (
 	id          TEXT        NOT NULL PRIMARY KEY,
@@ -1815,10 +1817,10 @@ func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities
-			(id, name, key_algo, public_key, key_enc, status, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
-		ca.KeyEnc, string(ca.Status), ca.CreatedAt.UTC(),
+		ca.KeyEnc, string(ca.Status), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateSSHCA: %w", err)
@@ -1827,13 +1829,14 @@ func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAutho
 }
 
 const pgSSHCASelectSQL = `
-	SELECT id, name, key_algo, public_key, key_enc, status, created_at
+	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at
 	FROM ssh_certificate_authorities`
 
 func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 	var ca SSHCertificateAuthority
 	var idStr string
-	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt)
+	var logicalID, parentID *string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1841,6 +1844,8 @@ func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.LogicalCAID = pgSQLToUUID(logicalID)
+	ca.ParentID = pgSQLToUUID(parentID)
 	return &ca, nil
 }
 
@@ -1872,13 +1877,24 @@ func (s *postgresStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthor
 	for rows.Next() {
 		var ca SSHCertificateAuthority
 		var idStr string
-		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt); err != nil {
+		var logicalID, parentID *string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.LogicalCAID = pgSQLToUUID(logicalID)
+		ca.ParentID = pgSQLToUUID(parentID)
 		out = append(out, &ca)
 	}
 	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateSSHCAStatus(ctx context.Context, id uuid.UUID, status CAStatus) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE ssh_certificate_authorities SET status = $1 WHERE id = $2`, string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateSSHCAStatus: %w", err)
+	}
+	return nil
 }
 
 func (s *postgresStore) CreateSSHCertificate(ctx context.Context, cert *SSHCertificate) error {
