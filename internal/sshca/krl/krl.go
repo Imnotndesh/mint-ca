@@ -1,6 +1,20 @@
 // Package krl implements OpenSSH Key Revocation Lists (PROTOCOL.krl).
 // Unsigned mode only: transport trust (HTTPS) is the security boundary,
 // matching how mint-ca already serves x509 CRLs/OCSP.
+//
+// Signed KRL sections are deliberately NOT implemented. PROTOCOL.krl defines a
+// KRL_SECTION_SIGNATURE (0x04) section, but OpenSSH removed all support for it
+// in 9.4 (2023): the signing/verifing code was never completed, and modern
+// OpenSSH ignores (and previously refused) KRLs containing signature sections.
+// The upstream spec instead suggests SSHSIG (`ssh-keygen -Y sign`) as a
+// detached-signature mechanism, but sshd(8) does NOT verify such signatures
+// when it loads a KRL for the RevokedKeys directive — it hashes the issuing CA
+// key and checks it against the KRL body directly. Since mint-ca serves KRLs
+// over HTTPS (the /pki/sshca/{caID}/krl TLS endpoint), clients already receive
+// them over a channel providing integrity protection, which PROTOCOL.krl
+// describes as the case where "signature sections are optional ... by trusted
+// means". A signed section would therefore add bytes that no consumer verifies,
+// at risk of breaking OpenSSH >= 9.4 clients.
 package krl
 
 import (
