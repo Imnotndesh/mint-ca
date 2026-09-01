@@ -1886,6 +1886,17 @@ func (s *sqliteStore) DeleteAPIKey(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+func (s *sqliteStore) UpdateAPIKeyHash(ctx context.Context, id uuid.UUID, newHash string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE api_keys SET key_hash = ? WHERE id = ?`, newHash, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateAPIKeyHash: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateAPIKeyHash: API key %s not found", id)
+	}
+	return nil
+}
+
 func (s *sqliteStore) TouchAPIKey(ctx context.Context, id uuid.UUID) error {
 	_, err := s.db.ExecContext(ctx,
 		`UPDATE api_keys SET last_used = ? WHERE id = ?`,
