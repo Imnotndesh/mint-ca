@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -73,6 +74,16 @@ func (f *sshFakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificat
 		out = append(out, c)
 	}
 	return out, nil
+}
+func (f *sshFakeStore) UpdateSSHCAStatus(ctx context.Context, id uuid.UUID, status storage.CAStatus) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.cas[id]
+	if !ok {
+		return fmt.Errorf("sshFakeStore: UpdateSSHCAStatus: not found")
+	}
+	c.Status = status
+	return nil
 }
 func (f *sshFakeStore) CreateSSHCertificate(ctx context.Context, cert *storage.SSHCertificate) error {
 	f.mu.Lock()
@@ -683,4 +694,41 @@ func testClientAuthorizedKey(t *testing.T) string {
 		t.Fatalf("wrap test client signer: %v", err)
 	}
 	return string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+}
+
+func TestHandlers_SSHCA_RekeyAndCrossSign(t *testing.T) {
+	_, _, r := setupSSHRouter(t)
+
+	rec := doRequest(t, r, http.MethodPost, "/api/v1/sshca/", `{"name":"rotate","key_algo":"ed25519"}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("create: %d: %s", rec.Code, rec.Body.String())
+	}
+	var ca storage.SSHCertificateAuthority
+	_ = decodeTestJSON(rec.Body.String(), &ca)
+	logical := *ca.LogicalCAID
+
+	// Rekey.
+	rec = doRequest(t, r, http.MethodPost, "/api/v1/sshca/"+ca.ID.String()+"/rekey", "{}")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("rekey: %d: %s", rec.Code, rec.Body.String())
+	}
+	var rekeyed storage.SSHCertificateAuthority
+	_ = decodeTestJSON(rec.Body.String(), &rekeyed)
+	if rekeyed.ID == ca.ID {
+		t.Fatal("rekey must produce a new CA id")
+	}
+	if rekeyed.LogicalCAID == nil || *rekeyed.LogicalCAID != logical {
+		t.Fatalf("rekeyed CA logical id mismatch")
+	}
+
+	// Cross-sign uses the target key; both rows stay active.
+	rec = doRequest(t, r, http.MethodPost, "/api/v1/sshca/"+rekeyed.ID.String()+"/cross-sign", "{}")
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("cross-sign: %d: %s", rec.Code, rec.Body.String())
+	}
+	var signed storage.SSHCertificateAuthority
+	_ = decodeTestJSON(rec.Body.String(), &signed)
+	if signed.PublicKey != rekeyed.PublicKey {
+		t.Error("cross-sign must share the target public key")
+	}
 }

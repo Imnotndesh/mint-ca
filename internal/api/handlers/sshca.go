@@ -31,6 +31,8 @@ func (h *SSHCAHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/{caID}/issue", h.issueCert)
 		r.Post("/{caID}/sign/user", h.signUser)
 		r.Post("/{caID}/sign/host", h.signHost)
+		r.Post("/{caID}/rekey", h.rekeyCA)
+		r.Post("/{caID}/cross-sign", h.crossSignCA)
 		r.Get("/{caID}/certs", h.listCertsByCA)
 	})
 
@@ -88,6 +90,53 @@ func (h *SSHCAHandler) createCA(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusCreated, record)
+}
+
+func (h *SSHCAHandler) rekeyCA(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	var req struct {
+		KeyAlgo string `json:"key_algo"`
+	}
+	_ = decodeJSON(r, &req) // key_algo optional
+	ca, err := h.engine.RekeyCA(r.Context(), sshca.RekeyCARequest{CAID: id, KeyAlgo: sshca.KeyAlgo(req.KeyAlgo)})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, ca)
+}
+
+func (h *SSHCAHandler) crossSignCA(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "caID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	var req struct {
+		TargetCAID string `json:"target_ca_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	targetID := id
+	if req.TargetCAID != "" {
+		targetID, err = uuid.Parse(req.TargetCAID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid target_ca_id")
+			return
+		}
+	}
+	ca, err := h.engine.CrossSignCA(r.Context(), sshca.CrossSignCARequest{TargetCAID: targetID})
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, ca)
 }
 
 func (h *SSHCAHandler) listCAs(w http.ResponseWriter, r *http.Request) {
@@ -171,15 +220,23 @@ func (h *SSHCAHandler) issue(w http.ResponseWriter, certType storage.SSHCertType
 		return
 	}
 
+	// Resolve a stable logical CA id to the currently-active row so issuance
+	// continues to use the live key after a re-key.
+	active, err := h.engine.ResolveActiveCA(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	issued, err := h.engine.IssueCert(r.Context(), sshca.IssueCertRequest{
-		CAID:           caID,
-		ProvisionerID:  provID,
-		Requester:      actorFromContext(r),
-		CertType:       certType,
-		PublicKeyInput: req.PublicKey,
-		KeyID:          req.KeyID,
-		Principals:     req.Principals,
-		TTLSeconds:     req.TTLSeconds,
+		CAID:            active.ID,
+		ProvisionerID:   provID,
+		Requester:       actorFromContext(r),
+		CertType:        certType,
+		PublicKeyInput:  req.PublicKey,
+		KeyID:           req.KeyID,
+		Principals:      req.Principals,
+		TTLSeconds:      req.TTLSeconds,
 		CriticalOptions: req.CriticalOptions,
 		Extensions:      req.Extensions,
 	})
@@ -274,4 +331,3 @@ func (h *SSHCAHandler) revokeCert(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
-
