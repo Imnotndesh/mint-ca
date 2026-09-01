@@ -57,7 +57,14 @@ func (h *SSHCAHandler) getKRL(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid CA ID")
 		return
 	}
-	data, err := h.krlMgr.GetKRL(r.Context(), caID)
+	// Resolve to the active row so a logical/superseded id returns the live
+	// revocation list for the current signing key.
+	active, err := h.engine.ResolveActiveCA(r.Context(), caID)
+	if err != nil || active == nil {
+		writeError(w, http.StatusNotFound, "SSH CA not found")
+		return
+	}
+	data, err := h.krlMgr.GetKRL(r.Context(), active.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -154,7 +161,7 @@ func (h *SSHCAHandler) getCA(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid CA ID")
 		return
 	}
-	record, err := h.store.GetSSHCA(r.Context(), id)
+	record, err := h.engine.ResolveActiveCA(r.Context(), id)
 	if err != nil || record == nil {
 		writeError(w, http.StatusNotFound, "SSH CA not found")
 		return
@@ -257,7 +264,9 @@ func (h *SSHCAHandler) getPublicKey(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid CA ID")
 		return
 	}
-	record, err := h.store.GetSSHCA(r.Context(), caID)
+	// Resolve a logical/superseded id to the active row so clients always
+	// fetch the live public key after a re-key.
+	record, err := h.engine.ResolveActiveCA(r.Context(), caID)
 	if err != nil || record == nil {
 		writeError(w, http.StatusNotFound, "SSH CA not found")
 		return

@@ -559,3 +559,28 @@ func TestResolveActiveCA_LegacyRowIsOwnRoot(t *testing.T) {
 		t.Errorf("expected legacy row resolved as its own root, got %s", active.ID)
 	}
 }
+
+func TestResolveActiveCA_CrossSignDoesNotHijackResolution(t *testing.T) {
+	ctx := context.Background()
+	engine := setupTestEngine(t)
+	base, err := engine.CreateCA(ctx, CreateCARequest{Name: "resolve-base", KeyAlgo: KeyAlgoEd25519})
+	if err != nil {
+		t.Fatalf("CreateCA: %v", err)
+	}
+	logical := *base.LogicalCAID
+
+	// Cross-sign creates a second active row sharing the logical id.
+	if _, err := engine.CrossSignCA(ctx, CrossSignCARequest{TargetCAID: base.ID}); err != nil {
+		t.Fatalf("CrossSignCA: %v", err)
+	}
+
+	// Resolving the logical id must return the primary (base) row, not the
+	// cross-signed parallel row.
+	active, err := engine.ResolveActiveCA(ctx, logical)
+	if err != nil {
+		t.Fatalf("ResolveActiveCA: %v", err)
+	}
+	if active.ID != base.ID {
+		t.Errorf("expected logical id to resolve to base %s, got %s", base.ID, active.ID)
+	}
+}
