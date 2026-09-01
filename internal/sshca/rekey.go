@@ -76,25 +76,36 @@ func (e *Engine) ResolveActiveCA(ctx context.Context, logicalCAID uuid.UUID) (*s
 }
 
 // resolveLogicalCAID scans all SSH CAs for the row carrying the requested
-// logical id that is currently active.
+// logical id. Of the active rows it prefers the primary (ParentID == nil, i.e.
+// the logical root) so a cross-signed parallel row does not hijack resolution;
+// otherwise it returns the Chronologically-first active row.
 func (e *Engine) resolveLogicalCAID(ctx context.Context, logicalCAID uuid.UUID) (*storage.SSHCertificateAuthority, error) {
 	cas, err := e.store.ListSSHCAs(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("sshca: resolve: list: %w", err)
 	}
+	var primary *storage.SSHCertificateAuthority
+	var fallback *storage.SSHCertificateAuthority
 	for _, ca := range cas {
 		if ca.Status != storage.CAStatusActive {
 			continue
 		}
-		if ca.LogicalCAID != nil && *ca.LogicalCAID == logicalCAID {
-			return ca, nil
+		left := ca.LogicalCAID != nil && *ca.LogicalCAID == logicalCAID
+		right := ca.LogicalCAID == nil && ca.ID == logicalCAID
+		if !left && !right {
+			continue
 		}
-		// Pre-existing rows use their own ID as the logical id.
-		if ca.LogicalCAID == nil && ca.ID == logicalCAID {
-			return ca, nil
+		if ca.ParentID == nil && primary == nil {
+			primary = ca
+		}
+		if fallback == nil {
+			fallback = ca
 		}
 	}
-	return nil, nil
+	if primary != nil {
+		return primary, nil
+	}
+	return fallback, nil
 }
 
 // RekeyCA rotates an SSH CA's signing key: it generates a fresh keypair, creates
