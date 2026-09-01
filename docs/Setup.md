@@ -98,11 +98,24 @@ Default values are shown; variables marked **Required** must be set.
 | `MINT_ACME_ENABLED` | Enable the ACME protocol endpoints. | `false` | No |
 | `MINT_ACME_BASE_URL` | Public HTTPS URL where mint‑ca is reachable (e.g., `https://ca.example.com`). | – | If ACME enabled |
 | `MINT_ACME_EAB_REQUIRED` | Require External Account Binding for new ACME accounts. | `false` | No |
+| `MINT_ACME_CAA_DOMAIN` | This CA's public identity used for RFC 8659 CAA checks. When set, issuance is refused unless each identifier's CAA record authorises this domain. Empty disables CAA enforcement. | – | No |
+| `MINT_ACME_CAA_DNS_SERVER` | Override resolver (host:port) for CAA DNS lookups. Empty reads the system resolvers. | system | No |
+| `MINT_ACME_CAA_BYPASS_LABELS` | Comma‑separated domain labels for which CAA checking is skipped (a CP/CPS exception). | – | No |
 | **CRL** | | | |
 | `MINT_CRL_REFRESH_INTERVAL_SECONDS` | How often (seconds) to regenerate CRLs for all active CAs. | `3600` (1h) | No |
 | `MINT_CRL_VALIDITY_SECONDS` | How long (seconds) a generated CRL is valid (`NextUpdate`). | `86400` (24h) | No |
 | `MINT_CRL_DELTA_ENABLED` | Publish delta CRLs (`/pki/{caID}/crl/delta`) alongside the full base CRL. Opt‑in; off by default so existing deployments are unchanged. Base CRLs then carry a Freshest CRL extension (when `MINT_ACME_BASE_URL` is set). | `false` | No |
 | `MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS` | How often (seconds) to regenerate the full base CRL while delta mode is on. Deltas refresh every `MINT_CRL_REFRESH_INTERVAL_SECONDS`; bases can be rebuilt less often to reduce churn. Must be ≥ the refresh interval. | defaults to `MINT_CRL_REFRESH_INTERVAL_SECONDS` | No |
+| **MTLS Device Enrollment** | | | |
+| `MINT_MTLS_ENABLED` | Run a second mutual‑TLS listener for device enrollment (`/enroll`). | `false` | No |
+| `MINT_MTLS_LISTEN_ADDR` | Address/port the enrollment listener binds (e.g. `:8444`). | – | Yes if MTLS enabled |
+| `MINT_MTLS_CLIENT_CA` | PEM of the CA cert (or chain) used to validate device client certificates. | – | Yes if MTLS enabled |
+| `MINT_MTLS_CERT` / `MINT_MTLS_KEY` | Server TLS cert/key for the enrollment listener. Defaults to the main server TLS files. | main server TLS | No |
+| **Certificate Auto-Renewal** | | | |
+| `MINT_RENEWAL_ENABLED` | Run the background certificate auto-renewal worker. | `false` | No |
+| `MINT_RENEWAL_INTERVAL_SECONDS` | How often (seconds) the worker scans for certs due for renewal. | `3600` (1h) | No |
+| `MINT_RENEWAL_LEAD_SECONDS` | How long (seconds) before `NotAfter` a cert is considered due for renewal. | `604800` (7 days) | No |
+| `MINT_RENEWAL_WEBHOOK_URL` | When set, mint-ca POSTs a JSON notice for each cert due for renewal so an external system can renew it. | – | No |
 | **Logging** | | | |
 | `MINT_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error`. | `info` | No |
 | `MINT_LOG_JSON` | Output logs as JSON (structured) instead of human‑readable. | `false` | No |

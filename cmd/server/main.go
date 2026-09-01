@@ -22,6 +22,7 @@ import (
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/mtls"
 	"mint-ca/internal/policy"
+	"mint-ca/internal/renewal"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
 	"mint-ca/internal/sshca/krl"
@@ -86,6 +87,15 @@ func main() {
 	apiWorkers.Add(workers.NewNonceWorker(store))
 	apiWorkers.Add(workers.NewSSHKRLWorker(sshKRLManager, cfg.CRL))
 	apiWorkers.Add(workers.NewRateLimitPruneWorker(store))
+	if cfg.Renewal.Enabled {
+		var deliverer renewal.Deliverer
+		if cfg.Renewal.WebhookURL != "" {
+			deliverer = renewal.NewWebhookDeliverer(cfg.Renewal.WebhookURL)
+		}
+		apiWorkers.Add(renewal.NewWorker(store, deliverer,
+			time.Duration(cfg.Renewal.IntervalSeconds)*time.Second,
+			time.Duration(cfg.Renewal.LeadSeconds)*time.Second))
+	}
 	apiWorkers.Start(context.Background())
 	// Read state before starting the listener so we know which router to mount.
 	state, err := store.GetSetupState(context.Background())

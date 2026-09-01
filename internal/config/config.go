@@ -25,6 +25,7 @@ type Config struct {
 	Log       LogConfig
 	RateLimit RateLimitConfig
 	MTLS      MTLSConfig
+	Renewal   RenewalConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -220,6 +221,32 @@ type MTLSConfig struct {
 	ServerKeyFile  string
 }
 
+// RenewalConfig controls automatic certificate-renewal notices. A background
+// worker scans for active certificates whose NotAfter is within the lead window
+// and hands each to a configured deliverer (e.g. a webhook POST). The worker is
+// the generic trigger; the deliverer is pluggable so future integrations
+// (ACME re-issue, a management callback, a CLI) can be added without changing
+// the worker.
+type RenewalConfig struct {
+	// Enabled turns on the renewal worker.
+	// Env: MINT_RENEWAL_ENABLED
+	Enabled bool
+
+	// IntervalSeconds is how often the worker scans for certs due for renewal.
+	// Env: MINT_RENEWAL_INTERVAL_SECONDS
+	IntervalSeconds int64
+
+	// LeadSeconds is how long before NotAfter a certificate is considered due
+	// for renewal.
+	// Env: MINT_RENEWAL_LEAD_SECONDS
+	LeadSeconds int64
+
+	// WebhookURL, when set, is POSTed a JSON payload describing each certificate
+	// due for renewal, letting an external system perform the actual renewal.
+	// Env: MINT_RENEWAL_WEBHOOK_URL
+	WebhookURL string
+}
+
 // Load reads all configuration from environment variables, applies defaults,
 // validates every field, and returns a fully populated Config.
 //
@@ -386,6 +413,17 @@ func Load() (*Config, error) {
 			errs = append(errs, "MINT_MTLS_CLIENT_CA is required when MINT_MTLS_ENABLED=true")
 		}
 	}
+
+	c.Renewal.Enabled = envBool("MINT_RENEWAL_ENABLED")
+	c.Renewal.IntervalSeconds = int64(envIntOptional("MINT_RENEWAL_INTERVAL_SECONDS"))
+	if c.Renewal.IntervalSeconds == 0 {
+		c.Renewal.IntervalSeconds = 3600 // 1h
+	}
+	c.Renewal.LeadSeconds = int64(envIntOptional("MINT_RENEWAL_LEAD_SECONDS"))
+	if c.Renewal.LeadSeconds == 0 {
+		c.Renewal.LeadSeconds = 7 * 24 * 3600 // 7 days
+	}
+	c.Renewal.WebhookURL = strings.TrimSpace(os.Getenv("MINT_RENEWAL_WEBHOOK_URL"))
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)
