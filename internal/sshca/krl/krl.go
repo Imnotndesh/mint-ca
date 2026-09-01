@@ -34,13 +34,13 @@ import (
 
 // KRL section types (OpenSSH PROTOCOL.krl).
 const (
-	krlMagic       = "SSHKRL\x00\x00" // 8 bytes: "SSHKRL" + 2 NUL padding
-	krlFormatVers  = uint32(1)
-	sectCertificat = byte(1)  // KRL_SECTION_CERTIFICATES
+	krlMagic        = "SSHKRL\x00\x00" // 8 bytes: "SSHKRL" + 2 NUL padding
+	krlFormatVers   = uint32(1)
+	sectCertificat  = byte(1) // KRL_SECTION_CERTIFICATES
 	sectExplicitKey = byte(2) // KRL_SECTION_EXPLICIT_KEY
-	sectFpSHA1     = byte(3)  // KRL_SECTION_FINGERPRINT_SHA1
-	sectFpSHA256   = byte(5)  // KRL_SECTION_FINGERPRINT_SHA256
-	certSectSerial = byte(2)  // KRL_CERT_SECTION_SERIAL_LIST
+	sectFpSHA1      = byte(3) // KRL_SECTION_FINGERPRINT_SHA1
+	sectFpSHA256    = byte(5) // KRL_SECTION_FINGERPRINT_SHA256
+	certSectSerial  = byte(2) // KRL_CERT_SECTION_SERIAL_LIST
 )
 
 // Manager generates and caches KRLs for SSH CAs, mirroring
@@ -160,13 +160,15 @@ func (m *Manager) RefreshAll(ctx context.Context, validity time.Duration) error 
 // ---- binary encoding (PROTOCOL.krl, unsigned) ----
 //
 // Layout:
-//   magic(8) | format_version(u32) | krl_version(u64) | generated_date(u64)
-//   | flags(u32=0) | reserved_len(u32=0) | comment_len(u32=0)
-//   then repeated sections: type(1) | length(u32) | body
+//
+//	magic(8) | format_version(u32) | krl_version(u64) | generated_date(u64)
+//	| flags(u32=0) | reserved_len(u32=0) | comment_len(u32=0)
+//	then repeated sections: type(1) | length(u32) | body
 //
 // Certificate section body: ca_key_len(u32=0, omitted — unsigned mode has
 // no embedded CA pubkey) is NOT included; we go straight to cert subsections:
-//   subsect_type(1)=2 (SERIAL_LIST) | length(u32) | reserved(u64=0) | serial(u64)...
+//
+//	subsect_type(1)=2 (SERIAL_LIST) | length(u32) | reserved(u64=0) | serial(u64)...
 func encode(version uint64, generated time.Time, revoked []*storage.SSHCertificate) ([]byte, error) {
 	var buf bytes.Buffer
 	buf.WriteString(krlMagic)
