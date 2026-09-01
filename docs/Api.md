@@ -149,9 +149,16 @@ Generate a new key pair and issue a certificate.
   "key_algo": "ecdsa-p256",
   "server_auth": true,
   "client_auth": false,
+  "profile": "web",                 // optional: enforce a named certificate profile
+  "store_key": false,                 // optional: escrow the generated key for later retrieval
+  "key_passcode": "",                // optional: passcode-guard the escrowed key
   "metadata": { "environment": "prod" }
 }
 ```
+The generated private key is returned once in `key_pem` and **not stored** unless
+`store_key` is true. When `store_key` is true the key is encrypted at rest and
+can be retrieved later via `GET /api/v1/certs/{certID}/key` (or included in an
+export) — supplying `key_passcode` makes that retrieval require the passcode.
 
 **Response (201 Created)**
 ```json
@@ -200,6 +207,83 @@ Revoke a certificate.
 ```json
 { "status": "revoked" }
 ```
+
+### `POST /api/v1/certs/batch/sign`
+Sign many CSRs in one request (fleet / embedded provisioning). Each item is
+validated and signed independently; a failing item is reported and does not
+abort the rest.
+
+**Request body**
+```json
+{
+  "ca_id": "550e8400-e29b-41d4-a716-446655440000",
+  "provisioner_id": "provisioner-uuid",
+  "metadata": { "env": "prod" },          // shared metadata (optional)
+  "items": [
+    { "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...", "ttl_seconds": 3600, "metadata": {} },
+    { "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...", "ttl_seconds": 7200 }
+  ]
+}
+```
+Max 1000 items. Per‑item `metadata` overrides the shared metadata.
+
+**Response (200 OK)**
+```json
+{
+  "results": [
+    { "index": 0, "cert_id": "...", "serial": "...", "subject_cn": "...", "cert_pem": "..." },
+    { "index": 1, "error": "ca: SignCSR: ..." }
+  ],
+  "issued": 1,
+  "failed": 1
+}
+```
+
+### `GET /api/v1/certs/{certID}/key`
+Retrieve the escrowed private key for a certificate. Only available when the
+certificate was issued with `store_key: true`. If a key passcode was set at
+issue, it must be supplied here.
+
+**Query parameters**
+| Param | Description |
+|-------|-------------|
+| `passcode` | The key passcode, required when the key is passcode‑protected. |
+
+**Response (200 OK)** – `text/plain`, the PEM‑encoded private key.
+
+`404` if the key was not stored (`store_key` was false). `400` if a passcode is
+required but missing or incorrect.
+
+### `GET /api/v1/certs/{certID}/export`
+Download a tar.gz bundle of a certificate: `cert.pem`, `chain.pem`
+(leaf + intermediates + root), `cert.json` manifest, `README.txt`, and
+`key.pem` when the key was escrowed and a valid `passcode` is supplied.
+
+**Query parameters**
+| Param | Description |
+|-------|-------------|
+| `passcode` | Required to include `key.pem` when the key is passcode‑protected. |
+
+### Auto‑renewal webhook (background, not request/response)
+When `MINT_RENEWAL_ENABLED` and `MINT_RENEWAL_WEBHOOK_URL` are set, a background
+worker scans active certificates whose `NotAfter` is within
+`MINT_RENEWAL_LEAD_SECONDS` (default 7 days) and sends an HTTP **POST** with a JSON
+body to the webhook URL per certificate, so an external system can renew it:
+
+```json
+{
+  "cert_id": "550e8400-e29b-41d4-a716-446655440000",
+  "ca_id": "...",
+  "serial": "12345",
+  "subject_cn": "api.example.com",
+  "expires_at": "2026-01-01T00:00:00Z",
+  "days_left": 5,
+  "key_escrowed": false
+}
+```
+The worker is a generic trigger: the deliverer is pluggable, so other
+integrations (ACME re‑issue, a management callback, the `mca` CLI) can be wired
+to the same scan without changing it.
 
 ---
 
@@ -251,6 +335,39 @@ Certificates can also be constrained by a **profile** (`storage.Profile`) — a
 reusable set of constraints (`allowed_key_algos`, `min/max_ttl_seconds`,
 `require_san`, `allow_wildcard`) evaluated by `policy.EvaluateProfile`. A
 provisioner may pin one via its `profile_id`.
+
+### `POST /api/v1/profiles`
+Create a named certificate profile.
+
+**Request body**
+```json
+{
+  "name": "web",
+  "allowed_key_algos": ["ecdsa-p256"],
+  "min_ttl_seconds": 3600,
+  "max_ttl_seconds": 86400,
+  "require_san": true,
+  "allow_wildcard": false
+}
+```
+**Response (201 Created)** – the created profile object.
+
+### `GET /api/v1/profiles`
+List all profiles.
+
+### `GET /api/v1/profiles/{profileID}`
+Get a single profile.
+
+### `PUT /api/v1/profiles/{profileID}`
+Update a profile (same body as create).
+
+### `DELETE /api/v1/profiles/{profileID}`
+Delete a profile.
+
+**Referencing a profile at issuance:** `POST /api/v1/certs/issue` accepts an
+optional `"profile": "<name>"` field; the named profile is resolved and enforced
+with `policy.EvaluateProfile` (key‑algo, TTL min/max, require‑SAN, wildcard)
+before any crypto work.
 
 ### `POST /api/v1/policies`
 Create a new certificate issuance policy.
@@ -327,9 +444,13 @@ Create a new management API key.
   "name": "my-key",
   "scopes": ["*"],                // scope strings, "*" for all
   "ca_id": "ca-uuid",             // optional, restrict to a CA
-  "expires_in_seconds": 31536000
+  "expires_in_seconds": 31536000,  // optional; default applies when omitted
+  "never_expires": false           // optional; true for an explicit never‑expiring key
 }
 ```
+When `expires_in_seconds` is omitted (and `never_expires` is false), a
+conservative default lifetime of **90 days** is applied so automation tokens are
+rotated by default rather than long‑lived. Keys are enforced to be rejected after	expiry, and `last_used` is tracked per key.
 
 **Response (201 Created)**
 ```json
@@ -345,6 +466,16 @@ Create a new management API key.
 
 ### `GET /api/v1/apikeys`
 List all API keys (only metadata, no keys).
+
+### `POST /api/v1/apikeys/{keyID}/rotate`
+Issue a fresh bearer token for an existing key identity. Keeps its
+name/scopes/CAID; the **previous secret is immediately invalidated** (its hash is
+replaced) — callers must stop using it. No request body.
+
+**Response (200 OK)**
+```json
+{ "id": "key-uuid", "key": "mca_new...", "note": "previous key is now invalid; store this one securely" }
+```
 
 ### `DELETE /api/v1/apikeys/{keyID}`
 Delete an API key.
@@ -430,7 +561,35 @@ Full CA chain in PEM format (the CA’s own certificate plus all ancestors up to
 
 ---
 
-## 1.10 SSH Certificate Authorities
+## 1.10 MTLS Device Enrollment
+
+When the MTLS listener is enabled (`MINT_MTLS_ENABLED`), mint‑ca runs a **second**
+mutual‑TLS listener (default `:8444`) that requires devices to present a client
+certificate chained to the trusted client CA (`MINT_MTLS_CLIENT_CA`). A device is
+authenticated by that certificate and issued a fresh, device‑bound leaf.
+
+### `GET /healthz`
+Liveness of the enrollment listener.
+
+### `GET /enroll`
+Authenticate via the presented client certificate and issue a device leaf.
+The device identity is taken from the presented certificate's `CommonName`
+(and its DNS names become SANs). Requires the presented cert to chain to the
+trusted client CA.
+
+**Response (201 Created)**
+```json
+{
+  "certificate": { "id": "...", "subject_cn": "device-42", ... },
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "key_pem": "-----BEGIN EC PRIVATE KEY-----\n...",
+  "chain_pem": "..."
+}
+```
+
+---
+
+## 1.11 SSH Certificate Authorities
 
 SSH CAs sign **user** and **host** certificates (OpenSSH `-cert.pub` format), distinct from the X.509 CAs above. An SSH CA is a flat signing key — no parent/child chain — and its public key is distributed for clients/servers to trust. Management endpoints require an API key; the public key endpoint under `/pki` does not.
 
@@ -464,7 +623,35 @@ Public (no auth), plaintext `authorized_keys` line. Pipe it straight into `Trust
 List all SSH CAs.
 
 ### `GET /api/v1/sshca/{caID}`
-Get a single SSH CA by ID.
+Get a single SSH CA by ID. The ID may be a **logical CA id**: after a re‑key the
+logical id resolves to the currently‑active row (see below).
+
+### `POST /api/v1/sshca/{caID}/rekey`
+Rotate an SSH CA's signing key. Generates a fresh keypair under a new physical
+row that keeps the same **logical CA id**, and marks the old row `superseded` so
+it stops signing new certificates (already‑issued certs remain valid while the
+old public key is still trusted by clients).
+
+**Request body** (optional)
+```json
+{ "key_algo": "ecdsa-p256" }   // optional; defaults to the existing algorithm
+```
+**Response (201 Created)** – the new active SSH CA row.
+
+### `POST /api/v1/sshca/{caID}/cross-sign`
+Create a **parallel active** SSH CA row that shares the target CA's key and
+logical identity without superseding it. Both rows stay active, so clients
+trusting either physical CA id keep working — the SSH analogue of cross‑signing.
+
+**Request body** (optional)
+```json
+{ "target_ca_id": "<uuid>" }   // optional; defaults to {caID}
+```
+**Response (201 Created)** – the new parallel SSH CA row.
+
+> Issuance, `GET {caID}`, `public-key`, and `krl` all resolve a logical or
+> superseded id to the currently‑active row, so a stable `caID` keeps working
+> through key rotation.
 
 ### `POST /api/v1/sshca/{caID}/issue` / `.../sign/user` / `.../sign/host`
 Issue (sign) an SSH certificate. `/sign/user` and `/sign/host` are fixed-type aliases of `/issue` (which takes `cert_type` in the body).
@@ -522,7 +709,7 @@ never presented — covering both cert- and raw-key-based use.
 **Note:** unlike CRL, sshd does not fetch KRLs live. Configure `sshd_config`:
 ---
 
-## 1.11 ACME Endpoints
+## 1.12 ACME Endpoints
 
 ACME endpoints follow the **RFC 8555** protocol. All POST requests must be wrapped in a JWS.  
 The provisioner ID is part of the URL.  
@@ -558,7 +745,7 @@ The directory response also includes `"keyChange"` alongside `newNonce`, `newAcc
 
 ---
 
-## 1.12 Health & Setup
+## 1.13 Health & Setup
 
 ### `GET /healthz`
 Health check. In setup mode it returns a `status: "setup"` message.
@@ -597,7 +784,7 @@ Rejected with `urn:ietf:params:acme:error:malformed` if:
 - the new key was previously retired by any account's rollover (once a key is rolled off, it can never be reused — standard CA practice).
 
 Subject to the `acme_key_change_per_account` rate limiter (default: 5/hour).
-## 1.13 Rate Limiting
+## 1.14 Rate Limiting
 
 mint-ca enforces per-limiter request quotas using a fixed-window algorithm. Limits apply to:
 
