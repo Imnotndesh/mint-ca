@@ -31,6 +31,8 @@ func (h *CertHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/serial/{serial}", h.getBySerial)
 		r.Get("/ca/{caID}", h.listByCA)
 		r.Put("/{certID}/revoke", h.revoke)
+		r.Get("/{certID}/key", h.key)
+		r.Get("/{certID}/export", h.export)
 	})
 }
 
@@ -46,6 +48,11 @@ type issueCertRequest struct {
 	ServerAuth    bool         `json:"server_auth"`
 	ClientAuth    bool         `json:"client_auth"`
 	Metadata      storage.JSON `json:"metadata"`
+	// StoreKey persists the generated private key (keystore-encrypted, with an
+	// optional passcode guard) so it can be retrieved later via the key/export
+	// endpoints. Off by default: the key is returned once and never stored.
+	StoreKey    bool   `json:"store_key"`
+	KeyPasscode string `json:"key_passcode"`
 }
 
 func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +139,8 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		Metadata:         req.Metadata,
 		CertPolicyOIDs:   certPolicyOIDs,
 		CertPolicyCPSURI: certPolicyCPSURI,
+		StoreKey:         req.StoreKey,
+		KeyPasscode:      req.KeyPasscode,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -204,6 +213,60 @@ func (h *CertHandler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, cert)
+}
+
+// key returns the escrowed private key for a certificate. It returns 400 if a
+// passcode is required but not supplied, 404 if the cert is not found, and 204/
+// empty when the key was not stored (store_key=false).
+func (h *CertHandler) key(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "certID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid cert ID")
+		return
+	}
+	_ = r.ParseForm()
+	passcode := r.URL.Query().Get("passcode")
+	keyPEM, err := h.engine.RetrieveKey(r.Context(), id, passcode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(keyPEM) == 0 {
+		writeError(w, http.StatusNotFound, "no key stored for this certificate (store_key was not set)")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(keyPEM)
+}
+
+// export returns a tar.gz bundle of a certificate (leaf, chain, manifest) and,
+// when the key was escrowed and a valid passcode is supplied, the key too.
+func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "certID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid cert ID")
+		return
+	}
+	cert, err := h.store.GetCertificate(r.Context(), id)
+	if err != nil || cert == nil {
+		writeError(w, http.StatusNotFound, "certificate not found")
+		return
+	}
+	keyPEM, err := h.engine.RetrieveKey(r.Context(), id, r.URL.Query().Get("passcode"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := exportCert(r.Context(), h.engine, cert, keyPEM)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".tgz\"")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 }
 
 func (h *CertHandler) getBySerial(w http.ResponseWriter, r *http.Request) {

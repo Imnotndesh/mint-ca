@@ -194,7 +194,9 @@ CREATE TABLE IF NOT EXISTS certificates (
 	issued_at      TIMESTAMPTZ NOT NULL,
 	provisioner_id TEXT        NOT NULL REFERENCES provisioners(id) ON DELETE RESTRICT,
 	requester      TEXT        NOT NULL DEFAULT '',
-	metadata       TEXT        NOT NULL DEFAULT '{}'
+	metadata       TEXT        NOT NULL DEFAULT '{}',
+	key_encrypted  BYTEA,
+	key_pw_required BOOLEAN    NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_pg_certs_ca_id     ON certificates(ca_id);
 CREATE INDEX IF NOT EXISTS idx_pg_certs_serial    ON certificates(serial);
@@ -648,12 +650,14 @@ func (s *postgresStore) CreateCertificate(ctx context.Context, cert *Certificate
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO certificates
 			(id, ca_id, serial, subject_cn, sans, key_usage, cert_pem, status,
-			 not_before, not_after, issued_at, provisioner_id, requester, metadata)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			 not_before, not_after, issued_at, provisioner_id, requester, metadata,
+			 key_encrypted, key_pw_required)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		cert.ID.String(), cert.CAID.String(), cert.Serial, cert.SubjectCN,
 		sans, ku, cert.CertPEM, string(cert.Status),
 		cert.NotBefore.UTC(), cert.NotAfter.UTC(), cert.IssuedAt.UTC(),
 		cert.ProvisionerID.String(), cert.Requester, meta,
+		cert.KeyEncrypted, cert.KeyPasscodeRequired,
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateCertificate: %w", err)
@@ -721,19 +725,22 @@ const pgCertSelectSQL = `
 	SELECT c.id, c.ca_id, c.serial, c.subject_cn, c.sans, c.key_usage, c.cert_pem,
 	       c.status, c.revoked_at, c.revoke_reason,
 	       c.not_before, c.not_after, c.issued_at,
-	       c.provisioner_id, c.requester, c.metadata
+	       c.provisioner_id, c.requester, c.metadata,
+	       c.key_encrypted, c.key_pw_required
 	FROM certificates c`
 
 func pgScanCert(row *sql.Row) (*Certificate, error) {
 	var c Certificate
 	var idStr, caIDStr, provIDStr string
 	var sansStr, kuStr, metaStr string
+	var pwReq bool
 	err := row.Scan(
 		&idStr, &caIDStr, &c.Serial, &c.SubjectCN,
 		&sansStr, &kuStr, &c.CertPEM, &c.Status,
 		&c.RevokedAt, &c.RevokeReason,
 		&c.NotBefore, &c.NotAfter, &c.IssuedAt,
 		&provIDStr, &c.Requester, &metaStr,
+		&c.KeyEncrypted, &pwReq,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -744,6 +751,7 @@ func pgScanCert(row *sql.Row) (*Certificate, error) {
 	c.ID = uuid.MustParse(idStr)
 	c.CAID = uuid.MustParse(caIDStr)
 	c.ProvisionerID = uuid.MustParse(provIDStr)
+	c.KeyPasscodeRequired = pwReq
 	_ = pgUnmarshalJSON(sansStr, &c.SANs)
 	c.KeyUsage, _ = pgUnmarshalStringSlice(kuStr)
 	_ = pgUnmarshalJSON(metaStr, &c.Metadata)
@@ -792,18 +800,21 @@ func pgScanCerts(rows *sql.Rows) ([]*Certificate, error) {
 		var c Certificate
 		var idStr, caIDStr, provIDStr string
 		var sansStr, kuStr, metaStr string
+		var pwReq bool
 		if err := rows.Scan(
 			&idStr, &caIDStr, &c.Serial, &c.SubjectCN,
 			&sansStr, &kuStr, &c.CertPEM, &c.Status,
 			&c.RevokedAt, &c.RevokeReason,
 			&c.NotBefore, &c.NotAfter, &c.IssuedAt,
 			&provIDStr, &c.Requester, &metaStr,
+			&c.KeyEncrypted, &pwReq,
 		); err != nil {
 			return nil, err
 		}
 		c.ID = uuid.MustParse(idStr)
 		c.CAID = uuid.MustParse(caIDStr)
 		c.ProvisionerID = uuid.MustParse(provIDStr)
+		c.KeyPasscodeRequired = pwReq
 		_ = pgUnmarshalJSON(sansStr, &c.SANs)
 		c.KeyUsage, _ = pgUnmarshalStringSlice(kuStr)
 		_ = pgUnmarshalJSON(metaStr, &c.Metadata)

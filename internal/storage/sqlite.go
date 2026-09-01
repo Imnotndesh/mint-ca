@@ -304,7 +304,9 @@ CREATE TABLE IF NOT EXISTS certificates (
 	issued_at      DATETIME NOT NULL,
 	provisioner_id TEXT    NOT NULL REFERENCES provisioners(id) ON DELETE RESTRICT,
 	requester      TEXT    NOT NULL DEFAULT '',
-	metadata       TEXT    NOT NULL DEFAULT '{}'
+	metadata       TEXT    NOT NULL DEFAULT '{}',
+	key_encrypted  BLOB,
+	key_pw_required INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_certs_ca_id    ON certificates(ca_id);
 CREATE INDEX IF NOT EXISTS idx_certs_serial   ON certificates(serial);
@@ -820,11 +822,16 @@ func (s *sqliteStore) CreateCertificate(ctx context.Context, cert *Certificate) 
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateCertificate: marshal metadata: %w", err)
 	}
+	pwReq := 0
+	if cert.KeyPasscodeRequired {
+		pwReq = 1
+	}
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificates
 			(id, ca_id, serial, subject_cn, sans, key_usage, cert_pem, status,
-			 not_before, not_after, issued_at, provisioner_id, requester, metadata)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 not_before, not_after, issued_at, provisioner_id, requester, metadata,
+			 key_encrypted, key_pw_required)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cert.ID.String(),
 		cert.CAID.String(),
 		cert.Serial,
@@ -839,6 +846,8 @@ func (s *sqliteStore) CreateCertificate(ctx context.Context, cert *Certificate) 
 		cert.ProvisionerID.String(),
 		cert.Requester,
 		meta,
+		cert.KeyEncrypted,
+		pwReq,
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateCertificate: %w", err)
@@ -906,19 +915,22 @@ const certSelectSQL = `
 	SELECT c.id, c.ca_id, c.serial, c.subject_cn, c.sans, c.key_usage, c.cert_pem,
 	       c.status, c.revoked_at, c.revoke_reason,
 	       c.not_before, c.not_after, c.issued_at,
-	       c.provisioner_id, c.requester, c.metadata
+	       c.provisioner_id, c.requester, c.metadata,
+	       c.key_encrypted, c.key_pw_required
 	FROM certificates c`
 
 func scanCert(row *sql.Row) (*Certificate, error) {
 	var c Certificate
 	var idStr, caIDStr, provIDStr string
 	var sansStr, kuStr, metaStr string
+	var pwReq int
 	err := row.Scan(
 		&idStr, &caIDStr, &c.Serial, &c.SubjectCN,
 		&sansStr, &kuStr, &c.CertPEM, &c.Status,
 		&c.RevokedAt, &c.RevokeReason,
 		&c.NotBefore, &c.NotAfter, &c.IssuedAt,
 		&provIDStr, &c.Requester, &metaStr,
+		&c.KeyEncrypted, &pwReq,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -929,6 +941,7 @@ func scanCert(row *sql.Row) (*Certificate, error) {
 	c.ID = uuid.MustParse(idStr)
 	c.CAID = uuid.MustParse(caIDStr)
 	c.ProvisionerID = uuid.MustParse(provIDStr)
+	c.KeyPasscodeRequired = pwReq == 1
 	_ = unmarshalJSON(sansStr, &c.SANs)
 	c.KeyUsage, _ = unmarshalStringSlice(kuStr)
 	_ = unmarshalJSON(metaStr, &c.Metadata)
@@ -941,18 +954,21 @@ func scanCerts(rows *sql.Rows) ([]*Certificate, error) {
 		var c Certificate
 		var idStr, caIDStr, provIDStr string
 		var sansStr, kuStr, metaStr string
+		var pwReq int
 		if err := rows.Scan(
 			&idStr, &caIDStr, &c.Serial, &c.SubjectCN,
 			&sansStr, &kuStr, &c.CertPEM, &c.Status,
 			&c.RevokedAt, &c.RevokeReason,
 			&c.NotBefore, &c.NotAfter, &c.IssuedAt,
 			&provIDStr, &c.Requester, &metaStr,
+			&c.KeyEncrypted, &pwReq,
 		); err != nil {
 			return nil, err
 		}
 		c.ID = uuid.MustParse(idStr)
 		c.CAID = uuid.MustParse(caIDStr)
 		c.ProvisionerID = uuid.MustParse(provIDStr)
+		c.KeyPasscodeRequired = pwReq == 1
 		_ = unmarshalJSON(sansStr, &c.SANs)
 		c.KeyUsage, _ = unmarshalStringSlice(kuStr)
 		_ = unmarshalJSON(metaStr, &c.Metadata)
