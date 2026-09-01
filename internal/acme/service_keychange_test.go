@@ -49,7 +49,7 @@ func signES256(t *testing.T, priv *ecdsa.PrivateKey, protected, payload string) 
 func setupKeyChangeEnv(t *testing.T) (*fakeStore, *Service, *storage.ACMEAccount, *ecdsa.PrivateKey) {
 	t.Helper()
 	store := NewFakeStore()
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	oldPriv, oldJWK := genECJWK(t)
 	oldThumb, err := Thumbprint(oldJWK)

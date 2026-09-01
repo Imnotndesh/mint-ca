@@ -102,6 +102,32 @@ type ACMEConfig struct {
 	// Default: false
 	// Env: MINT_ACME_EAB_REQUIRED
 	EABRequired bool
+
+	// CAADomain is this CA's public identity announced in its own CAA
+	// issue/issuewild records (RFC 8659). Operators grant mint-ca the right
+	// to issue by publishing, e.g.
+	//
+	//	example.com	CAA 0 issue "<CAADomain>"
+	//
+	// When set, mint-ca checks each requested identifier's Relevant RRset and
+	// refuses issuance unless the RRset is empty or authorises this domain.
+	// When empty, CAA lookup is skipped entirely (and the ACME service does
+	// not restrict issuance).
+	// Env: MINT_ACME_CAA_DOMAIN
+	CAADomain string
+
+	// CAADNSServer optionally overrides the resolver used for CAA lookups, in
+	// host:port form (e.g. "1.1.1.1:53"). Empty means read the system
+	// resolvers from /etc/resolv.conf.
+	// Env: MINT_ACME_CAA_DNS_SERVER
+	CAADNSServer string
+
+	// CAABypassLabels is a comma-separated list of domain labels for which CAA
+	// checking is skipped (an explicit CP/CPS exception per RFC 8659 §3). Any
+	// requested identifier that is exactly, or is a subdomain of, one of these
+	// labels bypasses CAA enforcement.
+	// Env: MINT_ACME_CAA_BYPASS_LABELS
+	CAABypassLabels string
 }
 
 // CRLConfig controls the CRL background refresh behaviour.
@@ -246,6 +272,9 @@ func Load() (*Config, error) {
 	c.ACME.Enabled = envBool("MINT_ACME_ENABLED")
 	c.ACME.BaseURL = strings.TrimRight(strings.TrimSpace(os.Getenv("MINT_ACME_BASE_URL")), "/")
 	c.ACME.EABRequired = envBool("MINT_ACME_EAB_REQUIRED")
+	c.ACME.CAADomain = strings.TrimSpace(os.Getenv("MINT_ACME_CAA_DOMAIN"))
+	c.ACME.CAADNSServer = strings.TrimSpace(os.Getenv("MINT_ACME_CAA_DNS_SERVER"))
+	c.ACME.CAABypassLabels = os.Getenv("MINT_ACME_CAA_BYPASS_LABELS")
 
 	if c.ACME.Enabled {
 		if c.ACME.BaseURL == "" {
@@ -354,9 +383,9 @@ func (c *Config) Redact() map[string]interface{} {
 			"eab_required": c.ACME.EABRequired,
 		},
 		"crl": map[string]interface{}{
-			"refresh_interval":     c.CRL.RefreshInterval.String(),
-			"validity":             c.CRL.Validity.String(),
-			"delta_enabled":        c.CRL.DeltaEnabled,
+			"refresh_interval":      c.CRL.RefreshInterval.String(),
+			"validity":              c.CRL.Validity.String(),
+			"delta_enabled":         c.CRL.DeltaEnabled,
 			"base_refresh_interval": c.CRL.BaseRefreshInterval.String(),
 		},
 		"log": map[string]interface{}{

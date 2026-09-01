@@ -75,7 +75,7 @@ func TestNewOrderWildcardChallengeRestriction(t *testing.T) {
 	}
 	_ = store.CreateACMEAccount(ctx, account)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	order, challenges, prob := svc.NewOrder(ctx, account, prov, []Identifier{
 		{Type: "dns", Value: "*.example.com"},

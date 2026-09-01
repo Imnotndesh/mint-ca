@@ -51,7 +51,7 @@ func BuildRouter(
 
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
-		handlers.NewSSHCAHandler(sshcaEngine, store,sshKRLMgr).RegisterPublicRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterPublicRoutes(r)
 	})
 
 	r.Group(func(r chi.Router) {
@@ -60,7 +60,7 @@ func BuildRouter(
 		r.Use(apimiddleware.Audit(store))
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
-		handlers.NewSSHCAHandler(sshcaEngine, store,sshKRLMgr).RegisterRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterRoutes(r)
 		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
@@ -71,7 +71,12 @@ func BuildRouter(
 	})
 
 	if cfg.ACME.Enabled {
-		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, cfg.ACME.BaseURL)
+		caaChecker := internalacme.NewCAAChecker(
+			cfg.ACME.CAADomain,
+			cfg.ACME.CAADNSServer,
+			internalacme.SplitBypassLabels(cfg.ACME.CAABypassLabels),
+		)
+		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, caaChecker, cfg.ACME.BaseURL)
 		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
 	}
 
