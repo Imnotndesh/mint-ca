@@ -264,6 +264,17 @@ CREATE TABLE IF NOT EXISTS policies (
 	created_at      DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS profiles (
+	id                 TEXT    NOT NULL PRIMARY KEY,
+	name               TEXT    NOT NULL UNIQUE,
+	allowed_key_algos  TEXT    NOT NULL DEFAULT '[]',
+	min_ttl_seconds    INTEGER NOT NULL DEFAULT 0,
+	max_ttl_seconds    INTEGER NOT NULL DEFAULT 0,
+	require_san        INTEGER NOT NULL DEFAULT 0,
+	allow_wildcard     INTEGER NOT NULL DEFAULT 0,
+	created_at         DATETIME NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS provisioners (
 	id         TEXT NOT NULL PRIMARY KEY,
 	ca_id      TEXT NOT NULL REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
@@ -1223,6 +1234,119 @@ func (s *sqliteStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
 		return fmt.Errorf("sqlite: DeletePolicy: %w", err)
 	}
 	return nil
+}
+
+// ---- certificate profiles ----
+
+func writeProfileArgs(p *Profile) []interface{} {
+	aka, _ := marshalStringSlice(p.AllowedKeyAlgos)
+	rs, aw := 0, 0
+	if p.RequireSAN {
+		rs = 1
+	}
+	if p.AllowWildcard {
+		aw = 1
+	}
+	return []interface{}{
+		p.ID.String(), p.Name, aka, p.MinTTLSeconds, p.MaxTTLSeconds,
+		rs, aw, p.CreatedAt.UTC(),
+	}
+}
+
+func (s *sqliteStore) CreateProfile(ctx context.Context, p *Profile) error {
+	args := writeProfileArgs(p)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO profiles
+			(id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
+			 require_san, allow_wildcard, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateProfile: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetProfile(ctx context.Context, id uuid.UUID) (*Profile, error) {
+	row := s.db.QueryRowContext(ctx, profileSelectSQL+" WHERE id = ?", id.String())
+	return scanProfileRow(row)
+}
+
+func (s *sqliteStore) GetProfileByName(ctx context.Context, name string) (*Profile, error) {
+	row := s.db.QueryRowContext(ctx, profileSelectSQL+" WHERE name = ?", name)
+	return scanProfileRow(row)
+}
+
+func (s *sqliteStore) ListProfiles(ctx context.Context) ([]*Profile, error) {
+	rows, err := s.db.QueryContext(ctx, profileSelectSQL+" ORDER BY name ASC")
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListProfiles: %w", err)
+	}
+	defer rows.Close()
+	var out []*Profile
+	for rows.Next() {
+		p, err := scanProfileRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpdateProfile(ctx context.Context, p *Profile) error {
+	args := writeProfileArgs(p)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE profiles SET
+			name = ?, allowed_key_algos = ?, min_ttl_seconds = ?,
+			max_ttl_seconds = ?, require_san = ?, allow_wildcard = ?
+		WHERE id = ?`, args[1], args[2], args[3], args[4], args[5], args[6], args[0])
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateProfile: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateProfile: profile %s not found", p.ID)
+	}
+	return nil
+}
+
+func (s *sqliteStore) DeleteProfile(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM profiles WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: DeleteProfile: %w", err)
+	}
+	return nil
+}
+
+const profileSelectSQL = `
+	SELECT id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
+	       require_san, allow_wildcard, created_at
+	FROM profiles`
+
+func scanProfileRow(row *sql.Row) (*Profile, error) {
+	p, err := scanProfileFields(func(dest ...interface{}) error { return row.Scan(dest...) })
+	if err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func scanProfileRows(rows *sql.Rows) (*Profile, error) {
+	return scanProfileFields(rows.Scan)
+}
+
+func scanProfileFields(scan func(...interface{}) error) (*Profile, error) {
+	var p Profile
+	var idStr, akaStr string
+	var rs, aw int
+	err := scan(&idStr, &p.Name, &akaStr, &p.MinTTLSeconds, &p.MaxTTLSeconds, &rs, &aw, &p.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	p.ID = uuid.MustParse(idStr)
+	p.AllowedKeyAlgos, _ = unmarshalStringSlice(akaStr)
+	p.RequireSAN = rs == 1
+	p.AllowWildcard = aw == 1
+	return &p, nil
 }
 
 func (s *sqliteStore) CreateACMEAccount(ctx context.Context, a *ACMEAccount) error {
