@@ -39,6 +39,7 @@ func (h *CertHandler) RegisterRoutes(r chi.Router) {
 	r.Route("/api/v1/certs", func(r chi.Router) {
 		r.Post("/issue", h.issue)
 		r.Post("/sign", h.signCSR)
+		r.Post("/batch/sign", h.batchSignCSR)
 		r.Get("/{certID}", h.get)
 		r.Get("/serial/{serial}", h.getBySerial)
 		r.Get("/ca/{caID}", h.listByCA)
@@ -237,6 +238,100 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 		"cert_pem":    string(issued.CertPEM),
 		"chain_pem":   string(issued.ChainPEM),
 	})
+}
+
+// batchSignCSR signs many caller-provided CSRs in one request (fleet/embedded
+// provisioning). Each item is validated and signed independently; an item that
+// fails is reported with an error and does not abort the rest (partial failure).
+func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CAID          string          `json:"ca_id"`
+		ProvisionerID string          `json:"provisioner_id"`
+		Items         []batchSignItem `json:"items"`
+		Metadata      storage.JSON    `json:"metadata"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.Items) == 0 {
+		writeError(w, http.StatusBadRequest, "items must not be empty")
+		return
+	}
+	caID, err := uuid.Parse(req.CAID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid ca_id")
+		return
+	}
+	provID, err := uuid.Parse(req.ProvisionerID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
+		return
+	}
+	if len(req.Items) > 1000 {
+		writeError(w, http.StatusBadRequest, "too many items (max 1000)")
+		return
+	}
+
+	// Per-item metadata overrides the shared metadata when present.
+	results := make([]batchSignResult, 0, len(req.Items))
+	for i, item := range req.Items {
+		res := batchSignResult{Index: i}
+		meta := req.Metadata
+		if item.Metadata != nil {
+			meta = item.Metadata
+		}
+		issued, err := h.engine.SignCSR(r.Context(), ca.SignCSRRequest{
+			CAID:          caID,
+			ProvisionerID: provID,
+			Requester:     actorFromContext(r),
+			CSRPEM:        []byte(item.CSRPEM),
+			TTLSeconds:    item.TTLSeconds,
+			Metadata:      meta,
+		})
+		if err != nil {
+			res.Error = err.Error()
+		} else {
+			res.CertID = issued.Record.ID.String()
+			res.Serial = issued.Record.Serial
+			res.SubjectCN = issued.Record.SubjectCN
+			res.CertPEM = string(issued.CertPEM)
+		}
+		results = append(results, res)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"results": results,
+		"issued":  countIssued(results),
+		"failed":  len(results) - countIssued(results),
+	})
+}
+
+// batchSignItem is one CSR to sign in a batch request.
+type batchSignItem struct {
+	CSRPEM     string       `json:"csr_pem"`
+	TTLSeconds int64        `json:"ttl_seconds"`
+	Metadata   storage.JSON `json:"metadata,omitempty"`
+}
+
+// batchSignResult is the per-item outcome.
+type batchSignResult struct {
+	Index     int    `json:"index"`
+	CertID    string `json:"cert_id,omitempty"`
+	Serial    string `json:"serial,omitempty"`
+	SubjectCN string `json:"subject_cn,omitempty"`
+	CertPEM   string `json:"cert_pem,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func countIssued(results []batchSignResult) int {
+	n := 0
+	for _, res := range results {
+		if res.Error == "" {
+			n++
+		}
+	}
+	return n
 }
 
 func (h *CertHandler) get(w http.ResponseWriter, r *http.Request) {
