@@ -32,7 +32,7 @@ func TestNewPreAuth_CreatesStandaloneAuthorization(t *testing.T) {
 	}
 	_ = store.CreateACMEAccount(ctx, account)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	auth, challenges, prob := svc.NewPreAuth(ctx, account, prov, Identifier{Type: "dns", Value: "pre.example.com"})
 	if prob != nil {
@@ -75,7 +75,7 @@ func TestNewPreAuth_ReusesValidStandaloneAuthz(t *testing.T) {
 	}
 	_ = store.CreateACMEAccount(ctx, account)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	first, _, prob := svc.NewPreAuth(ctx, account, prov, Identifier{Type: "dns", Value: "reuse.example.com"})
 	if prob != nil {
@@ -117,7 +117,7 @@ func TestNewOrder_ReusesValidStandaloneAuthz_NoDuplicatePending(t *testing.T) {
 	}
 	_ = store.CreateACMEAccount(ctx, account)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	preAuth, _, prob := svc.NewPreAuth(ctx, account, prov, Identifier{Type: "dns", Value: "order-reuse.example.com"})
 	if prob != nil {
@@ -161,7 +161,7 @@ func TestNewPreAuth_OwnershipIsolation(t *testing.T) {
 	_ = store.CreateACMEAccount(ctx, accountA)
 	_ = store.CreateACMEAccount(ctx, accountB)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	authA, _, prob := svc.NewPreAuth(ctx, accountA, prov, Identifier{Type: "dns", Value: "isolated.example.com"})
 	if prob != nil {

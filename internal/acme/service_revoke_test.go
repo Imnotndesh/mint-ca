@@ -52,7 +52,7 @@ func TestRevokeCert_ByAccountKID(t *testing.T) {
 		t.Fatalf("issue cert: %v", err)
 	}
 
-	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, "https://ca.test")
+	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, nil, "https://ca.test")
 
 	certDER := pemToDER(t, issued.CertPEM)
 	if prob := svc.RevokeCert(ctx, certDER, account, nil, nil); prob != nil {
@@ -85,7 +85,7 @@ func TestRevokeCert_WrongAccount_Fails(t *testing.T) {
 		t.Fatalf("issue cert: %v", err)
 	}
 
-	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, "https://ca.test")
+	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, nil, "https://ca.test")
 	certDER := pemToDER(t, issued.CertPEM)
 
 	prob := svc.RevokeCert(ctx, certDER, attacker, nil, nil)
@@ -115,7 +115,7 @@ func TestRevokeCert_AlreadyRevoked(t *testing.T) {
 		t.Fatalf("issue cert: %v", err)
 	}
 
-	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, "https://ca.test")
+	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, nil, "https://ca.test")
 	certDER := pemToDER(t, issued.CertPEM)
 
 	if prob := svc.RevokeCert(ctx, certDER, account, nil, nil); prob != nil {
@@ -148,7 +148,7 @@ func TestRevokeCert_BadReasonCode(t *testing.T) {
 		t.Fatalf("issue cert: %v", err)
 	}
 
-	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, "https://ca.test")
+	svc := NewService(store, engine, NewNonceManager(store, 0), crlMgr, nil, "https://ca.test")
 	certDER := pemToDER(t, issued.CertPEM)
 
 	badReason := 2 // cACompromise — disallowed for ACME clients

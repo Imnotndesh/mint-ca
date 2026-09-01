@@ -47,7 +47,7 @@ func TestNewAccount_RejectsInvalidContact(t *testing.T) {
 	}
 	_ = store.CreateProvisioner(ctx, prov)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	_, _, prob := svc.NewAccount(ctx, prov.ID, []byte(`{"kty":"EC"}`), "thumb-1",
 		[]string{"not-a-uri-no-scheme"}, nil, prov)
@@ -72,7 +72,7 @@ func TestNewAccount_AcceptsValidMailtoContact(t *testing.T) {
 	}
 	_ = store.CreateProvisioner(ctx, prov)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	acct, created, prob := svc.NewAccount(ctx, prov.ID, []byte(`{"kty":"EC"}`), "thumb-2",
 		[]string{"mailto:admin@example.com"}, nil, prov)
@@ -87,7 +87,7 @@ func TestNewAccount_AcceptsValidMailtoContact(t *testing.T) {
 func TestUpdateAccount_RejectsInvalidContact(t *testing.T) {
 	ctx := context.Background()
 	store := NewFakeStore()
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	account := &storage.ACMEAccount{ID: uuid.New(), Status: storage.ACMEAccountStatusValid}
 	_ = store.CreateACMEAccount(ctx, account)
@@ -104,7 +104,7 @@ func TestUpdateAccount_RejectsInvalidContact(t *testing.T) {
 func TestUpdateAccount_AcceptsValidContact(t *testing.T) {
 	ctx := context.Background()
 	store := NewFakeStore()
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	account := &storage.ACMEAccount{ID: uuid.New(), Status: storage.ACMEAccountStatusValid}
 	_ = store.CreateACMEAccount(ctx, account)

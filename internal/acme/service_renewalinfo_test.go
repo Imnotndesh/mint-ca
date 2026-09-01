@@ -16,7 +16,7 @@ func newRenewalService(t *testing.T, cert *storage.Certificate) (*Service, *fake
 	if cert != nil {
 		_ = store.CreateCertificate(ctxTest, cert)
 	}
-	svc := NewService(store, nil, NewNonceManager(NewFakeStore(), 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(NewFakeStore(), 0), nil, nil, "https://ca.test")
 	return svc, store
 }
 

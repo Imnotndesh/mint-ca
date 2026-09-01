@@ -360,11 +360,12 @@ func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 	cfg.SetDefaults()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"newNonce":   base + "/new-nonce",
-		"newAccount": base + "/new-account",
-		"keyChange":  base + "/key-change",
-		"newOrder":   base + "/new-order",
-		"newAuthz":   base + "/new-authz",
+		"newNonce":    base + "/new-nonce",
+		"newAccount":  base + "/new-account",
+		"keyChange":   base + "/key-change",
+		"newOrder":    base + "/new-order",
+		"newAuthz":    base + "/new-authz",
+		"renewalInfo": base + "/renewal-info/",
 		"meta": map[string]interface{}{
 			"externalAccountRequired": cfg.EABRequired,
 			"website":                 h.cfg.BaseURL,

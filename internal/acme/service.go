@@ -116,6 +116,7 @@ type Service struct {
 	http01    *challenge.HTTP01Validator
 	dns01     *challenge.DNS01Validator
 	tlsalpn01 *challenge.TLSALPN01Validator
+	caa       *CAAChecker
 	baseURL   string
 }
 
@@ -133,6 +134,7 @@ func NewService(
 	engine *ca.Engine,
 	nonces *NonceManager,
 	crlMgr *revocation.CRLManager,
+	caa *CAAChecker,
 	baseURL string,
 ) *Service {
 	return &Service{
@@ -143,6 +145,7 @@ func NewService(
 		http01:    challenge.NewHTTP01Validator(),
 		dns01:     challenge.NewDNS01Validator(nil),
 		tlsalpn01: challenge.NewTLSALPN01Validator(443),
+		caa:       caa,
 		baseURL:   strings.TrimRight(baseURL, "/"),
 	}
 }
@@ -411,6 +414,9 @@ func (s *Service) AuthenticateJWK(jws *RawJWS, hdr *ProtectedHeader) (json.RawMe
 	if err != nil {
 		return nil, "", NewProblem(ErrBadPublicKey, 400, err.Error())
 	}
+	if err := AlgorithmMatchesKey(hdr.Algorithm, pub); err != nil {
+		return nil, "", NewProblem(ErrBadSignatureAlg, 400, err.Error())
+	}
 	if err := jws.Verify(pub, hdr.Algorithm); err != nil {
 		return nil, "", ErrUnauthorizedProblem("JWS signature verification failed: " + err.Error())
 	}
@@ -448,10 +454,12 @@ func (s *Service) AuthenticateKID(ctx context.Context, jws *RawJWS, hdr *Protect
 	if err != nil {
 		return nil, ErrServerInternalProblem("marshal stored account key: " + err.Error())
 	}
-
 	pub, err := ParseJWK(jwkBytes)
 	if err != nil {
 		return nil, ErrServerInternalProblem("parse stored account key: " + err.Error())
+	}
+	if err := AlgorithmMatchesKey(hdr.Algorithm, pub); err != nil {
+		return nil, NewProblem(ErrBadSignatureAlg, 400, err.Error())
 	}
 	if err := jws.Verify(pub, hdr.Algorithm); err != nil {
 		return nil, ErrUnauthorizedProblem("JWS signature verification failed: " + err.Error())
@@ -839,6 +847,24 @@ func (s *Service) ValidateChallenge(
 // performPreAuthValidation validates a standalone pre-authorization
 // challenge. Unlike performValidation, there is no order to update — only
 // the challenge and its authorization.
+// enforceCAA checks the RFC 8659 CAA policy for the given identifier during
+// validation and reports whether issuance is permitted. When no CAA checker
+// is configured CAA is not enforced (always permitted). On a DNS lookup error
+// the service fails open (log + permit) so a transient resolver hiccup does not
+// break issuance; an explicit unsupported-critical or unmatched restrictor
+// still denies.
+func (s *Service) enforceCAA(ctx context.Context, identifier string) bool {
+	if s.caa == nil || s.caa.identity == "" {
+		return true
+	}
+	permitted, err := s.caa.Enforce(ctx, identifier)
+	if err != nil {
+		slog.Warn("caa: lookup failed, failing open", "identifier", identifier, "err", err)
+		return true
+	}
+	return permitted
+}
+
 func (s *Service) performPreAuthValidation(
 	ctx context.Context,
 	account *storage.ACMEAccount,
@@ -875,6 +901,15 @@ func (s *Service) performPreAuthValidation(
 
 	now := time.Now().UTC()
 	if valErr != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+
+	// RFC 8659: refuse issuance when CAA does not authorise this CA for the
+	// identifier, even though the challenge itself validated.
+	if !s.enforceCAA(ctx, auth.IdentifierValue) {
+		slog.Warn("caa: refused issuance for identifier", "identifier", auth.IdentifierValue)
 		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
 		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
 		return
@@ -944,6 +979,18 @@ func (s *Service) performValidation(
 
 	now := time.Now().UTC()
 	if valErr != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		if ch.AuthorizationID != nil {
+			_ = s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusInvalid)
+		}
+		return
+	}
+
+	// RFC 8659: refuse issuance when CAA does not authorise this CA for the
+	// identifier, even though the challenge itself validated.
+	if !s.enforceCAA(ctx, identifiers[0].Value) {
+		slog.Warn("caa: refused issuance for identifier", "identifier", identifiers[0].Value)
 		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
 		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
 		if ch.AuthorizationID != nil {

@@ -37,7 +37,7 @@ func TestListOrders(t *testing.T) {
 	_ = store.CreateACMEAccount(ctx, accountA)
 	_ = store.CreateACMEAccount(ctx, accountB)
 
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	// Two orders for account A, one for account B.
 	if _, _, prob := svc.NewOrder(ctx, accountA, prov, []Identifier{{Type: "dns", Value: "a1.example.com"}}); prob != nil {
@@ -83,7 +83,7 @@ func TestListOrders(t *testing.T) {
 
 func TestOrderURLBuildsCorrectly(t *testing.T) {
 	store := NewFakeStore()
-	svc := NewService(store, nil, NewNonceManager(store, 0), nil, "https://ca.test")
+	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	provID := uuid.New()
 	orderID := uuid.New()
