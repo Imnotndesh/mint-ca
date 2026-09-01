@@ -187,11 +187,11 @@ func runLiveStack(m *testing.M) (int, error) {
 	cfg.ACME.BaseURL = baseURL
 
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
-	sshcaEngine := sshca.NewEngine(store, ks)
+	policyEngine := policy.NewEngine(store)
+	sshcaEngine := sshca.NewEngine(store, ks, policyEngine)
 	crlManager := revocation.NewCRLManager(store, ks, baseURL, false)
 	ocspResponder := revocation.NewOCSPResponder(store, ks)
 	sshKRLManager := krl.NewManager(store)
-	policyEngine := policy.NewEngine(store)
 
 	// ---- setup mode over real HTTP (separate ephemeral server; doesn't
 	// need to match baseURL since /setup/* never validates a JWS URL) ----
