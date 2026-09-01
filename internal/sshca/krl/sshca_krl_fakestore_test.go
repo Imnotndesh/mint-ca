@@ -34,19 +34,22 @@ func newKRLFakeStore() *krlFakeStore {
 }
 
 func (f *krlFakeStore) CreateSSHCA(ctx context.Context, ca *storage.SSHCertificateAuthority) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.cas[ca.ID] = ca
 	return nil
 }
 func (f *krlFakeStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*storage.SSHCertificateAuthority, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.cas[id], nil
 }
 func (f *krlFakeStore) GetSSHCAByName(ctx context.Context, name string) (*storage.SSHCertificateAuthority, error) {
 	panic("not implemented")
 }
 func (f *krlFakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificateAuthority, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*storage.SSHCertificateAuthority
 	for _, c := range f.cas {
 		out = append(out, c)
@@ -54,12 +57,14 @@ func (f *krlFakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificat
 	return out, nil
 }
 func (f *krlFakeStore) CreateSSHCertificate(ctx context.Context, cert *storage.SSHCertificate) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.certs[cert.ID] = cert
 	return nil
 }
 func (f *krlFakeStore) GetSSHCertificate(ctx context.Context, id uuid.UUID) (*storage.SSHCertificate, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.certs[id], nil
 }
 func (f *krlFakeStore) GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*storage.SSHCertificate, error) {
@@ -69,7 +74,8 @@ func (f *krlFakeStore) ListSSHCertificatesByCA(ctx context.Context, caID uuid.UU
 	panic("not implemented")
 }
 func (f *krlFakeStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*storage.SSHCertificate, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	var out []*storage.SSHCertificate
 	for _, c := range f.certs {
 		if c.CAID == caID && c.Status == storage.SSHCertStatusRevoked {
@@ -79,7 +85,8 @@ func (f *krlFakeStore) ListRevokedSSHCertificatesByCA(ctx context.Context, caID 
 	return out, nil
 }
 func (f *krlFakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	c, ok := f.certs[id]
 	if !ok {
 		return errKRLNotFound
@@ -90,12 +97,14 @@ func (f *krlFakeStore) RevokeSSHCertificate(ctx context.Context, id uuid.UUID) e
 	return nil
 }
 func (f *krlFakeStore) UpsertSSHKRL(ctx context.Context, k *storage.SSHKRLCache) error {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.krls[k.CAID] = k
 	return nil
 }
 func (f *krlFakeStore) GetSSHKRL(ctx context.Context, caID uuid.UUID) (*storage.SSHKRLCache, error) {
-	f.mu.Lock(); defer f.mu.Unlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	return f.krls[caID], nil
 }
 
