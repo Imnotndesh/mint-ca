@@ -18,7 +18,7 @@ Create a new self‑signed root CA.
   "country": "US",                    // optional
   "state": "California",              // optional
   "locality": "San Francisco",        // optional
-  "key_algo": "ecdsa-p256",           // ecdsa-p256, ecdsa-p384, rsa-2048, rsa-4096
+  "key_algo": "ecdsa-p256",           // ecdsa-p256, ecdsa-p384, rsa-2048, rsa-4096, ed25519
   "ttl_days": 3650                    // validity in days, default 3650
 }
 ```
@@ -84,6 +84,51 @@ Revoke a CA (no longer usable for issuing). No request body.
 { "status": "revoked" }
 ```
 
+### `POST /api/v1/ca/{caID}/rekey`
+Rotate a CA's signing key while preserving its identity and hierarchy position.
+Creates a NEW active CA row (new ID, new key, new SubjectKeyId, same Subject,
+same name constraints) signed by the same issuer (or self for a root). The
+previous CA row is marked **`superseded`** — it stops signing new certificates
+but already-issued leafs remain valid (they keep their original CAID). The new
+row keeps the same **`logical_ca_id`** as its predecessor, so provisioners and
+`ResolveActiveCA` keep resolving to it automatically — **no provisioner
+repointing is required** after a re-key.
+
+**Request body**
+```json
+{
+  "key_algo": "ecdsa-p256", // optional; defaults to the current key algorithm
+  "ttl_days": 365            // optional; defaults to remaining lifetime of the old CA
+}
+```
+
+**Response (201 Created)**: the new (active) `CertificateAuthority` object.
+
+### `POST /api/v1/ca/{caID}/cross-sign`
+Issue a cross-signed certificate for CA `{caID}`'s existing public key + subject,
+signed by a different CA. This builds a trust bridge during CA transitions
+(e.g. an old root cross-signing a new root so clients trusting the old root can
+validate the new root). The target CA's keypair is reused — this is a parallel
+certificate from another issuer, stored in `ca_cross_certs`.
+
+**Request body**
+```json
+{
+  "signing_ca_id": "signer-ca-uuid", // required; must differ from {caID}
+  "ttl_days": 1825                   // optional
+}
+```
+
+**Response (201 Created)**: the stored cross-signed `CrossCert` object.
+
+### `GET /api/v1/ca/{caID}/cross-certs`
+List all cross-signed certificates issued for `{caID}`.
+
+### `GET /pki/{caID}/chain/cross/{signingCAID}`
+Public (no auth). PEM chain of the cross cert (target's public key signed by
+`{signingCAID}`) followed by the signer's own chain up to its root. For clients
+that trust the signing CA but not the target's native issuer.
+
 ---
 
 ## 1.2 Certificates
@@ -104,9 +149,16 @@ Generate a new key pair and issue a certificate.
   "key_algo": "ecdsa-p256",
   "server_auth": true,
   "client_auth": false,
+  "profile": "web",                 // optional: enforce a named certificate profile
+  "store_key": false,                 // optional: escrow the generated key for later retrieval
+  "key_passcode": "",                // optional: passcode-guard the escrowed key
   "metadata": { "environment": "prod" }
 }
 ```
+The generated private key is returned once in `key_pem` and **not stored** unless
+`store_key` is true. When `store_key` is true the key is encrypted at rest and
+can be retrieved later via `GET /api/v1/certs/{certID}/key` (or included in an
+export) — supplying `key_passcode` makes that retrieval require the passcode.
 
 **Response (201 Created)**
 ```json
@@ -156,6 +208,83 @@ Revoke a certificate.
 { "status": "revoked" }
 ```
 
+### `POST /api/v1/certs/batch/sign`
+Sign many CSRs in one request (fleet / embedded provisioning). Each item is
+validated and signed independently; a failing item is reported and does not
+abort the rest.
+
+**Request body**
+```json
+{
+  "ca_id": "550e8400-e29b-41d4-a716-446655440000",
+  "provisioner_id": "provisioner-uuid",
+  "metadata": { "env": "prod" },          // shared metadata (optional)
+  "items": [
+    { "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...", "ttl_seconds": 3600, "metadata": {} },
+    { "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...", "ttl_seconds": 7200 }
+  ]
+}
+```
+Max 1000 items. Per‑item `metadata` overrides the shared metadata.
+
+**Response (200 OK)**
+```json
+{
+  "results": [
+    { "index": 0, "cert_id": "...", "serial": "...", "subject_cn": "...", "cert_pem": "..." },
+    { "index": 1, "error": "ca: SignCSR: ..." }
+  ],
+  "issued": 1,
+  "failed": 1
+}
+```
+
+### `GET /api/v1/certs/{certID}/key`
+Retrieve the escrowed private key for a certificate. Only available when the
+certificate was issued with `store_key: true`. If a key passcode was set at
+issue, it must be supplied here.
+
+**Query parameters**
+| Param | Description |
+|-------|-------------|
+| `passcode` | The key passcode, required when the key is passcode‑protected. |
+
+**Response (200 OK)** – `text/plain`, the PEM‑encoded private key.
+
+`404` if the key was not stored (`store_key` was false). `400` if a passcode is
+required but missing or incorrect.
+
+### `GET /api/v1/certs/{certID}/export`
+Download a tar.gz bundle of a certificate: `cert.pem`, `chain.pem`
+(leaf + intermediates + root), `cert.json` manifest, `README.txt`, and
+`key.pem` when the key was escrowed and a valid `passcode` is supplied.
+
+**Query parameters**
+| Param | Description |
+|-------|-------------|
+| `passcode` | Required to include `key.pem` when the key is passcode‑protected. |
+
+### Auto‑renewal webhook (background, not request/response)
+When `MINT_RENEWAL_ENABLED` and `MINT_RENEWAL_WEBHOOK_URL` are set, a background
+worker scans active certificates whose `NotAfter` is within
+`MINT_RENEWAL_LEAD_SECONDS` (default 7 days) and sends an HTTP **POST** with a JSON
+body to the webhook URL per certificate, so an external system can renew it:
+
+```json
+{
+  "cert_id": "550e8400-e29b-41d4-a716-446655440000",
+  "ca_id": "...",
+  "serial": "12345",
+  "subject_cn": "api.example.com",
+  "expires_at": "2026-01-01T00:00:00Z",
+  "days_left": 5,
+  "key_escrowed": false
+}
+```
+The worker is a generic trigger: the deliverer is pluggable, so other
+integrations (ACME re‑issue, a management callback, the `mca` CLI) can be wired
+to the same scan without changing it.
+
 ---
 
 ## 1.3 Provisioners
@@ -201,6 +330,44 @@ Disable a provisioner. No request body.
 ---
 
 ## 1.4 Policies
+
+Certificates can also be constrained by a **profile** (`storage.Profile`) — a
+reusable set of constraints (`allowed_key_algos`, `min/max_ttl_seconds`,
+`require_san`, `allow_wildcard`) evaluated by `policy.EvaluateProfile`. A
+provisioner may pin one via its `profile_id`.
+
+### `POST /api/v1/profiles`
+Create a named certificate profile.
+
+**Request body**
+```json
+{
+  "name": "web",
+  "allowed_key_algos": ["ecdsa-p256"],
+  "min_ttl_seconds": 3600,
+  "max_ttl_seconds": 86400,
+  "require_san": true,
+  "allow_wildcard": false
+}
+```
+**Response (201 Created)** – the created profile object.
+
+### `GET /api/v1/profiles`
+List all profiles.
+
+### `GET /api/v1/profiles/{profileID}`
+Get a single profile.
+
+### `PUT /api/v1/profiles/{profileID}`
+Update a profile (same body as create).
+
+### `DELETE /api/v1/profiles/{profileID}`
+Delete a profile.
+
+**Referencing a profile at issuance:** `POST /api/v1/certs/issue` accepts an
+optional `"profile": "<name>"` field; the named profile is resolved and enforced
+with `policy.EvaluateProfile` (key‑algo, TTL min/max, require‑SAN, wildcard)
+before any crypto work.
 
 ### `POST /api/v1/policies`
 Create a new certificate issuance policy.
@@ -277,9 +444,13 @@ Create a new management API key.
   "name": "my-key",
   "scopes": ["*"],                // scope strings, "*" for all
   "ca_id": "ca-uuid",             // optional, restrict to a CA
-  "expires_in_seconds": 31536000
+  "expires_in_seconds": 31536000,  // optional; default applies when omitted
+  "never_expires": false           // optional; true for an explicit never‑expiring key
 }
 ```
+When `expires_in_seconds` is omitted (and `never_expires` is false), a
+conservative default lifetime of **90 days** is applied so automation tokens are
+rotated by default rather than long‑lived. Keys are enforced to be rejected after	expiry, and `last_used` is tracked per key.
 
 **Response (201 Created)**
 ```json
@@ -295,6 +466,16 @@ Create a new management API key.
 
 ### `GET /api/v1/apikeys`
 List all API keys (only metadata, no keys).
+
+### `POST /api/v1/apikeys/{keyID}/rotate`
+Issue a fresh bearer token for an existing key identity. Keeps its
+name/scopes/CAID; the **previous secret is immediately invalidated** (its hash is
+replaced) — callers must stop using it. No request body.
+
+**Response (200 OK)**
+```json
+{ "id": "key-uuid", "key": "mca_new...", "note": "previous key is now invalid; store this one securely" }
+```
 
 ### `DELETE /api/v1/apikeys/{keyID}`
 Delete an API key.
@@ -356,10 +537,21 @@ mintca_certs_revoked_total 3
 These are served without authentication and are meant for clients to retrieve CRLs, OCSP responses, and CA chains.
 
 ### `GET /pki/{caID}/crl`
-PEM‑encoded CRL.
+PEM‑encoded **base** CRL.
 
 ### `GET /pki/{caID}/crl.der`
-DER‑encoded CRL (content-type `application/pkix-crl`).
+DER‑encoded base CRL (content-type `application/pkix-crl`).
+
+### `GET /pki/{caID}/crl/delta`
+PEM‑encoded **delta** CRL (RFC 5280 §5.2.4). Only populated when delta CRLs are
+enabled (`MINT_CRL_DELTA_ENABLED=true`). A delta carries only the certificates
+revoked after the base CRL's `ThisUpdate` and includes a `deltaCRLIndicator`
+extension pointing back to the base CRL Number. When deltas are enabled and a
+`MINT_ACME_BASE_URL` is set, the base CRL also advertises this address in a
+Freshest CRL extension so RFC 5280‑aware clients can discover it.
+
+### `GET /pki/{caID}/crl/delta.der`
+DER‑encoded delta CRL (content-type `application/pkix-crl`).
 
 ### `POST /pki/{caID}/ocsp`
 OCSP request (DER) in the body, returns DER‑encoded OCSP response.
@@ -369,7 +561,155 @@ Full CA chain in PEM format (the CA’s own certificate plus all ancestors up to
 
 ---
 
-## 1.10 ACME Endpoints
+## 1.10 MTLS Device Enrollment
+
+When the MTLS listener is enabled (`MINT_MTLS_ENABLED`), mint‑ca runs a **second**
+mutual‑TLS listener (default `:8444`) that requires devices to present a client
+certificate chained to the trusted client CA (`MINT_MTLS_CLIENT_CA`). A device is
+authenticated by that certificate and issued a fresh, device‑bound leaf.
+
+### `GET /healthz`
+Liveness of the enrollment listener.
+
+### `GET /enroll`
+Authenticate via the presented client certificate and issue a device leaf.
+The device identity is taken from the presented certificate's `CommonName`
+(and its DNS names become SANs). Requires the presented cert to chain to the
+trusted client CA.
+
+**Response (201 Created)**
+```json
+{
+  "certificate": { "id": "...", "subject_cn": "device-42", ... },
+  "cert_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "key_pem": "-----BEGIN EC PRIVATE KEY-----\n...",
+  "chain_pem": "..."
+}
+```
+
+---
+
+## 1.11 SSH Certificate Authorities
+
+SSH CAs sign **user** and **host** certificates (OpenSSH `-cert.pub` format), distinct from the X.509 CAs above. An SSH CA is a flat signing key — no parent/child chain — and its public key is distributed for clients/servers to trust. Management endpoints require an API key; the public key endpoint under `/pki` does not.
+
+### `POST /api/v1/sshca/`
+Create a new SSH CA signing key.
+
+**Request body**
+```json
+{
+  "name": "my-ssh-ca",      // unique internal name
+  "key_algo": "ed25519"      // "ed25519" (default) or "ecdsa-p256"
+}
+```
+
+**Response (201 Created)**
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "name": "my-ssh-ca",
+  "key_algo": "ssh-ed25519",
+  "public_key": "ssh-ed25519 AAAA... mint-ca",
+  "status": "active",
+  "created_at": "2025-01-01T00:00:00Z"
+}
+```
+
+### `GET /pki/sshca/{caID}/public-key`
+Public (no auth), plaintext `authorized_keys` line. Pipe it straight into `TrustedUserCAKeys` / `known_hosts` or an `@cert-authority` line.
+
+### `GET /api/v1/sshca/`
+List all SSH CAs.
+
+### `GET /api/v1/sshca/{caID}`
+Get a single SSH CA by ID. The ID may be a **logical CA id**: after a re‑key the
+logical id resolves to the currently‑active row (see below).
+
+### `POST /api/v1/sshca/{caID}/rekey`
+Rotate an SSH CA's signing key. Generates a fresh keypair under a new physical
+row that keeps the same **logical CA id**, and marks the old row `superseded` so
+it stops signing new certificates (already‑issued certs remain valid while the
+old public key is still trusted by clients).
+
+**Request body** (optional)
+```json
+{ "key_algo": "ecdsa-p256" }   // optional; defaults to the existing algorithm
+```
+**Response (201 Created)** – the new active SSH CA row.
+
+### `POST /api/v1/sshca/{caID}/cross-sign`
+Create a **parallel active** SSH CA row that shares the target CA's key and
+logical identity without superseding it. Both rows stay active, so clients
+trusting either physical CA id keep working — the SSH analogue of cross‑signing.
+
+**Request body** (optional)
+```json
+{ "target_ca_id": "<uuid>" }   // optional; defaults to {caID}
+```
+**Response (201 Created)** – the new parallel SSH CA row.
+
+> Issuance, `GET {caID}`, `public-key`, and `krl` all resolve a logical or
+> superseded id to the currently‑active row, so a stable `caID` keeps working
+> through key rotation.
+
+### `POST /api/v1/sshca/{caID}/issue` / `.../sign/user` / `.../sign/host`
+Issue (sign) an SSH certificate. `/sign/user` and `/sign/host` are fixed-type aliases of `/issue` (which takes `cert_type` in the body).
+
+**Request body** (all three share this shape)
+```json
+{
+  "provisioner_id": "provisioner-uuid",
+  "public_key": "ssh-ed25519 AAAA... mykey",   // authorized_keys line OR raw base64 wire format
+  "principals": ["alice", "ops"],              // usernames (user) or hostnames (host); at least one
+  "key_id": "alice",                            // free-text label in the certificate
+  "ttl_seconds": 28800,                          // optional; default 8h user / 1y host
+  // optional OpenSSH critical options (force-command, source-address, ...):
+  "critical_options": { "force-command": "/opt/gateway", "source-address": "203.0.113.0/24" },
+  // optional extra extensions (permit-open, permit-listen, ...). Merged over
+  // the built-in default permit-* set — defaults are retained unless overridden:
+  "extensions": { "permit-open": "host:22" }
+}
+```
+
+**Response (201 Created)**
+```json
+{
+  "certificate": { "id": "...", "ca_id": "...", "serial": 12345, "cert_type": "user", ... },
+  "cert_data": "ssh-ed25519-cert-v01@openssh.com AAAA..."   // -cert.pub format, write to disk
+}
+```
+
+### `GET /api/v1/sshca/{caID}/certs`
+List all certificates issued by an SSH CA.
+
+### `GET /api/v1/sshca/certs/{certID}`
+Get a single SSH certificate by ID.
+
+### `GET /api/v1/sshca/certs/serial/{caID}/{serial}`
+Get an SSH certificate by its CA ID and decimal serial.
+
+### `PUT /api/v1/sshca/certs/{certID}/revoke`
+Revoke an SSH certificate. No request body.
+
+**Response (200 OK)**
+```json
+{ "status": "revoked" }
+```
+
+### `GET /pki/sshca/{caID}/krl`
+Public (no auth). Binary OpenSSH Key Revocation List (`application/octet-stream`), unsigned —
+authenticity relies on HTTPS transport, same trust model as the x509 CRL/OCSP endpoints.
+Each revoked certificate is revoked three ways in the KRL: by certificate serial
+(`KRL_SECTION_CERTIFICATES`), by explicit raw key (`KRL_SECTION_EXPLICIT_KEY`), and by
+SHA256 key fingerprint (`KRL_SECTION_FINGERPRINT_SHA256`). The explicit-key and fingerprint
+sections reject the revoked certificate's underlying plain key even if the certificate is
+never presented — covering both cert- and raw-key-based use.
+
+**Note:** unlike CRL, sshd does not fetch KRLs live. Configure `sshd_config`:
+---
+
+## 1.12 ACME Endpoints
 
 ACME endpoints follow the **RFC 8555** protocol. All POST requests must be wrapped in a JWS.  
 The provisioner ID is part of the URL.  
@@ -386,13 +726,26 @@ Authentication is done via the JWS signature.
 | `/acme/{provisionerID}/order/{orderID}/finalize` | POST | Finalize order with CSR |
 | `/acme/{provisionerID}/challenge/{challengeID}` | POST | Notify server that challenge is ready |
 | `/acme/{provisionerID}/certificate/{certID}` | POST | Download issued certificate |
+| `/acme/{provisionerID}/renewal-info/{certID}` | GET | Renewal window (RFC 9779); the certificate download response also carries a `Link: <...>;rel=renewalInfo` header |
+| `/acme/{provisionerID}/key-change` | POST | Roll account over to a new key (RFC 8555 §7.3.5) |
+
+The renewal-info response body:
+```json
+{
+  "renewalWindow": { "start": "2026-08-16T00:00:00Z", "end": "2026-11-24T00:00:00Z" }
+}
+```
+The window closes at `notAfter` and opens one lead-time earlier, where lead time =
+`max(lifetime/5, 24h)` by default. A provisioner can override the lead time via its
+`renewal_lead_period_seconds` (`ProvisionerConfig`) setting; the window never starts before
+`notBefore`.
 
 See [RFC 8555](https://tools.ietf.org/html/rfc8555) for the exact JWS payloads.  
-The directory response contains URLs for all operations.
+The directory response also includes `"keyChange"` alongside `newNonce`, `newAccount`, `newOrder`, `newAuthz`.
 
 ---
 
-## 1.11 Health & Setup
+## 1.13 Health & Setup
 
 ### `GET /healthz`
 Health check. In setup mode it returns a `status: "setup"` message.
@@ -408,3 +761,86 @@ Request body:
 { "name": "admin", "scopes": ["*"] }
 ```
 Response includes the new API key (store it) and CA chain URL.
+### ACME Key Rollover
+
+`POST /acme/{provisionerID}/key-change`
+
+Outer JWS is signed with the account's **current** key and authenticated via `kid` (same as any other authenticated ACME request). The outer payload is itself a JWS, signed with the **new** key using an inline `jwk` header (no `kid`):
+
+**Inner JWS payload**
+```json
+{
+  "account": "https://ca.example.com/acme/{provisionerID}/account/{accountID}",
+  "oldKey": { "kty": "EC", "crv": "P-256", "x": "...", "y": "..." }
+}
+```
+
+**Response (200 OK)** — empty body, standard ACME headers (`Replay-Nonce`).
+
+Rejected with `urn:ietf:params:acme:error:malformed` if:
+- inner `account` URL doesn't match the authenticated account,
+- inner `oldKey` doesn't match the account's current key,
+- the new key is already registered to another account,
+- the new key was previously retired by any account's rollover (once a key is rolled off, it can never be reused — standard CA practice).
+
+Subject to the `acme_key_change_per_account` rate limiter (default: 5/hour).
+## 1.14 Rate Limiting
+
+mint-ca enforces per-limiter request quotas using a fixed-window algorithm. Limits apply to:
+
+| Limiter | Scope | Default | Purpose |
+|---|---|---|---|
+| `acme_new_account_per_ip` | client IP | 10/hour | ACME `new-account` |
+| `acme_new_order_per_account` | ACME account | 50/hour | ACME `new-order`, `new-authz` |
+| `acme_new_authz_per_account` | ACME account | 50/hour | reserved (currently shares the new-order limiter at call sites) |
+| `acme_key_change_per_account` | ACME account | 5/hour | ACME `key-change` |
+| `apikey_requests_per_key` | API key | 300/min | all `/api/v1/*` management endpoints |
+
+When a limit is exceeded:
+- ACME endpoints return an RFC 8555 `urn:ietf:params:acme:error:rateLimited` problem, HTTP 429, with a `Retry-After` header.
+- Management API endpoints return `{"error":"rate limit exceeded","retry_after_seconds":N}`, HTTP 429, with `Retry-After`.
+
+Every rejection is written to the audit log as event type `rate_limit_exceeded`.
+
+Defaults can be overridden on **first boot only** (a value is never overwritten once a database row exists — see Setup.md). After first boot, editing limiter configs requires direct database access; a management API for this is planned but not yet implemented.
+
+---
+
+## 1.15 CSR Auto-Approval Rules
+
+CSR auto‑approval rules control which CSRs a provisioner may **auto‑sign** without
+review, and enforce best‑of‑default constraints. Managed under
+`/api/v1/approval/csr-rules`.
+
+**Default posture is deny:** a rule whitelists what may be signed. A CSR matching
+a rule is auto‑approved; any non‑matching CommonName, any DNS SAN not in the
+rule's allowlist, or a requested TTL above the rule's cap is refused. When **no**
+rule exists for a provisioner, CSR signing is unchanged (no auto‑approval policy
+governs it). This is opt‑in.
+
+### `POST /api/v1/approval/csr-rules`
+Create a rule.
+
+**Request body**
+```json
+{
+  "provisioner_id": "provisioner-uuid",
+  "name": "internal-fleet",
+  "allowed_common_names": ["^svc-.*\\\\.internal\\\\.example$"],  // optional regexes the CSR CN must match
+  "allowed_dns": ["\\\\.internal\\\\.example$"],                 // regexes EVERY DNS SAN must match
+  "max_ttl_seconds": 86400                                          // optional; default cap 90 days
+}
+```
+**Response (201 Created)** – the stored rule (`enabled: true`).
+
+### `GET /api/v1/approval/csr-rules`
+List rules. Optionally filter with `?provisioner_id=<uuid>`.
+
+### `PUT /api/v1/approval/csr-rules/{ruleID}`
+Edit a rule (same body as create, plus `"enabled"`). 
+
+### `DELETE /api/v1/approval/csr-rules/{ruleID}`
+Delete a rule.
+
+> Enforcement happens on `POST /api/v1/certs/sign`. The TLS/HTTPS config for CAA
+> checking is configured via env (`MINT_ACME_CAA_*`, see Setup.md), not the REST API.

@@ -5,12 +5,16 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	apimiddleware "mint-ca/internal/api/middleware"
+	"mint-ca/internal/ratelimit"
 	"net/http"
+	"strconv"
 	"time"
 
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/config"
+	"mint-ca/internal/setup"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -23,6 +27,7 @@ type ACMEHandler struct {
 	engine  *ca.Engine
 	service *internalacme.Service
 	cfg     config.ACMEConfig
+	rl      *ratelimit.Engine
 }
 
 func NewACMEHandler(
@@ -30,12 +35,14 @@ func NewACMEHandler(
 	engine *ca.Engine,
 	svc *internalacme.Service,
 	cfg config.ACMEConfig,
+	rl *ratelimit.Engine,
 ) *ACMEHandler {
 	return &ACMEHandler{
 		store:   store,
 		engine:  engine,
 		service: svc,
 		cfg:     cfg,
+		rl:      rl,
 	}
 }
 
@@ -48,11 +55,17 @@ func (h *ACMEHandler) RegisterRoutes(r chi.Router) {
 		r.Post("/new-account", h.newAccount)
 		r.Post("/account/{accountID}", h.updateAccount)
 		r.Post("/new-order", h.newOrder)
+		r.Post("/new-authz", h.newAuthz)
 		r.Post("/order/{orderID}", h.getOrder)
 		r.Post("/order/{orderID}/authz/{index}", h.getAuthorization)
 		r.Post("/order/{orderID}/finalize", h.finalizeOrder)
 		r.Post("/challenge/{challengeID}", h.validateChallenge)
 		r.Post("/certificate/{certID}", h.getCertificate)
+		r.Get("/renewal-info/{certID}", h.getRenewalInfo)
+		r.Post("/account/{accountID}", h.updateAccount)
+		r.Post("/account/{accountID}/orders", h.listOrders)
+		r.Post("/revoke-cert", h.revokeCert)
+		r.Post("/key-change", h.keyChange)
 	})
 }
 
@@ -88,7 +101,6 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse JWS to authenticate the account (POST-as-GET)
 	jws, hdr, prob := parseJWS(r)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
@@ -108,7 +120,6 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Load the authorization
 	auth, err := h.store.GetACMEAuthorization(ctx, authID)
 	if err != nil {
 		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load authorization: "+err.Error()))
@@ -119,48 +130,154 @@ func (h *ACMEHandler) getAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Verify the authorization belongs to an order of this account
-	order, err := h.store.GetACMEOrder(ctx, auth.OrderID)
-	if err != nil {
-		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load order: "+err.Error()))
-		return
-	}
-	if order == nil || order.AccountID != account.ID {
-		h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("authorization does not belong to your account"))
-		return
+	// Ownership check: standalone pre-auths carry AccountID directly;
+	// order-bound authz ownership is verified via the parent order.
+	if auth.OrderID == uuid.Nil {
+		if auth.AccountID != account.ID {
+			h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("authorization does not belong to your account"))
+			return
+		}
+	} else {
+		order, err := h.store.GetACMEOrder(ctx, auth.OrderID)
+		if err != nil {
+			h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("load order: "+err.Error()))
+			return
+		}
+		if order == nil || order.AccountID != account.ID {
+			h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("authorization does not belong to your account"))
+			return
+		}
 	}
 
-	// Fetch challenges for this authorization
 	challenges, err := h.store.ListChallengesByAuthorization(ctx, auth.ID)
 	if err != nil {
 		h.acmeProblem(w, r, internalacme.ErrServerInternalProblem("list challenges: "+err.Error()))
 		return
 	}
 
-	// Build challenge objects
-	challengeObjs := make([]map[string]interface{}, len(challenges))
-	for i, c := range challenges {
-		challengeObjs[i] = map[string]interface{}{
-			"type":   string(c.Type),
-			"url":    h.service.ChallengeURL(prov.ID, c.ID),
-			"token":  c.Token,
-			"status": string(c.Status),
+	h.acmeWriteJSON(w, r, http.StatusOK, h.authzResponse(prov.ID, auth, challenges))
+}
+func (h *ACMEHandler) listOrders(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	accountID, err := uuid.Parse(chi.URLParam(r, "accountID"))
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid account ID"))
+		return
+	}
+	if accountID != account.ID {
+		h.acmeProblem(w, r, internalacme.ErrUnauthorizedProblem("orders list does not belong to your account"))
+		return
+	}
+
+	orders, prob := h.service.ListOrders(ctx, account.ID)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	urls := make([]string, len(orders))
+	for i, o := range orders {
+		urls[i] = h.service.OrderURL(prov.ID, o.ID)
+	}
+
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
+		"orders": urls,
+	})
+}
+func (h *ACMEHandler) revokeCert(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	_, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	// RFC 8555 §7.6: revocation may be authenticated by the account key
+	// (kid present) or by the certificate's own key (jwk present).
+	var authAccount *storage.ACMEAccount
+	var authJWK json.RawMessage
+
+	if hdr.KID != "" {
+		account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+		if prob != nil {
+			h.acmeProblem(w, r, prob)
+			return
 		}
+		authAccount = account
+	} else {
+		jwk, _, prob := h.service.AuthenticateJWK(jws, hdr)
+		if prob != nil {
+			h.acmeProblem(w, r, prob)
+			return
+		}
+		authJWK = jwk
 	}
 
-	// Build response
-	resp := map[string]interface{}{
-		"status":  string(auth.Status),
-		"expires": auth.ExpiresAt.Format(time.RFC3339),
-		"identifier": map[string]string{
-			"type":  auth.IdentifierType,
-			"value": auth.IdentifierValue,
-		},
-		"challenges": challengeObjs,
-		"wildcard":   false,
+	payloadBytes, err := jws.PayloadBytes()
+	if err != nil || payloadBytes == nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("revoke-cert requires a payload"))
+		return
+	}
+	var payload struct {
+		Certificate string `json:"certificate"`
+		Reason      *int   `json:"reason,omitempty"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode revoke-cert payload: "+err.Error()))
+		return
+	}
+	certDER, err := base64.RawURLEncoding.DecodeString(payload.Certificate)
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode certificate: "+err.Error()))
+		return
 	}
 
-	h.acmeWriteJSON(w, r, http.StatusOK, resp)
+	if prob := h.service.RevokeCert(ctx, certDER, authAccount, authJWK, payload.Reason); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{})
 }
 
 // parseJWS reads and decodes the JWS body common to all ACME POST requests.
@@ -204,6 +321,30 @@ func requestURL(r *http.Request, cfg config.ACMEConfig) string {
 	return cfg.BaseURL + r.URL.Path
 }
 
+// checkRateLimit evaluates a limiter and, if exceeded, writes the ACME
+// rateLimited problem response (RFC 8555 §6.7 / §8.7) with Retry-After.
+// Returns true if the request was rejected (caller should return
+// immediately without further processing).
+func (h *ACMEHandler) checkRateLimit(w http.ResponseWriter, r *http.Request, limiterName, bucketKey, actor string) bool {
+	allowed, retryAfter, err := h.rl.Check(r.Context(), limiterName, bucketKey)
+	if err != nil {
+		// Misconfigured limiter — fail open, already logged inside Check's
+		// caller responsibility; don't block ACME traffic on a config bug.
+		return false
+	}
+	if !allowed {
+		apimiddleware.WriteRateLimitAudit(h.store, actor, limiterName, bucketKey)
+		nonce, _ := h.service.IssueNonce(r.Context())
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+		internalacme.WriteProblem(w, nonce, internalacme.NewProblem(
+			internalacme.ErrRateLimited,
+			http.StatusTooManyRequests,
+			fmt.Sprintf("rate limit exceeded for %s; retry after %d seconds", limiterName, int(retryAfter.Seconds())),
+		))
+		return true
+	}
+	return false
+}
 func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 	prov, prob := h.loadProvisioner(r)
 	if prob != nil {
@@ -220,16 +361,95 @@ func (h *ACMEHandler) directory(w http.ResponseWriter, r *http.Request) {
 	cfg.SetDefaults()
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"newNonce":   base + "/new-nonce",
-		"newAccount": base + "/new-account",
-		"newOrder":   base + "/new-order",
+		"newNonce":    base + "/new-nonce",
+		"newAccount":  base + "/new-account",
+		"keyChange":   base + "/key-change",
+		"newOrder":    base + "/new-order",
+		"newAuthz":    base + "/new-authz",
+		"renewalInfo": base + "/renewal-info/",
 		"meta": map[string]interface{}{
 			"externalAccountRequired": cfg.EABRequired,
 			"website":                 h.cfg.BaseURL,
+			"termsOfService":          setup.TermsURL(h.cfg.BaseURL),
 		},
 	})
 }
+func (h *ACMEHandler) newAuthz(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
 
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_new_order_per_account", account.ID.String(), account.ID.String()) {
+		return
+	}
+
+	payloadBytes, err := jws.PayloadBytes()
+	if err != nil || payloadBytes == nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("new-authz requires a payload"))
+		return
+	}
+	var payload struct {
+		Identifier internalacme.Identifier `json:"identifier"`
+	}
+	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode new-authz payload: "+err.Error()))
+		return
+	}
+
+	auth, challenges, prob := h.service.NewPreAuth(ctx, account, prov, payload.Identifier)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	authURL := h.service.AuthorizationURL(prov.ID, auth.ID)
+	w.Header().Set("Location", authURL)
+	h.acmeWriteJSON(w, r, http.StatusCreated, h.authzResponse(prov.ID, auth, challenges))
+}
+
+func (h *ACMEHandler) authzResponse(provisionerID uuid.UUID, auth *storage.ACMEAuthorization, challenges []*storage.ACMEChallenge) map[string]interface{} {
+	challengeObjs := make([]map[string]interface{}, len(challenges))
+	for i, c := range challenges {
+		challengeObjs[i] = map[string]interface{}{
+			"type":   string(c.Type),
+			"url":    h.service.ChallengeURL(provisionerID, c.ID),
+			"token":  c.Token,
+			"status": string(c.Status),
+		}
+	}
+	return map[string]interface{}{
+		"status":  string(auth.Status),
+		"expires": auth.ExpiresAt.Format(time.RFC3339),
+		"identifier": map[string]string{
+			"type":  auth.IdentifierType,
+			"value": auth.IdentifierValue,
+		},
+		"challenges": challengeObjs,
+		"wildcard":   internalacme.IsWildcardIdentifier(auth.IdentifierValue),
+	}
+}
 func (h *ACMEHandler) newNonce(w http.ResponseWriter, r *http.Request) {
 	nonce, err := h.service.IssueNonce(r.Context())
 	if err != nil {
@@ -244,12 +464,74 @@ func (h *ACMEHandler) newNonce(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	}
 }
+func (h *ACMEHandler) keyChange(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
 
+	jws, hdr, prob := parseJWS(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateNonce(ctx, hdr); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if prob := h.service.ValidateURL(hdr, requestURL(r, h.cfg)); prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_key_change_per_account", account.ID.String(), account.ID.String()) {
+		return
+	}
+
+	innerPayload, err := jws.PayloadBytes()
+	if err != nil || innerPayload == nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("key-change requires a payload"))
+		return
+	}
+	var innerJWS internalacme.RawJWS
+	if err := json.Unmarshal(innerPayload, &innerJWS); err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode inner JWS: "+err.Error()))
+		return
+	}
+
+	accountURL := h.service.AccountURL(prov.ID, account.ID)
+	updated, prob := h.service.KeyChange(ctx, account, &innerJWS, accountURL)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	entry := &storage.AuditLog{
+		ID:        uuid.New(),
+		EventType: "acme_key_change",
+		Actor:     "acme-account:" + updated.ID.String(),
+		Payload:   storage.JSON{"new_key_id": updated.KeyID},
+		CreatedAt: time.Now().UTC(),
+	}
+	go func() { _ = h.store.WriteAuditLog(context.Background(), entry) }()
+
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{})
+}
 func (h *ACMEHandler) newAccount(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	prov, prob := h.loadProvisioner(r)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_new_account_per_ip", r.RemoteAddr, r.RemoteAddr) {
 		return
 	}
 
@@ -405,6 +687,9 @@ func (h *ACMEHandler) newOrder(w http.ResponseWriter, r *http.Request) {
 	account, prob := h.service.AuthenticateKID(ctx, jws, hdr)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
+		return
+	}
+	if h.checkRateLimit(w, r, "acme_new_order_per_account", account.ID.String(), account.ID.String()) {
 		return
 	}
 
@@ -667,8 +952,47 @@ func (h *ACMEHandler) getCertificate(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Replay-Nonce", nonce)
 	w.Header().Set("Content-Type", "application/pem-certificate-chain")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Link", "<"+h.service.RenewalInfoURL(prov.ID, certID)+">;rel=\"renewalInfo\"")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(chainPEM)
+}
+
+func (h *ACMEHandler) getRenewalInfo(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	prov, prob := h.loadProvisioner(r)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	certID, err := uuid.Parse(chi.URLParam(r, "certID"))
+	if err != nil {
+		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("invalid certificate ID"))
+		return
+	}
+
+	// Provisioner may override the renewal lead time; 0 means service default.
+	var cfg internalacme.ProvisionerConfig
+	if raw, err := json.Marshal(prov.Config); err == nil {
+		_ = json.Unmarshal(raw, &cfg)
+	}
+	cfg.SetDefaults()
+	override := time.Duration(cfg.RenewalLeadPeriodSeconds) * time.Second
+
+	window, prob := h.service.RenewalInfo(ctx, certID, override)
+	if prob != nil {
+		h.acmeProblem(w, r, prob)
+		return
+	}
+
+	// GET endpoint: no Replay-Nonce required (no subsequent POST in the same flow).
+	w.Header().Set("Cache-Control", "no-store")
+	h.acmeWriteJSON(w, r, http.StatusOK, map[string]interface{}{
+		"renewalWindow": map[string]string{
+			"start": window.Start.UTC().Format(time.RFC3339),
+			"end":   window.End.UTC().Format(time.RFC3339),
+		},
+	})
 }
 
 func accountResponse(a *storage.ACMEAccount, accountURL string) map[string]interface{} {

@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -59,28 +60,27 @@ func NewEngine(store storage.Store) *Engine {
 //  2. If the provisioner has a policy attached, evaluate it. Result is final.
 //  3. If not, look for a CA-scoped policy. Evaluate it if found. Result is final.
 //  4. If no policy applies, permit.
-func (e *Engine) Evaluate(ctx context.Context, req CertRequest) error {
+func (e *Engine) Evaluate(ctx context.Context, req CertRequest) (*storage.Policy, error) {
 	if req.ProvisionerID == uuid.Nil {
-		return errors.New("policy: ProvisionerID is required")
+		return nil, errors.New("policy: ProvisionerID is required")
 	}
 	if req.CAID == uuid.Nil {
-		return errors.New("policy: CAID is required")
+		return nil, errors.New("policy: CAID is required")
 	}
 
 	provisioner, err := e.store.GetProvisioner(ctx, req.ProvisionerID)
 	if err != nil {
-		return fmt.Errorf("policy: load provisioner: %w", err)
+		return nil, fmt.Errorf("policy: load provisioner: %w", err)
 	}
 	if provisioner == nil {
-		return fmt.Errorf("policy: provisioner %s does not exist", req.ProvisionerID)
+		return nil, fmt.Errorf("policy: provisioner %s does not exist", req.ProvisionerID)
 	}
 	if provisioner.Status != storage.ProvisionerStatusActive {
-		return fmt.Errorf("policy: provisioner %q is disabled", provisioner.Name)
+		return nil, fmt.Errorf("policy: provisioner %q is disabled", provisioner.Name)
 	}
 
-	// Confirm the provisioner actually belongs to the CA being requested.
 	if provisioner.CAID != req.CAID {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"policy: provisioner %q belongs to CA %s, not %s",
 			provisioner.Name, provisioner.CAID, req.CAID,
 		)
@@ -89,32 +89,69 @@ func (e *Engine) Evaluate(ctx context.Context, req CertRequest) error {
 	if provisioner.PolicyID != nil {
 		pol, err := e.store.GetPolicy(ctx, *provisioner.PolicyID)
 		if err != nil {
-			return fmt.Errorf("policy: load provisioner policy: %w", err)
+			return nil, fmt.Errorf("policy: load provisioner policy: %w", err)
 		}
 		if pol != nil {
 			if err := evaluate(pol, req); err != nil {
-				return fmt.Errorf("policy: provisioner %q denied: %w", provisioner.Name, err)
+				return nil, fmt.Errorf("policy: provisioner %q denied: %w", provisioner.Name, err)
 			}
-			// Provisioner policy passed — result is final.
-			return nil
+			return pol, nil
 		}
 	}
 
 	caPolicy, err := e.findCAPolicy(ctx, req.CAID)
 	if err != nil {
-		return fmt.Errorf("policy: load CA policy: %w", err)
+		return nil, fmt.Errorf("policy: load CA policy: %w", err)
 	}
 	if caPolicy != nil {
 		if err := evaluate(caPolicy, req); err != nil {
-			return fmt.Errorf("policy: CA policy denied: %w", err)
+			return nil, fmt.Errorf("policy: CA policy denied: %w", err)
 		}
-		return nil
+		return caPolicy, nil
 	}
 
-	return nil
+	return nil, nil
 }
 
-// findCAPolicy scans all policies looking for one scoped to the given CA.
+// EvaluateSSH checks req against the SSH policy attached to provisionerID.
+// It returns the effective SSHDecision, or an error if denied. A nil decision
+// with nil error means no SSH policy applies to the provisioner, so issuance
+// is unrestricted by policy.
+func (e *Engine) EvaluateSSH(ctx context.Context, provisionerID uuid.UUID, req SSHCertRequest) (*SSHDecision, error) {
+	if provisionerID == uuid.Nil {
+		return nil, errors.New("policy: provisioner ID is required")
+	}
+	provisioner, err := e.store.GetProvisioner(ctx, provisionerID)
+	if err != nil {
+		return nil, fmt.Errorf("policy: load provisioner: %w", err)
+	}
+	if provisioner == nil {
+		return nil, fmt.Errorf("policy: provisioner %s does not exist", provisionerID)
+	}
+	if provisioner.Status != storage.ProvisionerStatusActive {
+		return nil, fmt.Errorf("policy: provisioner %q is disabled", provisioner.Name)
+	}
+	if provisioner.PolicyID == nil {
+		return nil, nil
+	}
+	pol, err := e.store.GetPolicy(ctx, *provisioner.PolicyID)
+	if err != nil {
+		return nil, fmt.Errorf("policy: load policy: %w", err)
+	}
+	if pol == nil || len(pol.SSHPolicy) == 0 {
+		return nil, nil
+	}
+	var body SSHPolicyBody
+	if err := json.Unmarshal(pol.SSHPolicy, &body); err != nil {
+		return nil, fmt.Errorf("policy: parse SSH policy: %w", err)
+	}
+	d, err := EvaluateSSH(&body, req)
+	if err != nil {
+		return nil, fmt.Errorf("policy: provisioner %q denied: %w", provisioner.Name, err)
+	}
+	return d, nil
+}
+
 // This is a scan rather than a direct lookup because the current schema does
 // not have a direct FK from certificate_authorities to policies — policies are
 // attached via provisioners or by convention of scope. A CA-scoped policy is
@@ -233,6 +270,55 @@ func evaluate(pol *storage.Policy, req CertRequest) error {
 	return nil
 }
 
+// EvaluateProfile checks a certificate issuance request against a named
+// profile's constraints. An empty profile (all zero values) allows everything.
+// It is independent of the database-backed Policy evaluation and can be used
+// for provisioner-pinned or per-request profiles.
+func EvaluateProfile(prof *storage.Profile, req CertRequest) error {
+	if prof == nil {
+		return nil
+	}
+
+	if len(prof.AllowedKeyAlgos) > 0 && req.KeyAlgo != "" {
+		if !containsString(prof.AllowedKeyAlgos, req.KeyAlgo) {
+			return fmt.Errorf(
+				"profile: key algorithm %q is not permitted; allowed: %s",
+				req.KeyAlgo, strings.Join(prof.AllowedKeyAlgos, ", "),
+			)
+		}
+	}
+
+	if prof.MaxTTLSeconds > 0 && req.TTLSeconds > prof.MaxTTLSeconds {
+		return fmt.Errorf(
+			"profile: requested TTL %d exceeds profile maximum of %d",
+			req.TTLSeconds, prof.MaxTTLSeconds,
+		)
+	}
+	if prof.MinTTLSeconds > 0 && req.TTLSeconds > 0 && req.TTLSeconds < prof.MinTTLSeconds {
+		return fmt.Errorf(
+			"profile: requested TTL %d is below profile minimum of %d",
+			req.TTLSeconds, prof.MinTTLSeconds,
+		)
+	}
+
+	if prof.RequireSAN {
+		hasSAN := len(req.SANsDNS) > 0 || len(req.SANsIP) > 0 || len(req.SANsEmail) > 0
+		if !hasSAN {
+			return errors.New("profile requires at least one Subject Alternative Name")
+		}
+	}
+
+	if !prof.AllowWildcard {
+		for _, dns := range req.SANsDNS {
+			if strings.HasPrefix(dns, "*.") || dns == "*" {
+				return fmt.Errorf("profile: wildcard DNS SAN %q is not permitted", dns)
+			}
+		}
+	}
+
+	return nil
+}
+
 // matchDomain reports whether domain matches pattern.
 //
 // Rules:
@@ -254,6 +340,12 @@ func matchDomain(pattern, domain string) bool {
 	// Exact match.
 	if pattern == domain {
 		return true
+	}
+
+	// Bare "*" matches any single label with no dots (RFC-style single-label
+	// wildcard). E.g. "*" matches "foo" but not "foo.com" or "foo.bar.com".
+	if pattern == "*" {
+		return domain != "" && !strings.Contains(domain, ".")
 	}
 
 	// Wildcard match: pattern must start with "*." and the remainder must
