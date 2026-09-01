@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/sha1"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
@@ -20,6 +21,30 @@ import (
 	"github.com/google/uuid"
 	"golang.org/x/crypto/ocsp"
 )
+
+var idPkixOcspNonce = asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 2}
+
+const maxOCSPNonceSize = 32
+
+func extractOCSPNonce(requestDER []byte) ([]byte, error) {
+	var req struct {
+		TBSRequest struct {
+			Version       int           `asn1:"optional,explicit,tag:0,default:0"`
+			RequesterName asn1.RawValue `asn1:"optional,explicit,tag:1"`
+			RequestList   []asn1.RawValue
+			Extensions    []pkix.Extension `asn1:"optional,explicit,tag:2"`
+		}
+	}
+	if _, err := asn1.Unmarshal(requestDER, &req); err != nil {
+		return nil, fmt.Errorf("ocsp: parse request for nonce: %w", err)
+	}
+	for _, ext := range req.TBSRequest.Extensions {
+		if ext.Id.Equal(idPkixOcspNonce) {
+			return ext.Value, nil
+		}
+	}
+	return nil, nil
+}
 
 // OCSPResponder handles OCSP requests for certificates issued by mint-ca CAs.
 type delegatedCache struct {
@@ -59,6 +84,13 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 	if err != nil {
 		return nil, fmt.Errorf("ocsp: parse request: %w", err)
 	}
+	nonce, err := extractOCSPNonce(requestDER)
+	if err != nil {
+		nonce = nil
+	}
+	if len(nonce) > maxOCSPNonceSize {
+		nonce = nonce[:maxOCSPNonceSize]
+	}
 	caRecord, err := r.store.GetCA(ctx, caID)
 	if err != nil {
 		return nil, fmt.Errorf("ocsp: load CA: %w", err)
@@ -91,9 +123,10 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 	switch {
 	case cert == nil:
 		template = ocsp.Response{
-			Status:     ocsp.Unknown,
-			ThisUpdate: thisUpdate,
-			NextUpdate: nextUpdate,
+			Status:       ocsp.Unknown,
+			SerialNumber: req.SerialNumber,
+			ThisUpdate:   thisUpdate,
+			NextUpdate:   nextUpdate,
 		}
 
 	case cert.Status == storage.CertStatusRevoked:
@@ -124,6 +157,13 @@ func (r *OCSPResponder) respond(ctx context.Context, caID uuid.UUID, requestDER 
 			NextUpdate:   nextUpdate,
 		}
 	}
+	if len(nonce) > 0 {
+		template.ExtraExtensions = append(template.ExtraExtensions, pkix.Extension{
+			Id:    idPkixOcspNonce,
+			Value: nonce,
+		})
+	}
+
 	r.mu.Lock()
 	if r.delegates == nil {
 		r.delegates = make(map[string]*delegatedCache)
@@ -167,6 +207,17 @@ func (r *OCSPResponder) generateDelegatedSigner(caCert *x509.Certificate, caKey 
 	if err != nil {
 		return nil, nil, err
 	}
+
+	ski, err := revocationSubjectKeyID(priv.Public())
+	if err != nil {
+		return nil, nil, fmt.Errorf("generateDelegatedSigner: compute subject key id: %w", err)
+	}
+	// caCert may predate explicit SKI support — fall back to recomputing it.
+	aki, err := revocationEnsureSKI(caCert)
+	if err != nil {
+		return nil, nil, fmt.Errorf("generateDelegatedSigner: compute authority key id: %w", err)
+	}
+
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject: pkix.Name{
@@ -175,8 +226,10 @@ func (r *OCSPResponder) generateDelegatedSigner(caCert *x509.Certificate, caKey 
 		NotBefore: time.Now().Add(-5 * time.Minute),
 		NotAfter:  time.Now().Add(7 * 24 * time.Hour),
 
-		KeyUsage:    x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning},
+		KeyUsage:       x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:    []x509.ExtKeyUsage{x509.ExtKeyUsageOCSPSigning},
+		SubjectKeyId:   ski,
+		AuthorityKeyId: aki,
 		ExtraExtensions: []pkix.Extension{
 			{
 				Id:       asn1.ObjectIdentifier{1, 3, 6, 1, 5, 5, 7, 48, 1, 5},
@@ -194,4 +247,29 @@ func (r *OCSPResponder) generateDelegatedSigner(caCert *x509.Certificate, caKey 
 
 	delegatedCert, err := x509.ParseCertificate(derBytes)
 	return delegatedCert, priv, err
+}
+func revocationSubjectKeyID(pub crypto.PublicKey) ([]byte, error) {
+	der, err := x509.MarshalPKIXPublicKey(pub)
+	if err != nil {
+		return nil, fmt.Errorf("revocationSubjectKeyID: marshal public key: %w", err)
+	}
+
+	var spki struct {
+		Algorithm        pkix.AlgorithmIdentifier
+		SubjectPublicKey asn1.BitString
+	}
+	if _, err := asn1.Unmarshal(der, &spki); err != nil {
+		return nil, fmt.Errorf("revocationSubjectKeyID: parse SubjectPublicKeyInfo: %w", err)
+	}
+
+	sum := sha1.Sum(spki.SubjectPublicKey.Bytes)
+	return sum[:], nil
+}
+
+// revocationEnsureSKI returns cert.SubjectKeyId if already populated, or computes it from cert.PublicKey otherwise
+func revocationEnsureSKI(cert *x509.Certificate) ([]byte, error) {
+	if len(cert.SubjectKeyId) > 0 {
+		return cert.SubjectKeyId, nil
+	}
+	return revocationSubjectKeyID(cert.PublicKey)
 }

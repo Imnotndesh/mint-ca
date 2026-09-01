@@ -49,8 +49,20 @@ func NewHandler(
 func (h *Handler) RegisterRoutes(r chi.Router) {
 	r.Route("/setup", func(r chi.Router) {
 		r.Use(h.requireBootstrapKey)
+		r.Get("/terms", h.getTerms)
 		r.Post("/root-ca", h.createRootCA)
 		r.Post("/api-key", h.createAPIKey)
+	})
+}
+
+// getTerms returns the Terms of Service text so the operator can read and
+// agree to it before completing setup. See TermsFor to resolve a configured
+// external URL.
+func (h *Handler) getTerms(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"terms":     DefaultTermsText,
+		"terms_url": TermsURL(h.cfg.ACME.BaseURL),
+		"required":  true, // setup cannot be completed without accepting these terms
 	})
 }
 
@@ -130,12 +142,19 @@ func (h *Handler) createRootCA(w http.ResponseWriter, r *http.Request) {
 type createAPIKeyRequest struct {
 	Name   string   `json:"name"`
 	Scopes []string `json:"scopes"`
+	// TermsAccepted must be true; the operator must explicitly agree to the
+	// Terms of Service before setup can be completed.
+	TermsAccepted bool `json:"terms_accepted"`
 }
 
 func (h *Handler) createAPIKey(w http.ResponseWriter, r *http.Request) {
 	var req createAPIKeyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !req.TermsAccepted {
+		writeError(w, http.StatusBadRequest, "acceptance of the Terms of Service is required to proceed: set \"terms_accepted\": true")
 		return
 	}
 	if req.Name == "" {

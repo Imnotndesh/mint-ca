@@ -42,8 +42,7 @@ type Problem struct {
 
 func (p *Problem) Error() string { return p.Type + ": " + p.Detail }
 
-// NewProblem constructs a Problem with the given ACME error type, HTTP status,
-// and human-readable detail.
+// NewProblem constructs a Problem with the given ACME error type, HTTP status, and human-readable detail.
 func NewProblem(errType string, status int, detail string) *Problem {
 	return &Problem{Type: errType, Status: status, Detail: detail}
 }
@@ -73,7 +72,13 @@ func ErrOrderNotReadyProblem(detail string) *Problem {
 func ErrBadCSRProblem(detail string) *Problem {
 	return NewProblem(ErrBadCSR, http.StatusBadRequest, detail)
 }
+func ErrInvalidContactProblem(detail string) *Problem {
+	return NewProblem(ErrInvalidContact, http.StatusBadRequest, detail)
+}
 
+func ErrUnsupportedContactProblem(detail string) *Problem {
+	return NewProblem(ErrUnsupportedContact, http.StatusBadRequest, detail)
+}
 func ErrExternalAccountRequiredProblem() *Problem {
 	return NewProblem(
 		ErrExternalAccountRequired,

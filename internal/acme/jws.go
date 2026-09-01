@@ -31,8 +31,6 @@ type ProtectedHeader struct {
 	KID       string          `json:"kid,omitempty"` // present on all other requests
 }
 
-// ParseJWS decodes the base64url fields of a RawJWS without verifying the
-// signature. Call VerifyJWS afterward to verify.
 func (r *RawJWS) ParseProtected() (*ProtectedHeader, error) {
 	protBytes, err := b64Decode(r.Protected)
 	if err != nil {
@@ -119,6 +117,26 @@ func ParseJWK(raw json.RawMessage) (crypto.PublicKey, error) {
 		return decodeRSAKey(j)
 	default:
 		return nil, fmt.Errorf("jwk: unsupported key type %q", j.Kty)
+	}
+}
+func AlgorithmMatchesKey(alg string, pub crypto.PublicKey) error {
+	switch pub.(type) {
+	case *ecdsa.PublicKey:
+		switch alg {
+		case "ES256", "ES384":
+			return nil
+		default:
+			return fmt.Errorf("jws: algorithm %q is not valid for an EC key", alg)
+		}
+	case *rsa.PublicKey:
+		switch alg {
+		case "RS256", "RS384", "RS512", "PS256", "PS384", "PS512":
+			return nil
+		default:
+			return fmt.Errorf("jws: algorithm %q is not valid for an RSA key", alg)
+		}
+	default:
+		return fmt.Errorf("jws: unsupported public key type %T", pub)
 	}
 }
 

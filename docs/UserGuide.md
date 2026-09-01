@@ -271,9 +271,152 @@ curl -X PUT http://localhost:8080/api/v1/certs/cert-uuid/revoke \
 
 The revocation is immediately reflected in the next CRL (which is regenerated automatically at a background interval).
 
+**Delta CRLs (optional).** When `MINT_CRL_DELTA_ENABLED=true`, mint‑ca also
+serves a delta CRL at `/pki/{caID}/crl/delta` that carries only the certificates
+revoked since the base CRL. Bases are rebuilt on `MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS`
+and deltas on every `MINT_CRL_REFRESH_INTERVAL_SECONDS` tick (and immediately
+after each revocation), so delta clients get fresh incremental lists without
+waiting for a full re‑scan. Delta mode is opt‑in and leaves existing CRL
+behaviour unchanged when disabled.
+
+## 3.9b Re-keying and Cross-signing (key lifecycle)
+
+**Re-key** (`POST /api/v1/ca/{caID}/rekey`) rotates a CA's signing key while
+preserving its identity. It creates a new active CA row (new key/SKI, same
+Subject), marks the old row **superseded**, and keeps already-issued leafs
+valid (they keep their original CAID). The re-keyed row keeps the same
+`logical_ca_id`, so provisioners and issuance keep resolving to it — there is
+**no need to repoint provisioners** after re-keying. Just distribute the new CA
+cert where clients need it. Superseded is distinct from revoked:
+superseded CA certificate can't sign new things, but its existing leaves are
+not treated as compromised.
+
+**Cross-sign** (`POST /api/v1/ca/{caID}/cross-sign`, body carries a different
+`signing_ca_id`) issues a second, parallel certificate for a CA's existing
+public key and subject, signed by a different CA. The classic use is rolling a
+root: create the new root, have the old root cross-sign it, then serve the
+cross chain at `GET /pki/{new_root}/chain/cross/{old_root}` so clients that
+trust the old root can validate the new one during the transition window.
+
 ---
 
-## 3.10 Additional Management Tasks
+## 3.10 SSH Certificate Authorities (User & Host Certificates)
+
+SSH CAs let you sign **user** and **host** SSH certificates instead of distributing raw public keys. This walkthrough mirrors Steps 4–9 but for SSH certificates.
+
+### Step 10a: Create an SSH Signing CA
+
+```bash
+export API_KEY="mca_987zyx..."
+
+curl -X POST http://localhost:8080/api/v1/sshca/ \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"name": "my-ssh-ca", "key_algo": "ed25519"}'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "id": "ssh-ca-uuid",
+  "name": "my-ssh-ca",
+  "key_algo": "ssh-ed25519",
+  "public_key": "ssh-ed25519 AAAA... mint-ca",
+  "status": "active"
+}
+```
+
+Save the `id` and the `public_key`.
+
+### Step 10b: Fetch the CA Public Key
+
+The public key is served unauthenticated so it is safe to fetch from any host you want to trust:
+
+```bash
+export SSH_CA_ID="ssh-ca-uuid"
+curl http://localhost:8080/pki/sshca/$SSH_CA_ID/public-key
+```
+
+This prints a single `ssh-ed25519 AAAA... mint-ca` line.
+
+### Step 10c: Configure Trust on a Server
+
+As root on the target server, add the CA public key so it trusts **user** certificates it signs:
+
+```bash
+curl http://localhost:8080/pki/sshca/$SSH_CA_ID/public-key \
+  > /etc/ssh/trusted-user-ca-keys.pem
+# add to /etc/ssh/sshd_config:
+#   TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem
+systemctl restart ssh
+```
+
+For **host** certificates, put the same line into each client's `known_hosts` as an `@cert-authority` entry:
+
+```
+@cert-authority *.example.com ssh-ed25519 AAAA... mint-ca
+```
+
+### Step 10d: Generate a Local Keypair and Sign It
+
+Keep the private key locally and submit only the public key to mint-ca. First generate a keypair on your workstation:
+
+```bash
+ssh-keygen -t ed25519 -f alice_id_ed25519 -N '' -C alice@example.com
+```
+
+Now request a **user** certificate signed by the CA. `provisioner_id` can be an existing approved provisioner, and principals are the usernames the cert is valid for:
+
+```bash
+export PROVISIONER_ID="your-provisioner-uuid"
+
+curl -X POST http://localhost:8080/api/v1/sshca/$SSH_CA_ID/sign/user \
+  -H "Authorization: Bearer $API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provisioner_id": "'"$PROVISIONER_ID"'",
+    "public_key": "$(cut -d' ' -f1-2 alice_id_ed25519.pub)",
+    "principals": ["alice", "ops"],
+    "key_id": "alice",
+    "ttl_seconds": 28800
+  }'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "certificate": { "id": "cert-uuid", "ca_id": "ssh-ca-uuid", "serial": 42, "cert_type": "user", ... },
+  "cert_data": "ssh-ed25519-cert-v01@openssh.com AAAA..."
+}
+```
+
+Save `cert_data` to `alice_id_ed25519-cert.pub` (this is the OpenSSH `-cert.pub` file). The provided key is automatically-detected whether pasted as a full `authorized_keys` line or raw base64 wire format.
+
+### Step 10e: Connect Using the Certificate
+
+```bash
+ssh -i alice_id_ed25519 -o CertificateFile=alice_id_ed25519-cert.pub alice@somewhere
+```
+
+OpenSSH pairs the certificate with your private key and the server validates it against the CA trust configured in Step 10c.
+
+### Step 10f: List and Revoke SSH Certificates
+
+```bash
+curl -H "Authorization: Bearer $API_KEY" \
+  http://localhost:8080/api/v1/sshca/$SSH_CA_ID/certs
+
+curl -X PUT http://localhost:8080/api/v1/sshca/certs/cert-uuid/revoke \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+Revoked SSH certificates are marked so servers can stop accepting them.
+
+---
+
+## 3.11 Additional Management Tasks
 
 ### Create an API Key for another user
 
@@ -314,7 +457,7 @@ curl http://localhost:8080/metrics
 
 ---
 
-## 3.11 Using ACME (Optional)
+## 3.12 Using ACME (Optional)
 
 If you enabled ACME (`MINT_ACME_ENABLED=true`), you can use any ACME client (like Certbot) with your mint‑ca instance.  
 The ACME endpoint is `/acme/{provisionerID}/directory`.  
@@ -341,14 +484,43 @@ curl -X POST http://localhost:8080/api/v1/provisioners \
 
 After creation, the directory URL becomes `http://localhost:8080/acme/{provisioner-uuid}/directory`.  
 You can then use Certbot:
+## 3.12a Rolling Over an ACME Account Key
 
+If a client's account key is compromised or being rotated on a schedule, use `keyChange` instead of creating a new account. This preserves the account's order/authorization history.
+
+The outer request is signed with the **current** key (like any authenticated ACME call); it wraps an inner JWS signed with the **new** key:
+
+```bash
+# Pseudocode — most ACME client libraries (certbot, acme.sh, etc.) implement
+# this automatically via an "account key rollover" command.
+POST /acme/{provisionerID}/key-change
+{
+  "protected": "<base64url: {alg, nonce, url, kid: accountURL}>",
+  "payload": "<base64url of the INNER JWS object below>",
+  "signature": "<signed with OLD key>"
+}
+
+# inner JWS (embedded as the outer payload, base64url-encoded):
+{
+  "protected": "<base64url: {alg, jwk: NEW_PUBLIC_KEY}>",
+  "payload": "<base64url: {\"account\": \"<accountURL>\", \"oldKey\": <OLD_PUBLIC_KEY_JWK>}>",
+  "signature": "<signed with NEW key>"
+}
+```
+
+**Response (200 OK):** empty body — the account's key is now the new key.
+
+**Notes:**
+- The old key is permanently retired: it can never be used as a *new* account key again, by this account or any other, even after this rollover.
+- Rolling to a key already registered on another account is rejected (`409`-style malformed problem).
+- Limited to 5 rollovers/hour per account.
 ```bash
 certbot certonly --standalone --server http://localhost:8080/acme/provisioner-uuid/directory -d example.com
 ```
 
 ---
 
-## 3.12 Troubleshooting Common Issues
+## 3.13 Troubleshooting Common Issues
 
 - **`401 Unauthorized`** – Check your `Authorization` header; it must be `Bearer <key>`.
 - **`403 Forbidden`** – Your API key may not have the required scope. Use `scopes: ["*"]` for full access.
@@ -359,7 +531,7 @@ certbot certonly --standalone --server http://localhost:8080/acme/provisioner-uu
 
 ---
 
-## 3.13 Next Steps
+## 3.14 Next Steps
 
 - Explore the full API using the [API Reference](Api.md).
 - Set up monitoring with Prometheus and Grafana.

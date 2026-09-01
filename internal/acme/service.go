@@ -2,20 +2,23 @@ package acme
 
 import (
 	"context"
+	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
 	"log/slog"
-	"strings"
-	"time"
-
 	"mint-ca/internal/acme/challenge"
 	"mint-ca/internal/ca"
+	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/storage"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -34,6 +37,16 @@ type ProvisionerConfig struct {
 	// AllowedChallengeTypes lists the challenge types this provisioner will
 	// accept. Supported values: "http-01", "dns-01". Empty means all supported.
 	AllowedChallengeTypes []string `json:"allowed_challenge_types"`
+
+	// RenewalLeadPeriodSeconds overrides the renewal-info lead time (how long
+	// before NotAfter the renewal window opens) for this provisioner. 0 means
+	// the default (max(lifetime/5, 24h)).
+	RenewalLeadPeriodSeconds int64 `json:"renewal_lead_period_seconds"`
+}
+
+type KeyChangeRequest struct {
+	Account json.RawMessage `json:"account"` // account URL, as string
+	OldKey  json.RawMessage `json:"oldKey"`
 }
 
 // SetDefaults fills in zero-value fields with sensible defaults.
@@ -96,12 +109,19 @@ type Store interface {
 
 // Service provides all ACME business logic.
 type Service struct {
-	store   Store
-	engine  *ca.Engine
-	nonces  *NonceManager
-	http01  *challenge.HTTP01Validator
-	dns01   *challenge.DNS01Validator
-	baseURL string
+	store     Store
+	engine    *ca.Engine
+	nonces    *NonceManager
+	crlMgr    *revocation.CRLManager
+	http01    *challenge.HTTP01Validator
+	dns01     *challenge.DNS01Validator
+	tlsalpn01 *challenge.TLSALPN01Validator
+	caa       *CAAChecker
+	baseURL   string
+}
+
+var allowedACMERevocationReasons = map[int]bool{
+	0: true, 1: true, 3: true, 4: true, 5: true, 6: true, 9: true, 10: true,
 }
 
 // NewService constructs a Service.
@@ -113,21 +133,274 @@ func NewService(
 	store Store,
 	engine *ca.Engine,
 	nonces *NonceManager,
+	crlMgr *revocation.CRLManager,
+	caa *CAAChecker,
 	baseURL string,
 ) *Service {
 	return &Service{
-		store:   store,
-		engine:  engine,
-		nonces:  nonces,
-		http01:  challenge.NewHTTP01Validator(),
-		dns01:   challenge.NewDNS01Validator(nil),
-		baseURL: strings.TrimRight(baseURL, "/"),
+		store:     store,
+		engine:    engine,
+		nonces:    nonces,
+		crlMgr:    crlMgr,
+		http01:    challenge.NewHTTP01Validator(),
+		dns01:     challenge.NewDNS01Validator(nil),
+		tlsalpn01: challenge.NewTLSALPN01Validator(443),
+		caa:       caa,
+		baseURL:   strings.TrimRight(baseURL, "/"),
 	}
+}
+
+// preAuthExpiry is how long a standalone (pre-)authorization remains valid
+// before it must be re-created. Matches the order/authz TTL used in NewOrder.
+const preAuthExpiry = 24 * time.Hour
+
+// NewPreAuth creates (or reuses) a standalone authorization for a single
+// identifier, independent of any order — RFC 8555 §7.4.1.
+func (s *Service) NewPreAuth(
+	ctx context.Context,
+	account *storage.ACMEAccount,
+	provisioner *storage.Provisioner,
+	identifier Identifier,
+) (*storage.ACMEAuthorization, []*storage.ACMEChallenge, *Problem) {
+
+	if err := validateIdentifier(identifier); err != nil {
+		return nil, nil, NewProblem(ErrRejectedIdentifier, 400, err.Error())
+	}
+
+	var cfg ProvisionerConfig
+	_ = json.Unmarshal(mustMarshalJSON(provisioner.Config), &cfg)
+	cfg.SetDefaults()
+
+	now := time.Now().UTC()
+
+	// Reuse an existing valid, unexpired standalone authz for this
+	// account + identifier if one exists.
+	existing, err := s.store.GetACMEAuthorizationByIdentifier(ctx, account.ID, identifier.Type, identifier.Value)
+	if err != nil {
+		return nil, nil, ErrServerInternalProblem("look up existing pre-authorization: " + err.Error())
+	}
+	if existing != nil && existing.Status == storage.ACMEAuthorizationStatusValid && existing.ExpiresAt.After(now) {
+		challenges, err := s.store.ListChallengesByAuthorization(ctx, existing.ID)
+		if err != nil {
+			return nil, nil, ErrServerInternalProblem("list existing challenges: " + err.Error())
+		}
+		return existing, challenges, nil
+	}
+
+	expiresAt := now.Add(preAuthExpiry)
+	authID := uuid.New()
+	auth := &storage.ACMEAuthorization{
+		ID:              authID,
+		OrderID:         uuid.Nil, // standalone pre-authorization
+		AccountID:       account.ID,
+		IdentifierType:  identifier.Type,
+		IdentifierValue: identifier.Value,
+		Status:          storage.ACMEAuthorizationStatusPending,
+		ExpiresAt:       expiresAt,
+		CreatedAt:       now,
+	}
+	if err := s.store.CreateACMEAuthorization(ctx, auth); err != nil {
+		return nil, nil, ErrServerInternalProblem("create pre-authorization: " + err.Error())
+	}
+
+	var challenges []*storage.ACMEChallenge
+	for _, challType := range cfg.AllowedChallengeTypes {
+		if IsWildcardIdentifier(identifier.Value) && challType != string(storage.ACMEChallengeTypeDNS01) {
+			continue
+		}
+		token, err := generateToken()
+		if err != nil {
+			return nil, nil, ErrServerInternalProblem("generate challenge token: " + err.Error())
+		}
+		ch := &storage.ACMEChallenge{
+			ID:              uuid.New(),
+			OrderID:         uuid.Nil, // standalone pre-authorization challenge
+			AuthorizationID: &authID,
+			Type:            storage.ACMEChallengeType(challType),
+			Token:           token,
+			Status:          storage.ACMEChallengeStatusPending,
+		}
+		if err := s.store.CreateACMEChallenge(ctx, ch); err != nil {
+			return nil, nil, ErrServerInternalProblem("create challenge: " + err.Error())
+		}
+		challenges = append(challenges, ch)
+	}
+
+	return auth, challenges, nil
 }
 
 // IssueNonce generates and persists a fresh nonce.
 func (s *Service) IssueNonce(ctx context.Context) (string, error) {
 	return s.nonces.Issue(ctx)
+}
+func (s *Service) KeyChange(
+	ctx context.Context,
+	outerAccount *storage.ACMEAccount,
+	innerJWS *RawJWS,
+	expectedAccountURL string,
+) (*storage.ACMEAccount, *Problem) {
+
+	innerHdr, err := innerJWS.ParseProtected()
+	if err != nil {
+		return nil, ErrMalformedProblem("keyChange: parse inner protected header: " + err.Error())
+	}
+	if len(innerHdr.JWK) == 0 {
+		return nil, ErrMalformedProblem("keyChange: inner JWS must carry jwk, not kid")
+	}
+	newPub, err := ParseJWK(innerHdr.JWK)
+	if err != nil {
+		return nil, NewProblem(ErrBadPublicKey, 400, "keyChange: "+err.Error())
+	}
+	if err := innerJWS.Verify(newPub, innerHdr.Algorithm); err != nil {
+		return nil, ErrUnauthorizedProblem("keyChange: inner JWS signature invalid: " + err.Error())
+	}
+
+	innerPayload, err := innerJWS.PayloadBytes()
+	if err != nil || innerPayload == nil {
+		return nil, ErrMalformedProblem("keyChange: inner JWS requires a payload")
+	}
+	var req KeyChangeRequest
+	if err := json.Unmarshal(innerPayload, &req); err != nil {
+		return nil, ErrMalformedProblem("keyChange: decode inner payload: " + err.Error())
+	}
+
+	var accountURL string
+	_ = json.Unmarshal(req.Account, &accountURL)
+	if strings.TrimRight(accountURL, "/") != strings.TrimRight(expectedAccountURL, "/") {
+		return nil, NewProblem(ErrMalformed, 400, "keyChange: inner account URL does not match authenticated account")
+	}
+
+	oldThumb, err := Thumbprint(req.OldKey)
+	if err != nil {
+		return nil, ErrMalformedProblem("keyChange: thumbprint oldKey: " + err.Error())
+	}
+	if oldThumb != outerAccount.KeyID {
+		return nil, NewProblem(ErrMalformed, 400, "keyChange: oldKey does not match authenticated account's current key")
+	}
+
+	newThumb, err := Thumbprint(innerHdr.JWK)
+	if err != nil {
+		return nil, ErrServerInternalProblem("keyChange: thumbprint new key: " + err.Error())
+	}
+	if newThumb == oldThumb {
+		return nil, NewProblem(ErrMalformed, 400, "keyChange: new key is identical to current key")
+	}
+
+	// New key must not already be in use, nor be a previously-retired key
+	// (common CA practice: rolled-off keys are permanently blocked from re-use).
+	existing, err := s.store.GetACMEAccountByKeyID(ctx, newThumb)
+	if err != nil {
+		return nil, ErrServerInternalProblem("keyChange: check new key: " + err.Error())
+	}
+	if existing != nil {
+		return nil, NewProblem(ErrMalformed, 409, "keyChange: new key is already in use by another account")
+	}
+	retired, err := s.store.IsKeyIDRetired(ctx, newThumb)
+	if err != nil {
+		return nil, ErrServerInternalProblem("keyChange: check retired keys: " + err.Error())
+	}
+	if retired {
+		return nil, NewProblem(ErrMalformed, 409, "keyChange: this key was previously retired and cannot be reused")
+	}
+
+	if err := s.store.UpdateACMEAccountKey(ctx, outerAccount.ID, newThumb, storage.JSON(mustUnmarshalRawJSON(innerHdr.JWK))); err != nil {
+		return nil, ErrServerInternalProblem("keyChange: update account key: " + err.Error())
+	}
+	if err := s.store.MarkKeyIDRetired(ctx, oldThumb); err != nil {
+		slog.Warn("keyChange: failed to retire old key", "account_id", outerAccount.ID, "err", err)
+	}
+
+	outerAccount.KeyID = newThumb
+	outerAccount.KeyJWK = storage.JSON(mustUnmarshalRawJSON(innerHdr.JWK))
+	return outerAccount, nil
+}
+
+// RevokeCert handles RFC 8555 §7.6 certificate revocation. Exactly one of
+// authAccount or authJWK must be non-nil, matching whichever auth mode the
+// handler resolved from the JWS protected header.
+func (s *Service) RevokeCert(
+	ctx context.Context,
+	certDER []byte,
+	authAccount *storage.ACMEAccount,
+	authJWK json.RawMessage,
+	reason *int,
+) *Problem {
+	if reason != nil && !allowedACMERevocationReasons[*reason] {
+		return NewProblem(ErrBadRevocationReason, 400,
+			fmt.Sprintf("reason code %d is not permitted", *reason))
+	}
+
+	leaf, err := x509.ParseCertificate(certDER)
+	if err != nil {
+		return ErrMalformedProblem("parse certificate: " + err.Error())
+	}
+
+	record, err := s.store.GetCertificateBySerial(ctx, leaf.SerialNumber.String())
+	if err != nil {
+		return ErrServerInternalProblem("load certificate: " + err.Error())
+	}
+	if record == nil {
+		return NewProblem(ErrMalformed, 404, "certificate not found")
+	}
+
+	// Confirm the supplied DER actually matches the stored cert, not just
+	// a serial collision.
+	storedCert, err := parseCertPEMBytes([]byte(record.CertPEM))
+	if err != nil {
+		return ErrServerInternalProblem("parse stored certificate: " + err.Error())
+	}
+	if !storedCert.Equal(leaf) {
+		return ErrMalformedProblem("supplied certificate does not match a certificate issued by this CA")
+	}
+
+	if record.Status == storage.CertStatusRevoked {
+		return NewProblem(ErrAlreadyRevoked, 400, "certificate is already revoked")
+	}
+
+	switch {
+	case authAccount != nil:
+		want := fmt.Sprintf("acme-account:%s", authAccount.ID)
+		if record.Requester != want {
+			return ErrUnauthorizedProblem("account did not request this certificate")
+		}
+	case authJWK != nil:
+		pub, err := ParseJWK(authJWK)
+		if err != nil {
+			return NewProblem(ErrBadPublicKey, 400, err.Error())
+		}
+		if !publicKeysEqual(pub, leaf.PublicKey) {
+			return ErrUnauthorizedProblem("JWK does not match certificate public key")
+		}
+	default:
+		return ErrServerInternalProblem("revoke: no authentication context supplied")
+	}
+
+	reasonCode := 0
+	if reason != nil {
+		reasonCode = *reason
+	}
+	if err := s.crlMgr.RevokeAndRefresh(ctx, record.ID, reasonCode); err != nil {
+		return ErrServerInternalProblem("revoke: " + err.Error())
+	}
+	return nil
+}
+
+func parseCertPEMBytes(pemBytes []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, fmt.Errorf("no PEM block found")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// publicKeysEqual compares two public keys for the algorithm types ParseJWK
+// and x509 certificates can produce (ECDSA, RSA).
+func publicKeysEqual(a, b crypto.PublicKey) bool {
+	type equaler interface{ Equal(x crypto.PublicKey) bool }
+	if ea, ok := a.(equaler); ok {
+		return ea.Equal(b)
+	}
+	return false
 }
 
 // AuthenticateJWK is used for newAccount requests (no existing account yet).
@@ -140,6 +413,9 @@ func (s *Service) AuthenticateJWK(jws *RawJWS, hdr *ProtectedHeader) (json.RawMe
 	pub, err := ParseJWK(hdr.JWK)
 	if err != nil {
 		return nil, "", NewProblem(ErrBadPublicKey, 400, err.Error())
+	}
+	if err := AlgorithmMatchesKey(hdr.Algorithm, pub); err != nil {
+		return nil, "", NewProblem(ErrBadSignatureAlg, 400, err.Error())
 	}
 	if err := jws.Verify(pub, hdr.Algorithm); err != nil {
 		return nil, "", ErrUnauthorizedProblem("JWS signature verification failed: " + err.Error())
@@ -178,10 +454,12 @@ func (s *Service) AuthenticateKID(ctx context.Context, jws *RawJWS, hdr *Protect
 	if err != nil {
 		return nil, ErrServerInternalProblem("marshal stored account key: " + err.Error())
 	}
-
 	pub, err := ParseJWK(jwkBytes)
 	if err != nil {
 		return nil, ErrServerInternalProblem("parse stored account key: " + err.Error())
+	}
+	if err := AlgorithmMatchesKey(hdr.Algorithm, pub); err != nil {
+		return nil, NewProblem(ErrBadSignatureAlg, 400, err.Error())
 	}
 	if err := jws.Verify(pub, hdr.Algorithm); err != nil {
 		return nil, ErrUnauthorizedProblem("JWS signature verification failed: " + err.Error())
@@ -222,6 +500,9 @@ func (s *Service) NewAccount(
 	var cfg ProvisionerConfig
 	_ = json.Unmarshal(mustMarshalJSON(provisioner.Config), &cfg)
 	cfg.SetDefaults()
+	if prob := validateContacts(contact); prob != nil {
+		return nil, false, prob
+	}
 
 	// Check whether this key is already registered.
 	existing, err := s.store.GetACMEAccountByKeyID(ctx, thumbprint)
@@ -270,6 +551,11 @@ func (s *Service) UpdateAccount(
 	contact []string,
 	deactivate bool,
 ) (*storage.ACMEAccount, *Problem) {
+	if contact != nil {
+		if prob := validateContacts(contact); prob != nil {
+			return nil, prob
+		}
+	}
 	if deactivate {
 		if err := s.store.UpdateACMEAccountStatus(ctx, account.ID, storage.ACMEAccountStatusDeactivated); err != nil {
 			return nil, ErrServerInternalProblem("deactivate account: " + err.Error())
@@ -384,11 +670,10 @@ func (s *Service) NewOrder(
 	_ = json.Unmarshal(mustMarshalJSON(provisioner.Config), &cfg)
 	cfg.SetDefaults()
 
-	// Validate identifiers — we only support DNS.
+	// Validate identifiers — we only support DNS, plus wildcard shape checks.
 	for _, id := range identifiers {
-		if id.Type != "dns" {
-			return nil, nil, NewProblem(ErrUnsupportedIdentifier, 400,
-				fmt.Sprintf("identifier type %q is not supported — only \"dns\" is accepted", id.Type))
+		if err := validateIdentifier(id); err != nil {
+			return nil, nil, NewProblem(ErrRejectedIdentifier, 400, err.Error())
 		}
 	}
 
@@ -419,14 +704,30 @@ func (s *Service) NewOrder(
 		return nil, nil, ErrServerInternalProblem("create order: " + err.Error())
 	}
 
-	// Create authorizations and challenges.
+	// Create authorizations and challenges — reusing any valid, unexpired
+	// standalone pre-authorization for this account+identifier if present.
 	var allChallenges []*storage.ACMEChallenge
 	for _, id := range identifiers {
+		existing, err := s.store.GetACMEAuthorizationByIdentifier(ctx, account.ID, id.Type, id.Value)
+		if err != nil {
+			return nil, nil, ErrServerInternalProblem("look up pre-authorization: " + err.Error())
+		}
+		if existing != nil && existing.Status == storage.ACMEAuthorizationStatusValid && existing.ExpiresAt.After(now) {
+			// Reuse: no new pending authz/challenges needed for this identifier.
+			existingChallenges, err := s.store.ListChallengesByAuthorization(ctx, existing.ID)
+			if err != nil {
+				return nil, nil, ErrServerInternalProblem("list reused challenges: " + err.Error())
+			}
+			allChallenges = append(allChallenges, existingChallenges...)
+			continue
+		}
+
 		// Create authorization for this identifier.
 		authID := uuid.New()
 		auth := &storage.ACMEAuthorization{
 			ID:              authID,
 			OrderID:         order.ID,
+			AccountID:       account.ID,
 			IdentifierType:  id.Type,
 			IdentifierValue: id.Value,
 			Status:          storage.ACMEAuthorizationStatusPending,
@@ -437,8 +738,11 @@ func (s *Service) NewOrder(
 			return nil, nil, ErrServerInternalProblem("create authorization: " + err.Error())
 		}
 
-		// Create challenges for each allowed type.
+		// Create challenges for each allowed type — wildcards get dns-01 only.
 		for _, challType := range cfg.AllowedChallengeTypes {
+			if IsWildcardIdentifier(id.Value) && challType != string(storage.ACMEChallengeTypeDNS01) {
+				continue
+			}
 			token, err := generateToken()
 			if err != nil {
 				return nil, nil, ErrServerInternalProblem("generate challenge token: " + err.Error())
@@ -497,6 +801,32 @@ func (s *Service) ValidateChallenge(
 		return ch, nil
 	}
 
+	if ch.OrderID == uuid.Nil {
+		// Standalone pre-authorization challenge — resolve ownership via the
+		// authorization instead of an order.
+		if ch.AuthorizationID == nil {
+			return nil, ErrServerInternalProblem("standalone challenge has no authorization")
+		}
+		auth, err := s.store.GetACMEAuthorization(ctx, *ch.AuthorizationID)
+		if err != nil {
+			return nil, ErrServerInternalProblem("load authorization: " + err.Error())
+		}
+		if auth == nil {
+			return nil, NewProblem(ErrMalformed, 404, "authorization not found")
+		}
+		if auth.AccountID != account.ID {
+			return nil, ErrUnauthorizedProblem("challenge does not belong to your account")
+		}
+
+		go func() {
+			time.Sleep(1 * time.Second)
+			bgCtx := context.Background()
+			s.performPreAuthValidation(bgCtx, account, ch, auth)
+		}()
+
+		return ch, nil
+	}
+
 	order, err := s.store.GetACMEOrder(ctx, ch.OrderID)
 	if err != nil {
 		return nil, ErrServerInternalProblem("load order: " + err.Error())
@@ -512,6 +842,90 @@ func (s *Service) ValidateChallenge(
 	}()
 
 	return ch, nil
+}
+
+// performPreAuthValidation validates a standalone pre-authorization
+// challenge. Unlike performValidation, there is no order to update — only
+// the challenge and its authorization.
+// enforceCAA checks the RFC 8659 CAA policy for the given identifier during
+// validation and reports whether issuance is permitted. When no CAA checker
+// is configured CAA is not enforced (always permitted). On a DNS lookup error
+// the service fails open (log + permit) so a transient resolver hiccup does not
+// break issuance; an explicit unsupported-critical or unmatched restrictor
+// still denies.
+func (s *Service) enforceCAA(ctx context.Context, identifier string) bool {
+	if s.caa == nil || s.caa.identity == "" {
+		return true
+	}
+	permitted, err := s.caa.Enforce(ctx, identifier)
+	if err != nil {
+		slog.Warn("caa: lookup failed, failing open", "identifier", identifier, "err", err)
+		return true
+	}
+	return permitted
+}
+
+func (s *Service) performPreAuthValidation(
+	ctx context.Context,
+	account *storage.ACMEAccount,
+	ch *storage.ACMEChallenge,
+	auth *storage.ACMEAuthorization,
+) {
+	domain := auth.IdentifierValue
+
+	acctJWKRaw, err := json.Marshal(account.KeyJWK)
+	if err != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+	keyAuth, err := KeyAuthorization(ch.Token, acctJWKRaw)
+	if err != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+
+	var valErr error
+	switch ch.Type {
+	case storage.ACMEChallengeTypeHTTP01:
+		valErr = s.http01.Validate(ctx, domain, ch.Token, keyAuth)
+	case storage.ACMEChallengeTypeDNS01:
+		digest := DNS01DigestAuthorization(keyAuth)
+		valErr = s.dns01.Validate(ctx, domain, digest)
+	case storage.ACMEChallengeTypeTLSALPN01:
+		valErr = s.tlsalpn01.Validate(ctx, domain, keyAuth)
+	default:
+		valErr = fmt.Errorf("unsupported challenge type %q", ch.Type)
+	}
+
+	now := time.Now().UTC()
+	if valErr != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+
+	// RFC 8659: refuse issuance when CAA does not authorise this CA for the
+	// identifier, even though the challenge itself validated.
+	if !s.enforceCAA(ctx, auth.IdentifierValue) {
+		slog.Warn("caa: refused issuance for identifier", "identifier", auth.IdentifierValue)
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusInvalid)
+		return
+	}
+
+	if err := s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusValid, &now); err != nil {
+		slog.Error("failed to update challenge status", "challenge_id", ch.ID, "err", err)
+		return
+	}
+
+	if err := s.store.UpdateACMEAuthorizationStatus(ctx, auth.ID, storage.ACMEAuthorizationStatusValid); err != nil {
+		slog.Error("failed to update authorization status", "auth_id", auth.ID, "err", err)
+		return
+	}
+
+	slog.Info("pre-authorization challenge validated", "challenge_id", ch.ID, "auth_id", auth.ID)
 }
 func (s *Service) performValidation(
 	ctx context.Context,
@@ -557,12 +971,26 @@ func (s *Service) performValidation(
 	case storage.ACMEChallengeTypeDNS01:
 		digest := DNS01DigestAuthorization(keyAuth)
 		valErr = s.dns01.Validate(ctx, domain, digest)
+	case storage.ACMEChallengeTypeTLSALPN01:
+		valErr = s.tlsalpn01.Validate(ctx, domain, keyAuth)
 	default:
 		valErr = fmt.Errorf("unsupported challenge type %q", ch.Type)
 	}
 
 	now := time.Now().UTC()
 	if valErr != nil {
+		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
+		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
+		if ch.AuthorizationID != nil {
+			_ = s.store.UpdateACMEAuthorizationStatus(ctx, *ch.AuthorizationID, storage.ACMEAuthorizationStatusInvalid)
+		}
+		return
+	}
+
+	// RFC 8659: refuse issuance when CAA does not authorise this CA for the
+	// identifier, even though the challenge itself validated.
+	if !s.enforceCAA(ctx, identifiers[0].Value) {
+		slog.Warn("caa: refused issuance for identifier", "identifier", identifiers[0].Value)
 		_ = s.store.UpdateChallengeStatus(ctx, ch.ID, storage.ACMEChallengeStatusInvalid, nil)
 		_ = s.store.UpdateACMEOrderStatus(ctx, order.ID, storage.ACMEOrderStatusInvalid)
 		if ch.AuthorizationID != nil {
@@ -619,6 +1047,13 @@ func (s *Service) performValidation(
 			slog.Info("order marked ready", "order_id", order.ID)
 		}
 	}
+}
+func (s *Service) ListOrders(ctx context.Context, accountID uuid.UUID) ([]*storage.ACMEOrder, *Problem) {
+	orders, err := s.store.ListACMEOrdersByAccount(ctx, accountID)
+	if err != nil {
+		return nil, ErrServerInternalProblem("list orders: " + err.Error())
+	}
+	return orders, nil
 }
 
 // maybeReadyOrder checks whether every challenge for an order is valid and, if so, transitions the order to the "ready" state.
@@ -744,6 +1179,63 @@ func (s *Service) CertificateURL(provisionerID, certID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/certificate/%s", s.baseURL, provisionerID, certID)
 }
 
+func (s *Service) RenewalInfoURL(provisionerID, certID uuid.UUID) string {
+	return fmt.Sprintf("%s/acme/%s/renewal-info/%s", s.baseURL, provisionerID, certID)
+}
+
+// renewInfoFloor is the minimum lead time before NotAfter at which the renewal
+// window opens, applied when the derived fraction would be smaller (short-lived
+// certificates). RFC 9779 leaves the exact policy to the CA.
+const renewInfoFloor = 24 * time.Hour
+
+// renewInfoFraction is the fraction of a certificate's lifetime used as the
+// default renewal lead time (1/5 = open renewing in the final 20%).
+const renewInfoFraction = 0.2
+
+// RenewalWindow is the RFC 9779 renewal window for a certificate.
+type RenewalWindow struct {
+	Start time.Time `json:"start"`
+	End   time.Time `json:"end"`
+}
+
+// RenewalInfo returns the RFC 9779 renewal window for the given certificate.
+// The window closes at NotAfter and opens one lead-time earlier, where
+// leadTime = override if >0, else max(lifetime*renewInfoFraction, renewInfoFloor),
+// clamped to the lifetime. Returns nil if the certificate is not found.
+func (s *Service) RenewalInfo(ctx context.Context, certID uuid.UUID, override time.Duration) (*RenewalWindow, *Problem) {
+	cert, err := s.store.GetCertificate(ctx, certID)
+	if err != nil {
+		return nil, ErrServerInternalProblem("load certificate: " + err.Error())
+	}
+	if cert == nil {
+		return nil, NewProblem(ErrMalformed, 404, "renewal info: certificate not found")
+	}
+
+	life := cert.NotAfter.Sub(cert.NotBefore)
+	if life <= 0 {
+		// Degenerate lifetime — open the window immediately.
+		return &RenewalWindow{Start: cert.NotBefore, End: cert.NotAfter}, nil
+	}
+
+	lead := override
+	if lead <= 0 {
+		lead = time.Duration(float64(life) * renewInfoFraction)
+		if lead < renewInfoFloor {
+			lead = renewInfoFloor
+		}
+	}
+	if lead > life {
+		lead = life
+	}
+
+	end := cert.NotAfter
+	start := end.Add(-lead)
+	if start.Before(cert.NotBefore) {
+		start = cert.NotBefore
+	}
+	return &RenewalWindow{Start: start, End: end}, nil
+}
+
 func (s *Service) AuthorizationURL(provisionerID, authID uuid.UUID) string {
 	return fmt.Sprintf("%s/acme/%s/auth/%s", s.baseURL, provisionerID, authID)
 }
@@ -758,6 +1250,30 @@ func (s *Service) accountIDFromKID(kid string) (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("empty kid")
 	}
 	return uuid.Parse(parts[len(parts)-1])
+}
+func IsWildcardIdentifier(value string) bool {
+	return strings.HasPrefix(value, "*.")
+}
+
+func validateIdentifier(id Identifier) error {
+	if id.Type != "dns" {
+		return fmt.Errorf("identifier type %q is not supported", id.Type)
+	}
+	v := id.Value
+	if v == "" {
+		return fmt.Errorf("identifier value is empty")
+	}
+	if IsWildcardIdentifier(v) {
+		rest := v[2:]
+		if rest == "" || strings.HasPrefix(rest, "*.") || strings.Contains(rest, "*") {
+			return fmt.Errorf("malformed wildcard identifier %q", v)
+		}
+		return nil
+	}
+	if strings.Contains(v, "*") {
+		return fmt.Errorf("malformed identifier %q: bare wildcards not permitted", v)
+	}
+	return nil
 }
 
 // parseOrderIdentifiers extracts the []Identifier slice from an order's JSON.
@@ -793,6 +1309,30 @@ func generateRandomBytes(b []byte) (int, error) {
 func mustMarshalJSON(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+func validateContacts(contacts []string) *Problem {
+	for _, c := range contacts {
+		u, err := url.Parse(c)
+		if err != nil {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q is not a valid URI: %v", c, err))
+		}
+		if u.Scheme == "" {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q must be a URI with a scheme", c))
+		}
+		if u.Scheme != "mailto" {
+			return ErrUnsupportedContactProblem(fmt.Sprintf("contact scheme %q is not supported; only mailto: is accepted", u.Scheme))
+		}
+		if u.Opaque == "" {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q has an empty mailto address", c))
+		}
+		if strings.Contains(u.Opaque, ",") {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q must not contain multiple addresses", c))
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q must not contain hfields or a fragment", c))
+		}
+	}
+	return nil
 }
 
 func mustUnmarshalRawJSON(b []byte) map[string]interface{} {

@@ -1,10 +1,15 @@
 package handlers
 
 import (
+	"context"
+	"encoding/pem"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 
 	gox509 "crypto/x509"
+	"mint-ca/internal/approval"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
@@ -23,14 +28,82 @@ func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storag
 	return &CertHandler{engine: engine, policy: policyEngine, store: store}
 }
 
+// loadProfileByName resolves a named profile via the store, or (nil,nil) when
+// the store does not support profiles at all.
+func (h *CertHandler) loadProfileByName(ctx context.Context, name string) (*storage.Profile, error) {
+	s, ok := h.store.(profileStore)
+	if !ok {
+		return nil, errors.New("store does not support profiles")
+	}
+	return s.GetProfileByName(ctx, name)
+}
+
+// enforceCSRAutoApproval applies CSR auto-approval rules (opt-in). If any
+// rules exist for the provisioner, the CSR must satisfy one of them; otherwise
+// it is refused. When no rule applies to the provisioner, behavior is unchanged
+// (no auto-approval policy governs this CSR).
+func (h *CertHandler) enforceCSRAutoApproval(ctx context.Context, provisionerID uuid.UUID, csrPEM string, ttlSeconds int64) error {
+	s, ok := h.store.(csrApprovalStore)
+	if !ok {
+		return nil
+	}
+	rules, err := s.ListCSRAutoApproveRules(ctx, provisionerID)
+	if err != nil {
+		return fmt.Errorf("load CSR approval rules: %w", err)
+	}
+	if len(rules) == 0 {
+		return nil
+	}
+
+	csr, err := parseCSR(csrPEM)
+	if err != nil {
+		return err
+	}
+	req := approval.Request{
+		ProvisionerID: provisionerID,
+		CommonName:    csr.Subject.CommonName,
+		SANsDNS:       csr.DNSNames,
+		TTLSeconds:    ttlSeconds,
+	}
+	for _, rule := range rules {
+		approved, decided, reason := approval.Evaluate(rule, req)
+		if !decided {
+			continue
+		}
+		if !approved {
+			return errors.New("csr auto-approval: " + reason)
+		}
+		return nil
+	}
+	return errors.New("csr auto-approval: no rule approves this request")
+}
+
+func parseCSR(pemStr string) (*gox509.CertificateRequest, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, errors.New("invalid CSR PEM")
+	}
+	csr, err := gox509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse CSR: %w", err)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("CSR signature invalid: %w", err)
+	}
+	return csr, nil
+}
+
 func (h *CertHandler) RegisterRoutes(r chi.Router) {
 	r.Route("/api/v1/certs", func(r chi.Router) {
 		r.Post("/issue", h.issue)
 		r.Post("/sign", h.signCSR)
+		r.Post("/batch/sign", h.batchSignCSR)
 		r.Get("/{certID}", h.get)
 		r.Get("/serial/{serial}", h.getBySerial)
 		r.Get("/ca/{caID}", h.listByCA)
 		r.Put("/{certID}/revoke", h.revoke)
+		r.Get("/{certID}/key", h.key)
+		r.Get("/{certID}/export", h.export)
 	})
 }
 
@@ -46,6 +119,14 @@ type issueCertRequest struct {
 	ServerAuth    bool         `json:"server_auth"`
 	ClientAuth    bool         `json:"client_auth"`
 	Metadata      storage.JSON `json:"metadata"`
+	// StoreKey persists the generated private key (keystore-encrypted, with an
+	// optional passcode guard) so it can be retrieved later via the key/export
+	// endpoints. Off by default: the key is returned once and never stored.
+	StoreKey    bool   `json:"store_key"`
+	KeyPasscode string `json:"key_passcode"`
+	// Profile optionally names a certificate profile to enforce against this
+	// issuance. Resolved by name and evaluated with policy.EvaluateProfile.
+	Profile string `json:"profile"`
 }
 
 func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
@@ -81,8 +162,33 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		algo = string(ca.DefaultKeyAlgo)
 	}
 
-	// Policy evaluation before any crypto work.
-	if err := h.policy.Evaluate(r.Context(), policy.CertRequest{
+	// Enforce a named profile (if requested) before any crypto work.
+	if req.Profile != "" {
+		prof, err := h.loadProfileByName(r.Context(), req.Profile)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if prof == nil {
+			writeError(w, http.StatusBadRequest, "unknown profile \""+req.Profile+"\"")
+			return
+		}
+		if err := policy.EvaluateProfile(prof, policy.CertRequest{
+			KeyAlgo:    algo,
+			TTLSeconds: req.TTLSeconds,
+			SANsDNS:    req.SANsDNS,
+			SANsIP:     ips,
+			SANsEmail:  req.SANsEmail,
+		}); err != nil {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
+	}
+
+	// Policy evaluation before any crypto work. The matched policy (if any)
+	// supplies the Certificate Policies OIDs/CPS URI to embed at issuance —
+	// avoids a second DB round-trip to re-resolve the same policy.
+	matchedPolicy, err := h.policy.Evaluate(r.Context(), policy.CertRequest{
 		CAID:          caID,
 		ProvisionerID: provID,
 		CommonName:    req.CommonName,
@@ -91,7 +197,8 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		SANsEmail:     req.SANsEmail,
 		TTLSeconds:    req.TTLSeconds,
 		KeyAlgo:       algo,
-	}); err != nil {
+	})
+	if err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -107,19 +214,30 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		eku = append(eku, gox509.ExtKeyUsageClientAuth)
 	}
 
+	var certPolicyOIDs []string
+	var certPolicyCPSURI string
+	if matchedPolicy != nil {
+		certPolicyOIDs = matchedPolicy.PolicyOIDs
+		certPolicyCPSURI = matchedPolicy.CPSURI
+	}
+
 	issued, err := h.engine.IssueCert(r.Context(), ca.IssueCertRequest{
-		CAID:          caID,
-		ProvisionerID: provID,
-		Requester:     actorFromContext(r),
-		CommonName:    req.CommonName,
-		SANsDNS:       req.SANsDNS,
-		SANsIP:        ips,
-		SANsEmail:     req.SANsEmail,
-		TTLSeconds:    req.TTLSeconds,
-		KeyAlgo:       ca.KeyAlgo(algo),
-		KeyUsage:      ku,
-		ExtKeyUsage:   eku,
-		Metadata:      req.Metadata,
+		CAID:             caID,
+		ProvisionerID:    provID,
+		Requester:        actorFromContext(r),
+		CommonName:       req.CommonName,
+		SANsDNS:          req.SANsDNS,
+		SANsIP:           ips,
+		SANsEmail:        req.SANsEmail,
+		TTLSeconds:       req.TTLSeconds,
+		KeyAlgo:          ca.KeyAlgo(algo),
+		KeyUsage:         ku,
+		ExtKeyUsage:      eku,
+		Metadata:         req.Metadata,
+		CertPolicyOIDs:   certPolicyOIDs,
+		CertPolicyCPSURI: certPolicyCPSURI,
+		StoreKey:         req.StoreKey,
+		KeyPasscode:      req.KeyPasscode,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -160,6 +278,13 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// CSR auto-approval rules (opt-in): if rules exist for this provisioner,
+	// the CSR must be auto-approved or it is refused.
+	if err := h.enforceCSRAutoApproval(r.Context(), provID, req.CSRPEM, req.TTLSeconds); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+
 	issued, err := h.engine.SignCSR(r.Context(), ca.SignCSRRequest{
 		CAID:          caID,
 		ProvisionerID: provID,
@@ -180,6 +305,100 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// batchSignCSR signs many caller-provided CSRs in one request (fleet/embedded
+// provisioning). Each item is validated and signed independently; an item that
+// fails is reported with an error and does not abort the rest (partial failure).
+func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		CAID          string          `json:"ca_id"`
+		ProvisionerID string          `json:"provisioner_id"`
+		Items         []batchSignItem `json:"items"`
+		Metadata      storage.JSON    `json:"metadata"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(req.Items) == 0 {
+		writeError(w, http.StatusBadRequest, "items must not be empty")
+		return
+	}
+	caID, err := uuid.Parse(req.CAID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid ca_id")
+		return
+	}
+	provID, err := uuid.Parse(req.ProvisionerID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
+		return
+	}
+	if len(req.Items) > 1000 {
+		writeError(w, http.StatusBadRequest, "too many items (max 1000)")
+		return
+	}
+
+	// Per-item metadata overrides the shared metadata when present.
+	results := make([]batchSignResult, 0, len(req.Items))
+	for i, item := range req.Items {
+		res := batchSignResult{Index: i}
+		meta := req.Metadata
+		if item.Metadata != nil {
+			meta = item.Metadata
+		}
+		issued, err := h.engine.SignCSR(r.Context(), ca.SignCSRRequest{
+			CAID:          caID,
+			ProvisionerID: provID,
+			Requester:     actorFromContext(r),
+			CSRPEM:        []byte(item.CSRPEM),
+			TTLSeconds:    item.TTLSeconds,
+			Metadata:      meta,
+		})
+		if err != nil {
+			res.Error = err.Error()
+		} else {
+			res.CertID = issued.Record.ID.String()
+			res.Serial = issued.Record.Serial
+			res.SubjectCN = issued.Record.SubjectCN
+			res.CertPEM = string(issued.CertPEM)
+		}
+		results = append(results, res)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"results": results,
+		"issued":  countIssued(results),
+		"failed":  len(results) - countIssued(results),
+	})
+}
+
+// batchSignItem is one CSR to sign in a batch request.
+type batchSignItem struct {
+	CSRPEM     string       `json:"csr_pem"`
+	TTLSeconds int64        `json:"ttl_seconds"`
+	Metadata   storage.JSON `json:"metadata,omitempty"`
+}
+
+// batchSignResult is the per-item outcome.
+type batchSignResult struct {
+	Index     int    `json:"index"`
+	CertID    string `json:"cert_id,omitempty"`
+	Serial    string `json:"serial,omitempty"`
+	SubjectCN string `json:"subject_cn,omitempty"`
+	CertPEM   string `json:"cert_pem,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+func countIssued(results []batchSignResult) int {
+	n := 0
+	for _, res := range results {
+		if res.Error == "" {
+			n++
+		}
+	}
+	return n
+}
+
 func (h *CertHandler) get(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "certID"))
 	if err != nil {
@@ -192,6 +411,60 @@ func (h *CertHandler) get(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, cert)
+}
+
+// key returns the escrowed private key for a certificate. It returns 400 if a
+// passcode is required but not supplied, 404 if the cert is not found, and 204/
+// empty when the key was not stored (store_key=false).
+func (h *CertHandler) key(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "certID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid cert ID")
+		return
+	}
+	_ = r.ParseForm()
+	passcode := r.URL.Query().Get("passcode")
+	keyPEM, err := h.engine.RetrieveKey(r.Context(), id, passcode)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(keyPEM) == 0 {
+		writeError(w, http.StatusNotFound, "no key stored for this certificate (store_key was not set)")
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	w.Write(keyPEM)
+}
+
+// export returns a tar.gz bundle of a certificate (leaf, chain, manifest) and,
+// when the key was escrowed and a valid passcode is supplied, the key too.
+func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
+	id, err := uuid.Parse(chi.URLParam(r, "certID"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid cert ID")
+		return
+	}
+	cert, err := h.store.GetCertificate(r.Context(), id)
+	if err != nil || cert == nil {
+		writeError(w, http.StatusNotFound, "certificate not found")
+		return
+	}
+	keyPEM, err := h.engine.RetrieveKey(r.Context(), id, r.URL.Query().Get("passcode"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	data, err := exportCert(r.Context(), h.engine, cert, keyPEM)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/gzip")
+	w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".tgz\"")
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
 }
 
 func (h *CertHandler) getBySerial(w http.ResponseWriter, r *http.Request) {

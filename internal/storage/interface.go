@@ -27,8 +27,22 @@ const (
 	CAStatusActive  CAStatus = "active"
 	CAStatusRevoked CAStatus = "revoked"
 	CAStatusExpired CAStatus = "expired"
+	// CAStatusSuperseded marks a CA that has been re-keyed. It no longer signs
+	// new certificates, but already-issued leafs remain valid and are NOT to be
+	// treated as compromised (unlike revoked). Distinct from revoked: the leaf
+	// CRL/OCSP status of a superseded CA's issued certificates is unchanged.
+	CAStatusSuperseded CAStatus = "superseded"
 )
 
+// SSHKRLCache holds the most recently generated KRL for each SSH CA.
+type SSHKRLCache struct {
+	ID         uuid.UUID `json:"id"`
+	CAID       uuid.UUID `json:"ca_id"`
+	KRLData    []byte    `json:"-"`
+	KRLVersion uint64    `json:"krl_version"`
+	ThisUpdate time.Time `json:"this_update"`
+	NextUpdate time.Time `json:"next_update"`
+}
 type CertStatus string
 
 const (
@@ -93,6 +107,28 @@ const (
 	ACMEChallengeStatusInvalid ACMEChallengeStatus = "invalid"
 )
 
+type SSHKeyAlgo string
+
+const (
+	SSHKeyAlgoEd25519   SSHKeyAlgo = "ssh-ed25519"
+	SSHKeyAlgoECDSAP256 SSHKeyAlgo = "ecdsa-p256"
+)
+
+type SSHCertType string
+
+const (
+	SSHCertTypeUser SSHCertType = "user"
+	SSHCertTypeHost SSHCertType = "host"
+)
+
+type SSHCertStatus string
+
+const (
+	SSHCertStatusActive  SSHCertStatus = "active"
+	SSHCertStatusRevoked SSHCertStatus = "revoked"
+	SSHCertStatusExpired SSHCertStatus = "expired"
+)
+
 // SANs holds the Subject Alternative Names for a certificate.
 type SANs struct {
 	DNS   []string `json:"dns,omitempty"`
@@ -102,17 +138,110 @@ type SANs struct {
 
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.
 type CertificateAuthority struct {
+	ID uuid.UUID `json:"id"`
+	// LogicalCAID is the stable identity a CA row belongs to. Re-key creates a
+	// new row with a new physical ID but the SAME LogicalCAID, so provisioners
+	// can keep pointing at one logical CA across rotations. Fresh CAs get their
+	// own ID as their LogicalCAID (backfilled on migration for existing rows).
+	LogicalCAID     *uuid.UUID       `json:"logical_ca_id,omitempty"`
+	ParentID        *uuid.UUID       `json:"parent_id,omitempty"`
+	Name            string           `json:"name"`
+	Type            CAType           `json:"type"`
+	Status          CAStatus         `json:"status"`
+	CertPEM         string           `json:"cert_pem"`
+	KeyEnc          []byte           `json:"-"`
+	KeyAlgo         string           `json:"key_algo"`
+	NameConstraints *NameConstraints `json:"name_constraints,omitempty"`
+	NotBefore       time.Time        `json:"not_before"`
+	NotAfter        time.Time        `json:"not_after"`
+	CreatedAt       time.Time        `json:"created_at"`
+}
+
+// SSHCertificateAuthority is a signing key used to issue SSH user/host
+// certificates. Unlike X.509 CAs, SSH CAs are flat — no parent/child chain.
+type SSHCertificateAuthority struct {
 	ID        uuid.UUID  `json:"id"`
-	ParentID  *uuid.UUID `json:"parent_id,omitempty"`
 	Name      string     `json:"name"`
-	Type      CAType     `json:"type"`
-	Status    CAStatus   `json:"status"`
-	CertPEM   string     `json:"cert_pem"`
+	KeyAlgo   SSHKeyAlgo `json:"key_algo"`
+	PublicKey string     `json:"public_key"` // OpenSSH authorized_keys format
 	KeyEnc    []byte     `json:"-"`
-	KeyAlgo   string     `json:"key_algo"`
-	NotBefore time.Time  `json:"not_before"`
-	NotAfter  time.Time  `json:"not_after"`
+	Status    CAStatus   `json:"status"`
+	// LogicalCAID is the stable identity this SSH CA belongs to. Key rotation
+	// creates a new row with a new physical ID but the SAME LogicalCAID, so
+	// downstream consumers can keep referring to one logical id. Set to the
+	// row's own ID at creation.
+	LogicalCAID *uuid.UUID `json:"logical_ca_id,omitempty"`
+	// ParentID records the SSH CA row this row supersedes (nil for a root).
+	ParentID  *uuid.UUID `json:"parent_id,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
+}
+
+// CrossCert is a cross-signed certificate: a certificate issued for an
+// existing CA's public key and subject, signed by a DIFFERENT CA (the
+// signer). Used to build trust bridges during root/intermediate transitions
+// (e.g. an old root cross-signs a new root). It shares the target's keypair
+// and identity but carries a different issuer/chain.
+type CrossCert struct {
+	ID          uuid.UUID `json:"id"`
+	TargetCAID  uuid.UUID `json:"target_ca_id"`
+	SigningCAID uuid.UUID `json:"signing_ca_id"`
+	CertPEM     string    `json:"cert_pem"`
+	NotBefore   time.Time `json:"not_before"`
+	NotAfter    time.Time `json:"not_after"`
+	Serial      string    `json:"serial"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// CRLCache holds the most recently generated base CRL PEM for each CA.
+type CRLCache struct {
+	ID         uuid.UUID `json:"id"`
+	CAID       uuid.UUID `json:"ca_id"`
+	CRLPEM     string    `json:"crl_pem"`
+	CRLNumber  int64     `json:"crl_number"` // NEW: persisted monotonic CRL Number
+	ThisUpdate time.Time `json:"this_update"`
+	NextUpdate time.Time `json:"next_update"`
+}
+
+// DeltaCRLCache holds the most recently generated delta CRL for each CA.
+type DeltaCRLCache struct {
+	ID            uuid.UUID `json:"id"`
+	CAID          uuid.UUID `json:"ca_id"`
+	CRLPEM        string    `json:"crl_pem"`
+	CRLNumber     int64     `json:"crl_number"`
+	BaseCRLNumber int64     `json:"base_crl_number"`
+	ThisUpdate    time.Time `json:"this_update"`
+	NextUpdate    time.Time `json:"next_update"`
+}
+
+// SSHCertificate is an issued SSH user or host certificate.
+type SSHCertificate struct {
+	ID            uuid.UUID     `json:"id"`
+	CAID          uuid.UUID     `json:"ca_id"`
+	Serial        uint64        `json:"serial"`
+	CertType      SSHCertType   `json:"cert_type"`
+	KeyID         string        `json:"key_id"`
+	Principals    []string      `json:"principals"`
+	PublicKey     string        `json:"public_key"` // signed public key, OpenSSH format
+	CertData      string        `json:"cert_data"`  // full serialized -cert.pub
+	ValidAfter    time.Time     `json:"valid_after"`
+	ValidBefore   time.Time     `json:"valid_before"`
+	Status        SSHCertStatus `json:"status"`
+	RevokedAt     *time.Time    `json:"revoked_at,omitempty"`
+	ProvisionerID uuid.UUID     `json:"provisioner_id"`
+	Requester     string        `json:"requester"`
+	CreatedAt     time.Time     `json:"created_at"`
+}
+
+// RateLimitConfig is a single named limiter's configuration, persisted so
+// it can be edited at runtime (e.g. via a future web UI) without a restart.
+type RateLimitConfig struct {
+	Name          string    `json:"name"`
+	Scope         string    `json:"scope"`
+	Algorithm     string    `json:"algorithm"`
+	WindowSeconds int       `json:"window_seconds"`
+	MaxRequests   int       `json:"max_requests"`
+	Enabled       bool      `json:"enabled"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 type ACMEAuthorizationStatus string
 
@@ -125,6 +254,7 @@ const (
 type ACMEAuthorization struct {
 	ID              uuid.UUID               `json:"id"`
 	OrderID         uuid.UUID               `json:"order_id"`
+	AccountID       uuid.UUID               `json:"account_id"`
 	IdentifierType  string                  `json:"identifier_type"`
 	IdentifierValue string                  `json:"identifier_value"`
 	Status          ACMEAuthorizationStatus `json:"status"`
@@ -134,25 +264,73 @@ type ACMEAuthorization struct {
 
 // Certificate represents a leaf certificate issued by one of the stored CAs.
 type Certificate struct {
-	ID            uuid.UUID  `json:"id"`
-	CAID          uuid.UUID  `json:"ca_id"`
-	Serial        string     `json:"serial"`
-	SubjectCN     string     `json:"subject_cn"`
-	SANs          SANs       `json:"sans"`
-	KeyUsage      []string   `json:"key_usage"`
-	CertPEM       string     `json:"cert_pem"`
-	Status        CertStatus `json:"status"`
-	RevokedAt     *time.Time `json:"revoked_at,omitempty"`
-	RevokeReason  *int       `json:"revoke_reason,omitempty"`
-	NotBefore     time.Time  `json:"not_before"`
-	NotAfter      time.Time  `json:"not_after"`
-	IssuedAt      time.Time  `json:"issued_at"`
-	ProvisionerID uuid.UUID  `json:"provisioner_id"`
-	Requester     string     `json:"requester"`
-	Metadata      JSON       `json:"metadata,omitempty"`
+	ID        uuid.UUID `json:"id"`
+	CAID      uuid.UUID `json:"ca_id"`
+	Serial    string    `json:"serial"`
+	SubjectCN string    `json:"subject_cn"`
+	SANs      SANs      `json:"sans"`
+	KeyUsage  []string  `json:"key_usage"`
+	CertPEM   string    `json:"cert_pem"`
+	// KeyEncrypted holds the keystore-encrypted leaf private key when the
+	// issuer opted into key escrow (store_key=true). Empty otherwise.
+	KeyEncrypted []byte `json:"-"`
+	// KeyPasscodeRequired records whether retrieval of the escrowed key also
+	// requires a caller-supplied passcode (key_passcode was set at issue).
+	KeyPasscodeRequired bool       `json:"-"`
+	Status              CertStatus `json:"status"`
+	RevokedAt           *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason        *int       `json:"revoke_reason,omitempty"`
+	NotBefore           time.Time  `json:"not_before"`
+	NotAfter            time.Time  `json:"not_after"`
+	IssuedAt            time.Time  `json:"issued_at"`
+	ProvisionerID       uuid.UUID  `json:"provisioner_id"`
+	Requester           string     `json:"requester"`
+	Metadata            JSON       `json:"metadata,omitempty"`
 }
 
 // Provisioner is the entity authorised to request certificates from a CA.
+// Profile is a named set of issuance constraints that can be pinned to a
+// provisioner (Provisioner.ProfileID) or requested per issuance. An empty
+// profile imposes no constraints.
+type Profile struct {
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+
+	// AllowedKeyAlgos restricts the leaf key algorithm (e.g. "ecdsa-p256",
+	// "rsa-2048", "ed25519"). Empty means any.
+	AllowedKeyAlgos []string `json:"allowed_key_algos,omitempty"`
+
+	// MinTTLSeconds / MaxTTLSeconds bound the certificate lifetime. 0 means
+	// "no constraint" on that side.
+	MinTTLSeconds int64 `json:"min_ttl_seconds"`
+	MaxTTLSeconds int64 `json:"max_ttl_seconds"`
+
+	// RequireSAN forces every issued certificate to carry at least one SAN.
+	RequireSAN bool `json:"require_san"`
+
+	// AllowWildcard permits wildcard DNS SANs (e.g. "*.example.com").
+	// Default false = wildcard SANs rejected.
+	AllowWildcard bool `json:"allow_wildcard"`
+
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// CSRAutoApproveRule is a stored CSR auto-approval rule controlling which
+// CSRs a provisioner may auto-sign without caller review.
+type CSRAutoApproveRule struct {
+	ID            uuid.UUID `json:"id"`
+	ProvisionerID uuid.UUID `json:"provisioner_id"`
+	Name          string    `json:"name"`
+	// AllowedCommonNames are regex patterns the CSR CommonName must match.
+	AllowedCommonNames []string `json:"allowed_common_names,omitempty"`
+	// AllowedDNS are regex patterns every DNS SAN must match.
+	AllowedDNS []string `json:"allowed_dns,omitempty"`
+	// MaxTTLSeconds caps the signed certificate lifetime (0 uses an approval default).
+	MaxTTLSeconds int64     `json:"max_ttl_seconds"`
+	Enabled       bool      `json:"enabled"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 type Provisioner struct {
 	ID        uuid.UUID         `json:"id"`
 	CAID      uuid.UUID         `json:"ca_id"`
@@ -160,6 +338,7 @@ type Provisioner struct {
 	Type      ProvisionerType   `json:"type"`
 	Config    JSON              `json:"config"`
 	PolicyID  *uuid.UUID        `json:"policy_id,omitempty"`
+	ProfileID *uuid.UUID        `json:"profile_id,omitempty"`
 	Status    ProvisionerStatus `json:"status"`
 	CreatedAt time.Time         `json:"created_at"`
 }
@@ -176,7 +355,20 @@ type Policy struct {
 	AllowedSANs    []string    `json:"allowed_sans"`
 	RequireSAN     bool        `json:"require_san"`
 	KeyAlgos       []string    `json:"key_algos"`
-	CreatedAt      time.Time   `json:"created_at"`
+	PolicyOIDs     []string    `json:"policy_oids,omitempty"` // dotted-decimal OID strings
+	CPSURI         string      `json:"cps_uri,omitempty"`
+	// SSHPolicy holds the SSH CA issuance constraints as an SSHPolicyBody JSON.
+	// Non-nil when the policy applies to SSH issuance; nil when X.509-only.
+	SSHPolicy []byte    `json:"ssh_policy,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+}
+type NameConstraints struct {
+	PermittedDNSDomains   []string `json:"permitted_dns_domains,omitempty"`
+	ExcludedDNSDomains    []string `json:"excluded_dns_domains,omitempty"`
+	PermittedIPRanges     []string `json:"permitted_ip_ranges,omitempty"`
+	ExcludedIPRanges      []string `json:"excluded_ip_ranges,omitempty"`
+	PermittedEmailDomains []string `json:"permitted_email_domains,omitempty"`
+	ExcludedEmailDomains  []string `json:"excluded_email_domains,omitempty"`
 }
 
 // ACMEAccount is an ACME client account, keyed by its JWK thumbprint.
@@ -237,15 +429,6 @@ type AuditLog struct {
 	CreatedAt time.Time  `json:"created_at"`
 }
 
-// CRLCache holds the most recently generated CRL PEM for each CA.
-type CRLCache struct {
-	ID         uuid.UUID `json:"id"`
-	CAID       uuid.UUID `json:"ca_id"`
-	CRLPEM     string    `json:"crl_pem"`
-	ThisUpdate time.Time `json:"this_update"`
-	NextUpdate time.Time `json:"next_update"`
-}
-
 // APIKey is a bearer token used to authenticate calls to the management API.
 type APIKey struct {
 	ID        uuid.UUID  `json:"id"`
@@ -279,6 +462,16 @@ type Store interface {
 
 	// ListChildCAs returns all CAs whose parent_id equals parentID.
 	ListChildCAs(ctx context.Context, parentID uuid.UUID) ([]*CertificateAuthority, error)
+
+	// CreateCrossCert stores a cross-signed certificate for the target CA.
+	CreateCrossCert(ctx context.Context, cc *CrossCert) error
+
+	// GetCrossCert returns the cross cert for targetCAID signed by signingCAID,
+	// or (nil, nil) if none exists.
+	GetCrossCert(ctx context.Context, targetCAID, signingCAID uuid.UUID) (*CrossCert, error)
+
+	// ListCrossCertsByTarget returns all cross certs issued for the target CA.
+	ListCrossCertsByTarget(ctx context.Context, targetCAID uuid.UUID) ([]*CrossCert, error)
 
 	// UpdateCAStatus changes the status field of a CA (active → revoked/expired).
 	UpdateCAStatus(ctx context.Context, id uuid.UUID, status CAStatus) error
@@ -432,11 +625,99 @@ type Store interface {
 	UpdateACMEAuthorizationStatus(ctx context.Context, id uuid.UUID, status ACMEAuthorizationStatus) error
 	ListAuthorizationsByOrder(ctx context.Context, orderID uuid.UUID) ([]*ACMEAuthorization, error)
 	ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*ACMEChallenge, error)
-
+	GetACMEAuthorizationByIdentifier(ctx context.Context, accountID uuid.UUID, identifierType, identifierValue string) (*ACMEAuthorization, error)
+	ListAuthorizationsByAccount(ctx context.Context, accountID uuid.UUID) ([]*ACMEAuthorization, error)
 	// (Update CreateACMEChallenge to use the new struct)
 
 	// PruneExpiredNonces removes nonces past their expiry timestamp.
 	PruneExpiredNonces(ctx context.Context) error
+	// CreateSSHCA persists a new SSH signing CA. Key must already be encrypted.
+	CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error
+
+	// GetSSHCA returns the SSH CA with the given ID, or (nil, nil) if not found.
+	GetSSHCA(ctx context.Context, id uuid.UUID) (*SSHCertificateAuthority, error)
+
+	// GetSSHCAByName returns the SSH CA with the given name, or (nil, nil).
+	GetSSHCAByName(ctx context.Context, name string) (*SSHCertificateAuthority, error)
+
+	// ListSSHCAs returns all SSH CAs ordered by creation time ascending.
+	ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthority, error)
+
+	// CreateSSHCertificate persists a newly issued SSH certificate record.
+	CreateSSHCertificate(ctx context.Context, cert *SSHCertificate) error
+
+	// GetSSHCertificate returns the SSH certificate with the given ID, or (nil, nil).
+	GetSSHCertificate(ctx context.Context, id uuid.UUID) (*SSHCertificate, error)
+
+	// GetSSHCertificateBySerial returns the SSH certificate matching caID+serial, or (nil, nil).
+	GetSSHCertificateBySerial(ctx context.Context, caID uuid.UUID, serial uint64) (*SSHCertificate, error)
+
+	// ListSSHCertificatesByCA returns all SSH certificates issued by caID, newest first.
+	ListSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error)
+
+	// RevokeSSHCertificate marks an SSH certificate revoked. Schema/plumbing
+	// only in phase 1 — no API endpoint wired up to it yet.
+	RevokeSSHCertificate(ctx context.Context, id uuid.UUID) error
+	// --- Add to the Store interface ---
+
+	// GetRateLimitConfig returns the config for a named limiter, or (nil, nil).
+	GetRateLimitConfig(ctx context.Context, name string) (*RateLimitConfig, error)
+
+	// ListRateLimitConfigs returns all configured limiters.
+	ListRateLimitConfigs(ctx context.Context) ([]*RateLimitConfig, error)
+
+	// UpsertRateLimitConfigIfAbsent inserts cfg only if no row with that
+	// name already exists. Used to seed defaults at boot without ever
+	// clobbering a value a future web UI has changed.
+	UpsertRateLimitConfigIfAbsent(ctx context.Context, cfg *RateLimitConfig) error
+
+	// UpdateRateLimitConfig unconditionally overwrites a limiter's config.
+	// Intended for the future web UI's edit endpoint.
+	UpdateRateLimitConfig(ctx context.Context, cfg *RateLimitConfig) error
+
+	// IncrementRateLimitCounter is a best-effort, write-through persistence
+	// of a fixed-window counter increment. Never authoritative — the caller
+	// (ratelimit.Engine) has already made its allow/deny decision from
+	// in-memory state before calling this.
+	IncrementRateLimitCounter(ctx context.Context, limiterName, bucketKey string, windowStart time.Time) error
+
+	// PruneExpiredRateLimitCounters deletes counter rows whose window
+	// started before olderThan.
+	PruneExpiredRateLimitCounters(ctx context.Context, olderThan time.Time) error
+	// --- Add to Store interface ---
+
+	// UpdateACMEAccountKey swaps an account's key_id/key_jwk (key rollover).
+	UpdateACMEAccountKey(ctx context.Context, accountID uuid.UUID, newKeyID string, newKeyJWK JSON) error
+
+	// MarkKeyIDRetired permanently blocks a JWK thumbprint from being used as
+	// a NEW account key again (common CA practice: an old key from a rollover
+	// can never come back into service, even on a different account).
+	MarkKeyIDRetired(ctx context.Context, keyID string) error
+
+	// IsKeyIDRetired reports whether keyID was retired via a prior key-change.
+	IsKeyIDRetired(ctx context.Context, keyID string) (bool, error)
+	// ListRevokedSSHCertificatesByCA returns only revoked SSH certs for caID.
+	ListRevokedSSHCertificatesByCA(ctx context.Context, caID uuid.UUID) ([]*SSHCertificate, error)
+
+	// UpsertSSHKRL inserts or replaces the cached KRL for an SSH CA.
+	UpsertSSHKRL(ctx context.Context, krl *SSHKRLCache) error
+
+	// GetSSHKRL returns the cached KRL for an SSH CA, or (nil, nil).
+	GetSSHKRL(ctx context.Context, caID uuid.UUID) (*SSHKRLCache, error)
+	// NextCRLNumber atomically returns the next monotonic CRL Number for
+	// caID, shared across base and delta CRLs so the sequence is global
+	// per-CA as RFC 5280 §5.2.4 requires.
+	NextCRLNumber(ctx context.Context, caID uuid.UUID) (int64, error)
+
+	// ListRevokedByCASince returns certificates revoked after `since`,
+	// used to compute delta CRL contents relative to a base CRL.
+	ListRevokedByCASince(ctx context.Context, caID uuid.UUID, since time.Time) ([]*Certificate, error)
+
+	// UpsertDeltaCRL inserts or replaces the cached delta CRL for a CA.
+	UpsertDeltaCRL(ctx context.Context, delta *DeltaCRLCache) error
+
+	// GetDeltaCRL returns the cached delta CRL for a CA, or (nil, nil).
+	GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*DeltaCRLCache, error)
 	// Close releases all connections held by the store.
 	Close() error
 }

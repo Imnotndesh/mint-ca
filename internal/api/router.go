@@ -2,6 +2,7 @@ package api
 
 import (
 	internalacme "mint-ca/internal/acme"
+	"mint-ca/internal/ratelimit"
 	"net/http"
 
 	"mint-ca/internal/api/handlers"
@@ -11,6 +12,8 @@ import (
 	"mint-ca/internal/config"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
+	"mint-ca/internal/sshca"
+	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -23,9 +26,12 @@ func BuildRouter(
 	cfg *config.Config,
 	store storage.Store,
 	caEngine *ca.Engine,
+	sshcaEngine *sshca.Engine,
 	crlMgr *revocation.CRLManager,
 	ocspResponder *revocation.OCSPResponder,
 	policyEngine *policy.Engine,
+	rlEngine *ratelimit.Engine,
+	sshKRLMgr *krl.Manager,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -37,21 +43,33 @@ func BuildRouter(
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok","service":"mint-ca"}`))
+		_, err := w.Write([]byte(`{"status":"ok","service":"mint-ca"}`))
+		if err != nil {
+			return
+		}
 	})
 
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterPublicRoutes(r)
+		r.Get(setup.TermsPath, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			_, _ = w.Write([]byte(setup.DefaultTermsText))
+		})
 	})
 
 	r.Group(func(r chi.Router) {
 		r.Use(apimiddleware.Auth(store))
+		r.Use(apimiddleware.RateLimit(rlEngine, store))
 		r.Use(apimiddleware.Audit(store))
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
+		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterRoutes(r)
 		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
+		handlers.NewProfileHandler(store).RegisterRoutes(r)
+		handlers.NewApprovalHandler(store).RegisterRoutes(r)
 		handlers.NewEABHandler(store).RegisterRoutes(r)
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
@@ -59,8 +77,13 @@ func BuildRouter(
 	})
 
 	if cfg.ACME.Enabled {
-		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), cfg.ACME.BaseURL)
-		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME).RegisterRoutes(r)
+		caaChecker := internalacme.NewCAAChecker(
+			cfg.ACME.CAADomain,
+			cfg.ACME.CAADNSServer,
+			internalacme.SplitBypassLabels(cfg.ACME.CAABypassLabels),
+		)
+		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, caaChecker, cfg.ACME.BaseURL)
+		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
 	}
 
 	return r

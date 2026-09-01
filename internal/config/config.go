@@ -17,12 +17,15 @@ import (
 // No package other than this one calls os.Getenv. If you need a value from the
 // environment, add it here.
 type Config struct {
-	Server  ServerConfig
-	Storage StorageConfig
-	Crypto  CryptoConfig
-	ACME    ACMEConfig
-	CRL     CRLConfig
-	Log     LogConfig
+	Server    ServerConfig
+	Storage   StorageConfig
+	Crypto    CryptoConfig
+	ACME      ACMEConfig
+	CRL       CRLConfig
+	Log       LogConfig
+	RateLimit RateLimitConfig
+	MTLS      MTLSConfig
+	Renewal   RenewalConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -101,6 +104,32 @@ type ACMEConfig struct {
 	// Default: false
 	// Env: MINT_ACME_EAB_REQUIRED
 	EABRequired bool
+
+	// CAADomain is this CA's public identity announced in its own CAA
+	// issue/issuewild records (RFC 8659). Operators grant mint-ca the right
+	// to issue by publishing, e.g.
+	//
+	//	example.com	CAA 0 issue "<CAADomain>"
+	//
+	// When set, mint-ca checks each requested identifier's Relevant RRset and
+	// refuses issuance unless the RRset is empty or authorises this domain.
+	// When empty, CAA lookup is skipped entirely (and the ACME service does
+	// not restrict issuance).
+	// Env: MINT_ACME_CAA_DOMAIN
+	CAADomain string
+
+	// CAADNSServer optionally overrides the resolver used for CAA lookups, in
+	// host:port form (e.g. "1.1.1.1:53"). Empty means read the system
+	// resolvers from /etc/resolv.conf.
+	// Env: MINT_ACME_CAA_DNS_SERVER
+	CAADNSServer string
+
+	// CAABypassLabels is a comma-separated list of domain labels for which CAA
+	// checking is skipped (an explicit CP/CPS exception per RFC 8659 §3). Any
+	// requested identifier that is exactly, or is a subdomain of, one of these
+	// labels bypasses CAA enforcement.
+	// Env: MINT_ACME_CAA_BYPASS_LABELS
+	CAABypassLabels string
 }
 
 // CRLConfig controls the CRL background refresh behaviour.
@@ -117,6 +146,41 @@ type CRLConfig struct {
 	// Default: 24h
 	// Env: MINT_CRL_VALIDITY_SECONDS
 	Validity time.Duration
+
+	// DeltaEnabled turns on delta CRL generation/serving. Opt-in — default
+	// false so existing deployments see no behavior change.
+	// Default: false
+	// Env: MINT_CRL_DELTA_ENABLED
+	DeltaEnabled bool
+
+	// BaseRefreshInterval is how often the full base CRL is regenerated while
+	// delta CRLs are enabled. Deltas are refreshed on every revocation and on
+	// the main RefreshInterval ticker; base CRLs can be rebuilt less frequently
+	// to reduce churn. Ignored when DeltaEnabled is false.
+	// Must be >= RefreshInterval.
+	// Default: RefreshInterval
+	// Env: MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS
+	BaseRefreshInterval time.Duration
+}
+
+// RateLimitOverride holds an optional first-boot-only override for one
+// hardcoded default limiter. Zero value (both fields 0) means "no override,
+// use the hardcoded default" for that field individually.
+type RateLimitOverride struct {
+	WindowSeconds int
+	MaxRequests   int
+}
+
+// RateLimitConfig holds optional env-sourced overrides for the four
+// hardcoded default limiters, applied only when seeding the DB for the
+// first time (see storage.UpsertRateLimitConfigIfAbsent). If a DB row
+// already exists, these are ignored entirely — the DB is authoritative
+// after first boot so a future web UI's edits are never clobbered.
+type RateLimitConfig struct {
+	NewAccountPerIP      RateLimitOverride
+	NewOrderPerAccount   RateLimitOverride
+	NewAuthzPerAccount   RateLimitOverride
+	APIKeyRequestsPerKey RateLimitOverride
 }
 
 // LogConfig controls structured logging output.
@@ -130,6 +194,57 @@ type LogConfig struct {
 	// Default: false
 	// Env: MINT_LOG_JSON
 	JSON bool
+}
+
+// MTLSConfig controls the optional mutual-TLS device enrollment listener. When
+// enabled, mint-ca runs a separate TLS listener that requires devices to present
+// a client certificate chain to a trusted issuer, then issues a new leaf bound
+// to the device identity.
+type MTLSConfig struct {
+	// Enabled turns on the MTLS enrollment listener.
+	// Env: MINT_MTLS_ENABLED
+	Enabled bool
+
+	// ListenAddr is the address the enrollment listener binds (e.g. ":8444").
+	// Env: MINT_MTLS_LISTEN_ADDR
+	ListenAddr string
+
+	// ClientCACertPEM is a PEM block of the CA cert (or chain) used to validate
+	// device client certificates presented during enrollment.
+	// Env: MINT_MTLS_CLIENT_CA
+	ClientCACertPEM string
+
+	// ServerCertFile/KeyFile are the server TLS cert/key for this listener.
+	// Reuses the main server TLS files when empty.
+	// Env: MINT_MTLS_CERT, MINT_MTLS_KEY
+	ServerCertFile string
+	ServerKeyFile  string
+}
+
+// RenewalConfig controls automatic certificate-renewal notices. A background
+// worker scans for active certificates whose NotAfter is within the lead window
+// and hands each to a configured deliverer (e.g. a webhook POST). The worker is
+// the generic trigger; the deliverer is pluggable so future integrations
+// (ACME re-issue, a management callback, a CLI) can be added without changing
+// the worker.
+type RenewalConfig struct {
+	// Enabled turns on the renewal worker.
+	// Env: MINT_RENEWAL_ENABLED
+	Enabled bool
+
+	// IntervalSeconds is how often the worker scans for certs due for renewal.
+	// Env: MINT_RENEWAL_INTERVAL_SECONDS
+	IntervalSeconds int64
+
+	// LeadSeconds is how long before NotAfter a certificate is considered due
+	// for renewal.
+	// Env: MINT_RENEWAL_LEAD_SECONDS
+	LeadSeconds int64
+
+	// WebhookURL, when set, is POSTed a JSON payload describing each certificate
+	// due for renewal, letting an external system perform the actual renewal.
+	// Env: MINT_RENEWAL_WEBHOOK_URL
+	WebhookURL string
 }
 
 // Load reads all configuration from environment variables, applies defaults,
@@ -210,6 +325,9 @@ func Load() (*Config, error) {
 	c.ACME.Enabled = envBool("MINT_ACME_ENABLED")
 	c.ACME.BaseURL = strings.TrimRight(strings.TrimSpace(os.Getenv("MINT_ACME_BASE_URL")), "/")
 	c.ACME.EABRequired = envBool("MINT_ACME_EAB_REQUIRED")
+	c.ACME.CAADomain = strings.TrimSpace(os.Getenv("MINT_ACME_CAA_DOMAIN"))
+	c.ACME.CAADNSServer = strings.TrimSpace(os.Getenv("MINT_ACME_CAA_DNS_SERVER"))
+	c.ACME.CAABypassLabels = os.Getenv("MINT_ACME_CAA_BYPASS_LABELS")
 
 	if c.ACME.Enabled {
 		if c.ACME.BaseURL == "" {
@@ -226,6 +344,14 @@ func Load() (*Config, error) {
 
 	c.CRL.RefreshInterval = envDuration("MINT_CRL_REFRESH_INTERVAL_SECONDS", 1*time.Hour)
 	c.CRL.Validity = envDuration("MINT_CRL_VALIDITY_SECONDS", 24*time.Hour)
+	c.CRL.DeltaEnabled = envBool("MINT_CRL_DELTA_ENABLED")
+	c.CRL.BaseRefreshInterval = envDuration("MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS", 0)
+	if c.CRL.BaseRefreshInterval == 0 {
+		// Default the base refresh cadence to the delta refresh cadence when
+		// unset, so an operator only has to think about one number unless they
+		// explicitly want a longer base lifecycle.
+		c.CRL.BaseRefreshInterval = c.CRL.RefreshInterval
+	}
 
 	if c.CRL.RefreshInterval < 1*time.Minute {
 		errs = append(errs,
@@ -236,6 +362,11 @@ func Load() (*Config, error) {
 		errs = append(errs,
 			"MINT_CRL_VALIDITY_SECONDS must be greater than MINT_CRL_REFRESH_INTERVAL_SECONDS — "+
 				"a CRL must be valid for longer than the refresh interval or clients will see expired CRLs",
+		)
+	}
+	if c.CRL.DeltaEnabled && c.CRL.BaseRefreshInterval < c.CRL.RefreshInterval {
+		errs = append(errs,
+			"MINT_CRL_BASE_REFRESH_INTERVAL_SECONDS must be at least MINT_CRL_REFRESH_INTERVAL_SECONDS when delta CRLs are enabled",
 		)
 	}
 
@@ -251,6 +382,48 @@ func Load() (*Config, error) {
 			c.Log.Level,
 		))
 	}
+	c.RateLimit.NewAccountPerIP = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_NEW_ACCOUNT_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_NEW_ACCOUNT_MAX"),
+	}
+	c.RateLimit.NewOrderPerAccount = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_NEW_ORDER_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_NEW_ORDER_MAX"),
+	}
+	c.RateLimit.NewAuthzPerAccount = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_NEW_AUTHZ_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_NEW_AUTHZ_MAX"),
+	}
+	c.RateLimit.APIKeyRequestsPerKey = RateLimitOverride{
+		WindowSeconds: envIntOptional("MINT_RATELIMIT_APIKEY_WINDOW_SECONDS"),
+		MaxRequests:   envIntOptional("MINT_RATELIMIT_APIKEY_MAX"),
+	}
+
+	c.MTLS.Enabled = envBool("MINT_MTLS_ENABLED")
+	c.MTLS.ListenAddr = strings.TrimSpace(os.Getenv("MINT_MTLS_LISTEN_ADDR"))
+	c.MTLS.ClientCACertPEM = strings.TrimSpace(os.Getenv("MINT_MTLS_CLIENT_CA"))
+	c.MTLS.ServerCertFile = strings.TrimSpace(os.Getenv("MINT_MTLS_CERT"))
+	c.MTLS.ServerKeyFile = strings.TrimSpace(os.Getenv("MINT_MTLS_KEY"))
+
+	if c.MTLS.Enabled {
+		if c.MTLS.ListenAddr == "" {
+			errs = append(errs, "MINT_MTLS_LISTEN_ADDR is required when MINT_MTLS_ENABLED=true")
+		}
+		if c.MTLS.ClientCACertPEM == "" {
+			errs = append(errs, "MINT_MTLS_CLIENT_CA is required when MINT_MTLS_ENABLED=true")
+		}
+	}
+
+	c.Renewal.Enabled = envBool("MINT_RENEWAL_ENABLED")
+	c.Renewal.IntervalSeconds = int64(envIntOptional("MINT_RENEWAL_INTERVAL_SECONDS"))
+	if c.Renewal.IntervalSeconds == 0 {
+		c.Renewal.IntervalSeconds = 3600 // 1h
+	}
+	c.Renewal.LeadSeconds = int64(envIntOptional("MINT_RENEWAL_LEAD_SECONDS"))
+	if c.Renewal.LeadSeconds == 0 {
+		c.Renewal.LeadSeconds = 7 * 24 * 3600 // 7 days
+	}
+	c.Renewal.WebhookURL = strings.TrimSpace(os.Getenv("MINT_RENEWAL_WEBHOOK_URL"))
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)
@@ -290,12 +463,20 @@ func (c *Config) Redact() map[string]interface{} {
 			"eab_required": c.ACME.EABRequired,
 		},
 		"crl": map[string]interface{}{
-			"refresh_interval": c.CRL.RefreshInterval.String(),
-			"validity":         c.CRL.Validity.String(),
+			"refresh_interval":      c.CRL.RefreshInterval.String(),
+			"validity":              c.CRL.Validity.String(),
+			"delta_enabled":         c.CRL.DeltaEnabled,
+			"base_refresh_interval": c.CRL.BaseRefreshInterval.String(),
 		},
 		"log": map[string]interface{}{
 			"level": c.Log.Level,
 			"json":  c.Log.JSON,
+		},
+		"rate_limit": map[string]interface{}{
+			"new_account_override": c.RateLimit.NewAccountPerIP.MaxRequests > 0 || c.RateLimit.NewAccountPerIP.WindowSeconds > 0,
+			"new_order_override":   c.RateLimit.NewOrderPerAccount.MaxRequests > 0 || c.RateLimit.NewOrderPerAccount.WindowSeconds > 0,
+			"new_authz_override":   c.RateLimit.NewAuthzPerAccount.MaxRequests > 0 || c.RateLimit.NewAuthzPerAccount.WindowSeconds > 0,
+			"apikey_override":      c.RateLimit.APIKeyRequestsPerKey.MaxRequests > 0 || c.RateLimit.APIKeyRequestsPerKey.WindowSeconds > 0,
 		},
 	}
 }
@@ -317,6 +498,20 @@ func envBool(key string) bool {
 		return true
 	}
 	return false
+}
+
+// envIntOptional reads an integer environment variable, returning 0 if
+// unset, empty, or unparsable — 0 is treated by callers as "no override".
+func envIntOptional(key string) int {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
 }
 
 // envDuration reads an environment variable as a number of seconds and returns
