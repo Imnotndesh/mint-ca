@@ -803,3 +803,44 @@ When a limit is exceeded:
 Every rejection is written to the audit log as event type `rate_limit_exceeded`.
 
 Defaults can be overridden on **first boot only** (a value is never overwritten once a database row exists — see Setup.md). After first boot, editing limiter configs requires direct database access; a management API for this is planned but not yet implemented.
+
+---
+
+## 1.15 CSR Auto-Approval Rules
+
+CSR auto‑approval rules control which CSRs a provisioner may **auto‑sign** without
+review, and enforce best‑of‑default constraints. Managed under
+`/api/v1/approval/csr-rules`.
+
+**Default posture is deny:** a rule whitelists what may be signed. A CSR matching
+a rule is auto‑approved; any non‑matching CommonName, any DNS SAN not in the
+rule's allowlist, or a requested TTL above the rule's cap is refused. When **no**
+rule exists for a provisioner, CSR signing is unchanged (no auto‑approval policy
+governs it). This is opt‑in.
+
+### `POST /api/v1/approval/csr-rules`
+Create a rule.
+
+**Request body**
+```json
+{
+  "provisioner_id": "provisioner-uuid",
+  "name": "internal-fleet",
+  "allowed_common_names": ["^svc-.*\\\\.internal\\\\.example$"],  // optional regexes the CSR CN must match
+  "allowed_dns": ["\\\\.internal\\\\.example$"],                 // regexes EVERY DNS SAN must match
+  "max_ttl_seconds": 86400                                          // optional; default cap 90 days
+}
+```
+**Response (201 Created)** – the stored rule (`enabled: true`).
+
+### `GET /api/v1/approval/csr-rules`
+List rules. Optionally filter with `?provisioner_id=<uuid>`.
+
+### `PUT /api/v1/approval/csr-rules/{ruleID}`
+Edit a rule (same body as create, plus `"enabled"`). 
+
+### `DELETE /api/v1/approval/csr-rules/{ruleID}`
+Delete a rule.
+
+> Enforcement happens on `POST /api/v1/certs/sign`. The TLS/HTTPS config for CAA
+> checking is configured via env (`MINT_ACME_CAA_*`, see Setup.md), not the REST API.

@@ -26,12 +26,12 @@ import (
 type testFakeStore struct {
 	storage.Store
 
-	mu       sync.Mutex
-	cas      map[uuid.UUID]*storage.CertificateAuthority
-	certs    map[uuid.UUID]*storage.Certificate
-	crls     map[uuid.UUID]*storage.CRLCache
+	mu        sync.Mutex
+	cas       map[uuid.UUID]*storage.CertificateAuthority
+	certs     map[uuid.UUID]*storage.Certificate
+	crls      map[uuid.UUID]*storage.CRLCache
 	deltaCRLs map[uuid.UUID]*storage.DeltaCRLCache
-	counters map[uuid.UUID]int64
+	counters  map[uuid.UUID]int64
 }
 
 func newTestFakeStore() *testFakeStore {
@@ -189,10 +189,10 @@ func addCerts(f *testFakeStore, caID uuid.UUID, n int) []*storage.Certificate {
 	certs := make([]*storage.Certificate, 0, n)
 	for i := 0; i < n; i++ {
 		c := &storage.Certificate{
-			ID:        uuid.New(),
-			CAID:      caID,
-			Serial:    big.NewInt(int64(100 + i)).String(),
-			Status:    storage.CertStatusActive,
+			ID:       uuid.New(),
+			CAID:     caID,
+			Serial:   big.NewInt(int64(100 + i)).String(),
+			Status:   storage.CertStatusActive,
 			CertPEM:  "PEM",
 			IssuedAt: time.Now().UTC(),
 		}

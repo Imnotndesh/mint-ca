@@ -23,9 +23,9 @@ import (
 // CRLManager handles CRL generation, caching, and serving for all CAs.
 // It is the only component that writes to the crl_cache table.
 type CRLManager struct {
-	store    storage.Store
-	keystore *mintcrypto.Keystore
-	baseURL      string 
+	store        storage.Store
+	keystore     *mintcrypto.Keystore
+	baseURL      string
 	deltaEnabled bool
 }
 
