@@ -264,22 +264,28 @@ type ACMEAuthorization struct {
 
 // Certificate represents a leaf certificate issued by one of the stored CAs.
 type Certificate struct {
-	ID            uuid.UUID  `json:"id"`
-	CAID          uuid.UUID  `json:"ca_id"`
-	Serial        string     `json:"serial"`
-	SubjectCN     string     `json:"subject_cn"`
-	SANs          SANs       `json:"sans"`
-	KeyUsage      []string   `json:"key_usage"`
-	CertPEM       string     `json:"cert_pem"`
-	Status        CertStatus `json:"status"`
-	RevokedAt     *time.Time `json:"revoked_at,omitempty"`
-	RevokeReason  *int       `json:"revoke_reason,omitempty"`
-	NotBefore     time.Time  `json:"not_before"`
-	NotAfter      time.Time  `json:"not_after"`
-	IssuedAt      time.Time  `json:"issued_at"`
-	ProvisionerID uuid.UUID  `json:"provisioner_id"`
-	Requester     string     `json:"requester"`
-	Metadata      JSON       `json:"metadata,omitempty"`
+	ID        uuid.UUID `json:"id"`
+	CAID      uuid.UUID `json:"ca_id"`
+	Serial    string    `json:"serial"`
+	SubjectCN string    `json:"subject_cn"`
+	SANs      SANs      `json:"sans"`
+	KeyUsage  []string  `json:"key_usage"`
+	CertPEM   string    `json:"cert_pem"`
+	// KeyEncrypted holds the keystore-encrypted leaf private key when the
+	// issuer opted into key escrow (store_key=true). Empty otherwise.
+	KeyEncrypted []byte `json:"-"`
+	// KeyPasscodeRequired records whether retrieval of the escrowed key also
+	// requires a caller-supplied passcode (key_passcode was set at issue).
+	KeyPasscodeRequired bool       `json:"-"`
+	Status              CertStatus `json:"status"`
+	RevokedAt           *time.Time `json:"revoked_at,omitempty"`
+	RevokeReason        *int       `json:"revoke_reason,omitempty"`
+	NotBefore           time.Time  `json:"not_before"`
+	NotAfter            time.Time  `json:"not_after"`
+	IssuedAt            time.Time  `json:"issued_at"`
+	ProvisionerID       uuid.UUID  `json:"provisioner_id"`
+	Requester           string     `json:"requester"`
+	Metadata            JSON       `json:"metadata,omitempty"`
 }
 
 // Provisioner is the entity authorised to request certificates from a CA.

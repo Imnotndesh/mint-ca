@@ -442,6 +442,13 @@ type IssueCertRequest struct {
 	Metadata         storage.JSON
 	CertPolicyOIDs   []string
 	CertPolicyCPSURI string
+	// StoreKey enables private-key escrow: the generated leaf key is encrypted
+	// (keystore at rest, plus optional passcode) and persisted so it can be
+	// retrieved later via RetrieveKey / the export endpoint.
+	StoreKey bool
+	// KeyPasscode optionally guards the escrowed key. When set, retrieval (and
+	// key-bearing export) requires this passcode.
+	KeyPasscode string
 }
 
 func (r *IssueCertRequest) setDefaults() {
@@ -1184,6 +1191,12 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		Metadata:      req.Metadata,
 	}
 
+	if req.StoreKey {
+		if err := e.escrowLeafKey(record, leafKeyPEM, req.KeyPasscode); err != nil {
+			return nil, fmt.Errorf("ca: IssueCert: escrow key: %w", err)
+		}
+	}
+
 	if err := e.store.CreateCertificate(ctx, record); err != nil {
 		return nil, fmt.Errorf("ca: IssueCert: store certificate: %w", err)
 	}
@@ -1331,6 +1344,71 @@ func (e *Engine) GetChainPEM(ctx context.Context, caID uuid.UUID) ([]byte, error
 	}
 	// buildChain with nil leafPEM returns only the CA chain.
 	return e.buildChain(ctx, caRecord, nil)
+}
+
+// GetLeafChainPEM returns the full chain for an issued leaf certificate: the
+// leaf PEM followed by its issuing CA's chain up to the root. Used by the cert
+// export endpoint to package a self-contained bundle.
+func (e *Engine) GetLeafChainPEM(ctx context.Context, caID uuid.UUID, leafPEM []byte) ([]byte, error) {
+	caRecord, err := e.store.GetCA(ctx, caID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: GetLeafChainPEM: load CA: %w", err)
+	}
+	if caRecord == nil {
+		return nil, fmt.Errorf("ca: GetLeafChainPEM: CA %s not found", caID)
+	}
+	return e.buildChain(ctx, caRecord, leafPEM)
+}
+
+// escrowLeafKey encrypts a leaf private key for storage: it is first sealed by
+// the keystore master key at rest, and, when a passcode is supplied, additionally
+// wrapped by the passcode so retrieval requires it. Fields on record are updated
+// in place.
+func (e *Engine) escrowLeafKey(record *storage.Certificate, keyPEM []byte, passcode string) error {
+	stored, err := e.keystore.EncryptPEM(keyPEM)
+	if err != nil {
+		return err
+	}
+	if passcode != "" {
+		stored, err = mintcrypto.EncryptWithPasscode(stored, []byte(passcode))
+		if err != nil {
+			return err
+		}
+		record.KeyPasscodeRequired = true
+	}
+	record.KeyEncrypted = stored
+	return nil
+}
+
+// RetrieveKey returns the escrowed private key for a certificate, or nil if it
+// was not stored (store_key was false). When the key is passcode-guarded the
+// passcode must be supplied to decrypt it.
+func (e *Engine) RetrieveKey(ctx context.Context, certID uuid.UUID, passcode string) ([]byte, error) {
+	record, err := e.store.GetCertificate(ctx, certID)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RetrieveKey: load cert: %w", err)
+	}
+	if record == nil {
+		return nil, fmt.Errorf("ca: RetrieveKey: certificate %s not found", certID)
+	}
+	if len(record.KeyEncrypted) == 0 {
+		return nil, nil // not escrowed — no key available
+	}
+	blob := record.KeyEncrypted
+	if record.KeyPasscodeRequired {
+		if passcode == "" {
+			return nil, errors.New("ca: RetrieveKey: this key is passcode-protected; a passcode is required")
+		}
+		blob, err = mintcrypto.DecryptWithPasscode(blob, []byte(passcode))
+		if err != nil {
+			return nil, err
+		}
+	}
+	keyPEM, err := e.keystore.DecryptPEM(blob)
+	if err != nil {
+		return nil, fmt.Errorf("ca: RetrieveKey: decrypt: %w", err)
+	}
+	return keyPEM, nil
 }
 
 // GetCrossChainPEM returns the cross-signing chain for a target CA: the
