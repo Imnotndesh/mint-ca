@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"mint-ca/internal/logger"
 	"mint-ca/internal/ratelimit"
@@ -19,12 +20,16 @@ import (
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
 	mintcrypto "mint-ca/internal/crypto"
+	"mint-ca/internal/mtls"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
+	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
 	"mint-ca/internal/workers"
-	"mint-ca/internal/sshca/krl"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 )
 
 func main() {
@@ -79,7 +84,7 @@ func main() {
 	apiWorkers := workers.NewWorkerGroup()
 	apiWorkers.Add(workers.NewCRLWorker(crlManager, cfg.CRL))
 	apiWorkers.Add(workers.NewNonceWorker(store))
-	apiWorkers.Add(workers.NewSSHKRLWorker(sshKRLManager,cfg.CRL))
+	apiWorkers.Add(workers.NewSSHKRLWorker(sshKRLManager, cfg.CRL))
 	apiWorkers.Add(workers.NewRateLimitPruneWorker(store))
 	apiWorkers.Start(context.Background())
 	// Read state before starting the listener so we know which router to mount.
@@ -161,7 +166,7 @@ func main() {
 
 	case storage.StateReady:
 		slog.Info("setup complete — starting full API")
-		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine,sshKRLManager)
+		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager)
 	}
 
 	srv := &http.Server{
@@ -201,6 +206,20 @@ func main() {
 		}
 	}()
 
+	// Optional mutual-TLS device enrollment listener. Started in READY state
+	// only, on its own TLS listener that requires a device client certificate.
+	var mtlsSrv *http.Server
+	if cfg.MTLS.Enabled && state == storage.StateReady {
+		mtlsSrv, err = startMTLSListener(cfg, store, caEngine)
+		if err != nil {
+			slog.Error("failed to start mtls enrollment listener", "err", err)
+			allWorkers := apiWorkers
+			_ = allWorkers
+		}
+	} else if cfg.MTLS.Enabled {
+		slog.Warn("MTLS enrollment requested but server not in ready state; not starting")
+	}
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
@@ -223,6 +242,11 @@ func main() {
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		slog.Error("HTTP shutdown error", "err", err)
+	}
+	if mtlsSrv != nil {
+		if err := mtlsSrv.Shutdown(shutdownCtx); err != nil {
+			slog.Error("MTLS shutdown error", "err", err)
+		}
 	}
 
 	slog.Info("stopping background workers")
@@ -256,4 +280,55 @@ func buildLogger(cfg config.LogConfig) *slog.Logger {
 	}
 
 	return slog.New(logger.NewPrettyHandler(os.Stdout, level))
+}
+
+func startMTLSListener(cfg *config.Config, store storage.Store, caEngine *ca.Engine) (*http.Server, error) {
+	issuerID, provID, err := resolveMTLSTargets(context.Background(), store)
+	if err != nil {
+		return nil, err
+	}
+
+	tlsConf, err := mtls.BuildServerTLSConfig(cfg.MTLS, []byte(cfg.MTLS.ClientCACertPEM))
+	if err != nil {
+		return nil, err
+	}
+
+	enroll := mtls.NewEnrollHandler(caEngine, store, issuerID, provID)
+	r := chi.NewRouter()
+	enroll.RegisterRoutes(r)
+
+	mtlsSrv := &http.Server{
+		Addr:      cfg.MTLS.ListenAddr,
+		Handler:   r,
+		TLSConfig: tlsConf,
+	}
+	go func() {
+		if err := mtlsSrv.ListenAndServeTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("mtls enrollment listener error", "err", err)
+		}
+	}()
+	slog.Info("mtls enrollment listener started", "addr", cfg.MTLS.ListenAddr)
+	return mtlsSrv, nil
+}
+
+// resolveMTLSTargets finds the signing CA and an "mtls"-type provisioner bound
+// to it. Prefers a provisioner whose type is mtls; otherwise fails unless an
+// mtls provisioner exists for the first active CA.
+func resolveMTLSTargets(ctx context.Context, store storage.Store) (uuid.UUID, uuid.UUID, error) {
+	cas, err := store.ListCAs(ctx)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, fmt.Errorf("mtls: list CAs: %w", err)
+	}
+	for _, caRec := range cas {
+		provs, err := store.ListProvisionersByCA(ctx, caRec.ID)
+		if err != nil {
+			continue
+		}
+		for _, p := range provs {
+			if p.Type == storage.ProvisionerTypeMTLS && p.Status == storage.ProvisionerStatusActive {
+				return p.CAID, p.ID, nil
+			}
+		}
+	}
+	return uuid.Nil, uuid.Nil, errors.New("mtls: no active 'mtls' provisioner found; create one first")
 }

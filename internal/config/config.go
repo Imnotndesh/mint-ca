@@ -24,6 +24,7 @@ type Config struct {
 	CRL       CRLConfig
 	Log       LogConfig
 	RateLimit RateLimitConfig
+	MTLS      MTLSConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -194,6 +195,31 @@ type LogConfig struct {
 	JSON bool
 }
 
+// MTLSConfig controls the optional mutual-TLS device enrollment listener. When
+// enabled, mint-ca runs a separate TLS listener that requires devices to present
+// a client certificate chain to a trusted issuer, then issues a new leaf bound
+// to the device identity.
+type MTLSConfig struct {
+	// Enabled turns on the MTLS enrollment listener.
+	// Env: MINT_MTLS_ENABLED
+	Enabled bool
+
+	// ListenAddr is the address the enrollment listener binds (e.g. ":8444").
+	// Env: MINT_MTLS_LISTEN_ADDR
+	ListenAddr string
+
+	// ClientCACertPEM is a PEM block of the CA cert (or chain) used to validate
+	// device client certificates presented during enrollment.
+	// Env: MINT_MTLS_CLIENT_CA
+	ClientCACertPEM string
+
+	// ServerCertFile/KeyFile are the server TLS cert/key for this listener.
+	// Reuses the main server TLS files when empty.
+	// Env: MINT_MTLS_CERT, MINT_MTLS_KEY
+	ServerCertFile string
+	ServerKeyFile  string
+}
+
 // Load reads all configuration from environment variables, applies defaults,
 // validates every field, and returns a fully populated Config.
 //
@@ -345,6 +371,22 @@ func Load() (*Config, error) {
 		WindowSeconds: envIntOptional("MINT_RATELIMIT_APIKEY_WINDOW_SECONDS"),
 		MaxRequests:   envIntOptional("MINT_RATELIMIT_APIKEY_MAX"),
 	}
+
+	c.MTLS.Enabled = envBool("MINT_MTLS_ENABLED")
+	c.MTLS.ListenAddr = strings.TrimSpace(os.Getenv("MINT_MTLS_LISTEN_ADDR"))
+	c.MTLS.ClientCACertPEM = strings.TrimSpace(os.Getenv("MINT_MTLS_CLIENT_CA"))
+	c.MTLS.ServerCertFile = strings.TrimSpace(os.Getenv("MINT_MTLS_CERT"))
+	c.MTLS.ServerKeyFile = strings.TrimSpace(os.Getenv("MINT_MTLS_KEY"))
+
+	if c.MTLS.Enabled {
+		if c.MTLS.ListenAddr == "" {
+			errs = append(errs, "MINT_MTLS_LISTEN_ADDR is required when MINT_MTLS_ENABLED=true")
+		}
+		if c.MTLS.ClientCACertPEM == "" {
+			errs = append(errs, "MINT_MTLS_CLIENT_CA is required when MINT_MTLS_ENABLED=true")
+		}
+	}
+
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)
 	}
