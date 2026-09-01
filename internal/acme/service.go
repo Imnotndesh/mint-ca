@@ -12,13 +12,13 @@ import (
 	"encoding/pem"
 	"fmt"
 	"log/slog"
-	"mint-ca/internal/ca/revocation"
-	"strings"
-	"time"
-
 	"mint-ca/internal/acme/challenge"
 	"mint-ca/internal/ca"
+	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/storage"
+	"net/url"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -492,6 +492,9 @@ func (s *Service) NewAccount(
 	var cfg ProvisionerConfig
 	_ = json.Unmarshal(mustMarshalJSON(provisioner.Config), &cfg)
 	cfg.SetDefaults()
+	if prob := validateContacts(contact); prob != nil {
+		return nil, false, prob
+	}
 
 	// Check whether this key is already registered.
 	existing, err := s.store.GetACMEAccountByKeyID(ctx, thumbprint)
@@ -540,6 +543,11 @@ func (s *Service) UpdateAccount(
 	contact []string,
 	deactivate bool,
 ) (*storage.ACMEAccount, *Problem) {
+	if contact != nil {
+		if prob := validateContacts(contact); prob != nil {
+			return nil, prob
+		}
+	}
 	if deactivate {
 		if err := s.store.UpdateACMEAccountStatus(ctx, account.ID, storage.ACMEAccountStatusDeactivated); err != nil {
 			return nil, ErrServerInternalProblem("deactivate account: " + err.Error())
@@ -1254,6 +1262,30 @@ func generateRandomBytes(b []byte) (int, error) {
 func mustMarshalJSON(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+func validateContacts(contacts []string) *Problem {
+	for _, c := range contacts {
+		u, err := url.Parse(c)
+		if err != nil {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q is not a valid URI: %v", c, err))
+		}
+		if u.Scheme == "" {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q must be a URI with a scheme", c))
+		}
+		if u.Scheme != "mailto" {
+			return ErrUnsupportedContactProblem(fmt.Sprintf("contact scheme %q is not supported; only mailto: is accepted", u.Scheme))
+		}
+		if u.Opaque == "" {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q has an empty mailto address", c))
+		}
+		if strings.Contains(u.Opaque, ",") {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q must not contain multiple addresses", c))
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return ErrInvalidContactProblem(fmt.Sprintf("contact %q must not contain hfields or a fragment", c))
+		}
+	}
+	return nil
 }
 
 func mustUnmarshalRawJSON(b []byte) map[string]interface{} {

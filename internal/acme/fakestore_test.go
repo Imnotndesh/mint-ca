@@ -200,7 +200,16 @@ func (f *fakeStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
 }
 
 // ---- ACME accounts ----
-
+func (f *fakeStore) UpdateACMEAccountContact(ctx context.Context, id uuid.UUID, contact []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a, ok := f.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found")
+	}
+	a.Contact = contact
+	return nil
+}
 func (f *fakeStore) CreateACMEAccount(ctx context.Context, a *storage.ACMEAccount) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -224,10 +233,6 @@ func (f *fakeStore) GetACMEAccount(ctx context.Context, id uuid.UUID) (*storage.
 }
 func (f *fakeStore) UpdateACMEAccountStatus(ctx context.Context, id uuid.UUID, status storage.ACMEAccountStatus) error {
 	notImplemented("UpdateACMEAccountStatus")
-	return nil
-}
-func (f *fakeStore) UpdateACMEAccountContact(ctx context.Context, id uuid.UUID, contact []string) error {
-	notImplemented("UpdateACMEAccountContact")
 	return nil
 }
 

@@ -72,7 +72,13 @@ func ErrOrderNotReadyProblem(detail string) *Problem {
 func ErrBadCSRProblem(detail string) *Problem {
 	return NewProblem(ErrBadCSR, http.StatusBadRequest, detail)
 }
+func ErrInvalidContactProblem(detail string) *Problem {
+	return NewProblem(ErrInvalidContact, http.StatusBadRequest, detail)
+}
 
+func ErrUnsupportedContactProblem(detail string) *Problem {
+	return NewProblem(ErrUnsupportedContact, http.StatusBadRequest, detail)
+}
 func ErrExternalAccountRequiredProblem() *Problem {
 	return NewProblem(
 		ErrExternalAccountRequired,
