@@ -27,9 +27,9 @@ func ocspRequestWithNonce(t *testing.T, issuer *x509.Certificate, nonce []byte) 
 	}
 	var outer struct {
 		TBSRequest struct {
-			Version       int             `asn1:"optional,explicit,tag:0,default:0"`
-			RequestList   []asn1.RawValue
-			Extensions    []pkix.Extension `asn1:"optional,explicit,tag:2"`
+			Version     int `asn1:"optional,explicit,tag:0,default:0"`
+			RequestList []asn1.RawValue
+			Extensions  []pkix.Extension `asn1:"optional,explicit,tag:2"`
 		}
 	}
 	if _, err := asn1.Unmarshal(base, &outer); err != nil {

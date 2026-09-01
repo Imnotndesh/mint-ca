@@ -15,12 +15,12 @@ import (
 // stay fresh and current with the base) while the full base CRL is only
 // rebuilt on BaseRefreshInterval — a separate, potentially longer cadence.
 type CRLWorker struct {
-	mgr               *revocation.CRLManager
-	interval          time.Duration
-	validity          time.Duration
-	deltaEnabled      bool
-	baseInterval      time.Duration
-	lastBaseRefresh   time.Time
+	mgr             *revocation.CRLManager
+	interval        time.Duration
+	validity        time.Duration
+	deltaEnabled    bool
+	baseInterval    time.Duration
+	lastBaseRefresh time.Time
 }
 
 func NewCRLWorker(mgr *revocation.CRLManager, cfg config.CRLConfig) *CRLWorker {
