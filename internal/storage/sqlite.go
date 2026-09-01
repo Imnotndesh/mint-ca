@@ -400,13 +400,15 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 
 CREATE TABLE IF NOT EXISTS ssh_certificate_authorities (
-	id         TEXT    NOT NULL PRIMARY KEY,
-	name       TEXT    NOT NULL UNIQUE,
-	key_algo   TEXT    NOT NULL,
-	public_key TEXT    NOT NULL,
-	key_enc    BLOB    NOT NULL,
-	status     TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired')),
-	created_at DATETIME NOT NULL
+	id            TEXT    NOT NULL PRIMARY KEY,
+	name          TEXT    NOT NULL UNIQUE,
+	key_algo      TEXT    NOT NULL,
+	public_key    TEXT    NOT NULL,
+	key_enc       BLOB    NOT NULL,
+	status        TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','expired','superseded')),
+	logical_ca_id TEXT,
+	parent_id     TEXT,
+	created_at    DATETIME NOT NULL
 );
 CREATE TABLE IF NOT EXISTS acme_authorizations (
     id               TEXT    NOT NULL PRIMARY KEY,
@@ -1934,10 +1936,10 @@ func (s *sqliteStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey
 func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities
-			(id, name, key_algo, public_key, key_enc, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
-		ca.KeyEnc, string(ca.Status), ca.CreatedAt.UTC(),
+		ca.KeyEnc, string(ca.Status), uuidToSQL(ca.LogicalCAID), uuidToSQL(ca.ParentID), ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateSSHCA: %w", err)
@@ -1946,13 +1948,14 @@ func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthori
 }
 
 const sqliteSSHCASelectSQL = `
-	SELECT id, name, key_algo, public_key, key_enc, status, created_at
+	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at
 	FROM ssh_certificate_authorities`
 
 func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 	var ca SSHCertificateAuthority
 	var idStr string
-	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt)
+	var logicalID, parentID *string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1960,6 +1963,8 @@ func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.LogicalCAID = sqlToUUID(logicalID)
+	ca.ParentID = sqlToUUID(parentID)
 	return &ca, nil
 }
 
@@ -1991,13 +1996,27 @@ func (s *sqliteStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthorit
 	for rows.Next() {
 		var ca SSHCertificateAuthority
 		var idStr string
-		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &ca.CreatedAt); err != nil {
+		var logicalID, parentID *string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.LogicalCAID = sqlToUUID(logicalID)
+		ca.ParentID = sqlToUUID(parentID)
 		out = append(out, &ca)
 	}
 	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpdateSSHCAStatus(ctx context.Context, id uuid.UUID, status CAStatus) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE ssh_certificate_authorities SET status = ? WHERE id = ?`, string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateSSHCAStatus: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateSSHCAStatus: SSH CA %s not found", id)
+	}
+	return nil
 }
 
 func (s *sqliteStore) CreateSSHCertificate(ctx context.Context, cert *SSHCertificate) error {

@@ -35,6 +35,7 @@ func notImplemented(method string) {
 	panic("sshca fakeStore: " + method + " not implemented in fake — add it if your test needs it")
 }
 
+// CreateSSHCA persists a new SSH signing CA. Key must already be encrypted.
 func (f *fakeStore) CreateSSHCA(ctx context.Context, ca *storage.SSHCertificateAuthority) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -57,8 +58,23 @@ func (f *fakeStore) GetSSHCAByName(ctx context.Context, name string) (*storage.S
 	return nil, nil
 }
 func (f *fakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificateAuthority, error) {
-	notImplemented("ListSSHCAs")
-	return nil, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*storage.SSHCertificateAuthority
+	for _, c := range f.cas {
+		out = append(out, c)
+	}
+	return out, nil
+}
+func (f *fakeStore) UpdateSSHCAStatus(ctx context.Context, id uuid.UUID, status storage.CAStatus) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c, ok := f.cas[id]
+	if !ok {
+		return fmt.Errorf("fakeStore: UpdateSSHCAStatus: not found %s", id)
+	}
+	c.Status = status
+	return nil
 }
 func (f *fakeStore) CreateSSHCertificate(ctx context.Context, cert *storage.SSHCertificate) error {
 	f.mu.Lock()
