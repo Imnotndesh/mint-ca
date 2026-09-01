@@ -2,11 +2,14 @@ package handlers
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 
 	gox509 "crypto/x509"
+	"mint-ca/internal/approval"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
@@ -33,6 +36,61 @@ func (h *CertHandler) loadProfileByName(ctx context.Context, name string) (*stor
 		return nil, errors.New("store does not support profiles")
 	}
 	return s.GetProfileByName(ctx, name)
+}
+
+// enforceCSRAutoApproval applies CSR auto-approval rules (opt-in). If any
+// rules exist for the provisioner, the CSR must satisfy one of them; otherwise
+// it is refused. When no rule applies to the provisioner, behavior is unchanged
+// (no auto-approval policy governs this CSR).
+func (h *CertHandler) enforceCSRAutoApproval(ctx context.Context, provisionerID uuid.UUID, csrPEM string, ttlSeconds int64) error {
+	s, ok := h.store.(csrApprovalStore)
+	if !ok {
+		return nil
+	}
+	rules, err := s.ListCSRAutoApproveRules(ctx, provisionerID)
+	if err != nil {
+		return fmt.Errorf("load CSR approval rules: %w", err)
+	}
+	if len(rules) == 0 {
+		return nil
+	}
+
+	csr, err := parseCSR(csrPEM)
+	if err != nil {
+		return err
+	}
+	req := approval.Request{
+		ProvisionerID: provisionerID,
+		CommonName:    csr.Subject.CommonName,
+		SANsDNS:       csr.DNSNames,
+		TTLSeconds:    ttlSeconds,
+	}
+	for _, rule := range rules {
+		approved, decided, reason := approval.Evaluate(rule, req)
+		if !decided {
+			continue
+		}
+		if !approved {
+			return errors.New("csr auto-approval: " + reason)
+		}
+		return nil
+	}
+	return errors.New("csr auto-approval: no rule approves this request")
+}
+
+func parseCSR(pemStr string) (*gox509.CertificateRequest, error) {
+	block, _ := pem.Decode([]byte(pemStr))
+	if block == nil {
+		return nil, errors.New("invalid CSR PEM")
+	}
+	csr, err := gox509.ParseCertificateRequest(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse CSR: %w", err)
+	}
+	if err := csr.CheckSignature(); err != nil {
+		return nil, fmt.Errorf("CSR signature invalid: %w", err)
+	}
+	return csr, nil
 }
 
 func (h *CertHandler) RegisterRoutes(r chi.Router) {
@@ -217,6 +275,13 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 	provID, err := uuid.Parse(req.ProvisionerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
+		return
+	}
+
+	// CSR auto-approval rules (opt-in): if rules exist for this provisioner,
+	// the CSR must be auto-approved or it is refused.
+	if err := h.enforceCSRAutoApproval(r.Context(), provID, req.CSRPEM, req.TTLSeconds); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
 
