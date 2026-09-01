@@ -275,6 +275,18 @@ CREATE TABLE IF NOT EXISTS profiles (
 	created_at         DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS csr_approval_rules (
+	id                 TEXT    NOT NULL PRIMARY KEY,
+	provisioner_id     TEXT    NOT NULL,
+	name               TEXT    NOT NULL,
+	allowed_common_names TEXT NOT NULL DEFAULT '[]',
+	allowed_dns        TEXT    NOT NULL DEFAULT '[]',
+	max_ttl_seconds    INTEGER NOT NULL DEFAULT 0,
+	enabled            INTEGER NOT NULL DEFAULT 1,
+	created_at         DATETIME NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_csr_approval_prov ON csr_approval_rules(provisioner_id);
+
 CREATE TABLE IF NOT EXISTS provisioners (
 	id         TEXT NOT NULL PRIMARY KEY,
 	ca_id      TEXT NOT NULL REFERENCES certificate_authorities(id) ON DELETE RESTRICT,
@@ -1317,6 +1329,84 @@ func (s *sqliteStore) DeleteProfile(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
+// ---- CSR auto-approval rules ----
+
+func sqliteCSRArgs(r *CSRAutoApproveRule) []interface{} {
+	en := 0
+	if r.Enabled {
+		en = 1
+	}
+	return []interface{}{
+		r.ID.String(), r.ProvisionerID.String(), r.Name,
+		marshalStringSliceOr(r.AllowedCommonNames), marshalStringSliceOr(r.AllowedDNS),
+		r.MaxTTLSeconds, en, r.CreatedAt.UTC(),
+	}
+}
+
+func (s *sqliteStore) CreateCSRAutoApproveRule(ctx context.Context, r *CSRAutoApproveRule) error {
+	args := sqliteCSRArgs(r)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO csr_approval_rules
+			(id, provisioner_id, name, allowed_common_names, allowed_dns, max_ttl_seconds, enabled, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateCSRAutoApproveRule: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) ListCSRAutoApproveRules(ctx context.Context, provisionerID uuid.UUID) ([]*CSRAutoApproveRule, error) {
+	q := csrApprovalSelectSQL
+	var args []interface{}
+	if provisionerID != uuid.Nil {
+		q += " WHERE provisioner_id = ?"
+		args = append(args, provisionerID.String())
+	}
+	q += " ORDER BY created_at ASC"
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListCSRAutoApproveRules: %w", err)
+	}
+	defer rows.Close()
+	var out []*CSRAutoApproveRule
+	for rows.Next() {
+		r, err := s.sqliteScanCSRApproval(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpdateCSRAutoApproveRule(ctx context.Context, r *CSRAutoApproveRule) error {
+	args := sqliteCSRArgs(r)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE csr_approval_rules SET
+			provisioner_id = ?, name = ?, allowed_common_names = ?, allowed_dns = ?,
+			max_ttl_seconds = ?, enabled = ?
+		WHERE id = ?`, args[1], args[2], args[3], args[4], args[5], args[6], args[0])
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateCSRAutoApproveRule: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateCSRAutoApproveRule: rule %s not found", r.ID)
+	}
+	return nil
+}
+
+func (s *sqliteStore) DeleteCSRAutoApproveRule(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM csr_approval_rules WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: DeleteCSRAutoApproveRule: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) sqliteScanCSRApproval(scan func(...interface{}) error) (*CSRAutoApproveRule, error) {
+	return scanCSRApproval(scan)
+}
+
 const profileSelectSQL = `
 	SELECT id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
 	       require_san, allow_wildcard, created_at
@@ -1347,6 +1437,31 @@ func scanProfileFields(scan func(...interface{}) error) (*Profile, error) {
 	p.RequireSAN = rs == 1
 	p.AllowWildcard = aw == 1
 	return &p, nil
+}
+
+const csrApprovalSelectSQL = `
+	SELECT id, provisioner_id, name, allowed_common_names, allowed_dns, max_ttl_seconds, enabled, created_at
+	FROM csr_approval_rules`
+
+func scanCSRApproval(scan func(...interface{}) error) (*CSRAutoApproveRule, error) {
+	var r CSRAutoApproveRule
+	var idStr, provStr, cnStr, dnsStr string
+	var enabled int
+	err := scan(&idStr, &provStr, &r.Name, &cnStr, &dnsStr, &r.MaxTTLSeconds, &enabled, &r.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	r.ID = uuid.MustParse(idStr)
+	r.ProvisionerID = uuid.MustParse(provStr)
+	r.AllowedCommonNames, _ = unmarshalStringSlice(cnStr)
+	r.AllowedDNS, _ = unmarshalStringSlice(dnsStr)
+	r.Enabled = enabled == 1
+	return &r, nil
+}
+
+func marshalStringSliceOr(s []string) interface{} {
+	b, _ := marshalStringSlice(s)
+	return b
 }
 
 func (s *sqliteStore) CreateACMEAccount(ctx context.Context, a *ACMEAccount) error {

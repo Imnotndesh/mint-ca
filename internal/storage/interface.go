@@ -315,6 +315,22 @@ type Profile struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// CSRAutoApproveRule is a stored CSR auto-approval rule controlling which
+// CSRs a provisioner may auto-sign without caller review.
+type CSRAutoApproveRule struct {
+	ID            uuid.UUID `json:"id"`
+	ProvisionerID uuid.UUID `json:"provisioner_id"`
+	Name          string    `json:"name"`
+	// AllowedCommonNames are regex patterns the CSR CommonName must match.
+	AllowedCommonNames []string `json:"allowed_common_names,omitempty"`
+	// AllowedDNS are regex patterns every DNS SAN must match.
+	AllowedDNS []string `json:"allowed_dns,omitempty"`
+	// MaxTTLSeconds caps the signed certificate lifetime (0 uses an approval default).
+	MaxTTLSeconds int64     `json:"max_ttl_seconds"`
+	Enabled       bool      `json:"enabled"`
+	CreatedAt     time.Time `json:"created_at"`
+}
+
 type Provisioner struct {
 	ID        uuid.UUID         `json:"id"`
 	CAID      uuid.UUID         `json:"ca_id"`

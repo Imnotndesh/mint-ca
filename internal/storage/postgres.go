@@ -166,6 +166,18 @@ CREATE TABLE IF NOT EXISTS profiles (
 	created_at        TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS csr_approval_rules (
+	id                 TEXT        NOT NULL PRIMARY KEY,
+	provisioner_id     TEXT        NOT NULL,
+	name               TEXT        NOT NULL,
+	allowed_common_names TEXT     NOT NULL DEFAULT '[]',
+	allowed_dns        TEXT        NOT NULL DEFAULT '[]',
+	max_ttl_seconds    BIGINT      NOT NULL DEFAULT 0,
+	enabled            BOOLEAN     NOT NULL DEFAULT TRUE,
+	created_at         TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pg_csr_approval_prov ON csr_approval_rules(provisioner_id);
+
 CREATE TABLE IF NOT EXISTS acme_authorizations (
     id               TEXT        NOT NULL PRIMARY KEY,
     order_id         TEXT        REFERENCES acme_orders(id) ON DELETE CASCADE,
@@ -1134,6 +1146,95 @@ func pgScanProfile(scan func(...interface{}) error) (*Profile, error) {
 	p.ID = uuid.MustParse(idStr)
 	p.AllowedKeyAlgos, _ = pgUnmarshalStringSlice(akaStr)
 	return &p, nil
+}
+
+// ---- CSR auto-approval rules ----
+
+func pgCSRApprovalArgs(r *CSRAutoApproveRule) []interface{} {
+	cn, _ := pgMarshalStringSlice(r.AllowedCommonNames)
+	dns, _ := pgMarshalStringSlice(r.AllowedDNS)
+	return []interface{}{
+		r.ID.String(), r.ProvisionerID.String(), r.Name, cn, dns,
+		r.MaxTTLSeconds, r.Enabled, r.CreatedAt.UTC(),
+	}
+}
+
+func (s *postgresStore) CreateCSRAutoApproveRule(ctx context.Context, r *CSRAutoApproveRule) error {
+	args := pgCSRApprovalArgs(r)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO csr_approval_rules
+			(id, provisioner_id, name, allowed_common_names, allowed_dns, max_ttl_seconds, enabled, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, args...)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateCSRAutoApproveRule: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) ListCSRAutoApproveRules(ctx context.Context, provisionerID uuid.UUID) ([]*CSRAutoApproveRule, error) {
+	q := pgCSRApprovalSelectSQL
+	args := []interface{}{}
+	if provisionerID != uuid.Nil {
+		q += " WHERE provisioner_id = $1"
+		args = append(args, provisionerID.String())
+	}
+	q += " ORDER BY created_at ASC"
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListCSRAutoApproveRules: %w", err)
+	}
+	defer rows.Close()
+	var out []*CSRAutoApproveRule
+	for rows.Next() {
+		r, err := pgScanCSRApproval(rows.Scan)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateCSRAutoApproveRule(ctx context.Context, r *CSRAutoApproveRule) error {
+	cn, _ := pgMarshalStringSlice(r.AllowedCommonNames)
+	dns, _ := pgMarshalStringSlice(r.AllowedDNS)
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE csr_approval_rules SET
+			provisioner_id = $2, name = $3, allowed_common_names = $4, allowed_dns = $5,
+			max_ttl_seconds = $6, enabled = $7
+		WHERE id = $1`, r.ID.String(), r.ProvisionerID.String(), r.Name, cn, dns, r.MaxTTLSeconds, r.Enabled)
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateCSRAutoApproveRule: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) DeleteCSRAutoApproveRule(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM csr_approval_rules WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: DeleteCSRAutoApproveRule: %w", err)
+	}
+	return nil
+}
+
+const pgCSRApprovalSelectSQL = `
+	SELECT id, provisioner_id, name, allowed_common_names, allowed_dns, max_ttl_seconds, enabled, created_at
+	FROM csr_approval_rules`
+
+func pgScanCSRApproval(scan func(...interface{}) error) (*CSRAutoApproveRule, error) {
+	var r CSRAutoApproveRule
+	var idStr, provStr, cnStr, dnsStr string
+	var enabled bool
+	err := scan(&idStr, &provStr, &r.Name, &cnStr, &dnsStr, &r.MaxTTLSeconds, &enabled, &r.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	r.ID = uuid.MustParse(idStr)
+	r.ProvisionerID = uuid.MustParse(provStr)
+	r.AllowedCommonNames, _ = pgUnmarshalStringSlice(cnStr)
+	r.AllowedDNS, _ = pgUnmarshalStringSlice(dnsStr)
+	r.Enabled = enabled
+	return &r, nil
 }
 
 func (s *postgresStore) CreateACMEAccount(ctx context.Context, a *ACMEAccount) error {
