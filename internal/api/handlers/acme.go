@@ -700,6 +700,10 @@ func (h *ACMEHandler) newOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	var payload struct {
 		Identifiers []internalacme.Identifier `json:"identifiers"`
+		// Profile optionally names a certificate profile to enforce against
+		// this order, mirroring the REST "profile" field on cert issuance.
+		// Ignored if the provisioner pins its own profile.
+		Profile string `json:"profile"`
 	}
 	if err := json.Unmarshal(payloadBytes, &payload); err != nil {
 		h.acmeProblem(w, r, internalacme.ErrMalformedProblem("decode new-order payload: "+err.Error()))
@@ -710,7 +714,7 @@ func (h *ACMEHandler) newOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	order, _, prob := h.service.NewOrder(ctx, account, prov, payload.Identifiers)
+	order, _, prob := h.service.NewOrder(ctx, account, prov, payload.Identifiers, payload.Profile)
 	if prob != nil {
 		h.acmeProblem(w, r, prob)
 		return
@@ -1032,6 +1036,9 @@ func (h *ACMEHandler) orderResponse(ctx context.Context, provisionerID uuid.UUID
 
 	if order.CertificateID != nil {
 		resp["certificate"] = h.service.CertificateURL(provisionerID, *order.CertificateID)
+	}
+	if name, ok := order.Identifiers["profile_name"]; ok {
+		resp["profile"] = name
 	}
 
 	return resp

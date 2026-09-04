@@ -116,6 +116,10 @@ Default values are shown; variables marked **Required** must be set.
 | `MINT_RENEWAL_INTERVAL_SECONDS` | How often (seconds) the worker scans for certs due for renewal. | `3600` (1h) | No |
 | `MINT_RENEWAL_LEAD_SECONDS` | How long (seconds) before `NotAfter` a cert is considered due for renewal. | `604800` (7 days) | No |
 | `MINT_RENEWAL_WEBHOOK_URL` | When set, mint-ca POSTs a JSON notice for each cert due for renewal so an external system can renew it. | – | No |
+| `MINT_RENEWAL_EXPIRING_SECONDS` | How long (seconds) before `NotAfter` a cert is classified `expiring_soon` instead of `due` in `GET /api/v1/renewal/status`. | `172800` (48h) | No |
+| `MINT_SCEP_ENABLED` | Enable the public SCEP enrollment endpoint at `/pki/{caID}/scep`. | `false` | No |
+| `MINT_SCEP_PROVISIONER_ID` | The provisioner UUID every SCEP enrollment is signed under. Required if `MINT_SCEP_ENABLED=true`. | – | If SCEP enabled |
+| `MINT_SCEP_DEFAULT_TTL_SECONDS` | Leaf certificate lifetime granted to SCEP enrollments. | `7776000` (90 days) | No |
 | **Logging** | | | |
 | `MINT_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error`. | `info` | No |
 | `MINT_LOG_JSON` | Output logs as JSON (structured) instead of human‑readable. | `false` | No |

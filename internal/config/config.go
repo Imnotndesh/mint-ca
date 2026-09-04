@@ -26,6 +26,7 @@ type Config struct {
 	RateLimit RateLimitConfig
 	MTLS      MTLSConfig
 	Renewal   RenewalConfig
+	SCEP      SCEPConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -245,6 +246,35 @@ type RenewalConfig struct {
 	// due for renewal, letting an external system perform the actual renewal.
 	// Env: MINT_RENEWAL_WEBHOOK_URL
 	WebhookURL string
+
+	// ExpiringSeconds is a tighter window than LeadSeconds: certs whose NotAfter
+	// falls within this window are classified "expiring_soon" instead of just
+	// "due", so automation can distinguish urgency.
+	// Env: MINT_RENEWAL_EXPIRING_SECONDS
+	ExpiringSeconds int64
+}
+
+// SCEPConfig controls the public SCEP (RFC 8894-ish) enrollment endpoint at
+// /pki/{caID}/scep. Pre-release, single-user posture: one provisioner handles
+// every SCEP enrollment rather than per-device provisioner mapping.
+//
+// This implementation does not wrap requests/responses in PKCS#7 as the full
+// SCEP spec requires (PKIOperation's SignedData/EnvelopedData). It accepts a
+// raw PKCS#10 CSR as the POST body and returns a raw DER certificate,
+// documented as a deviation in docs/Api.md. Clients or gateways that speak
+// full SCEP need a PKCS#7 unwrap/wrap shim in front of this endpoint.
+type SCEPConfig struct {
+	// Enabled turns on the /pki/{caID}/scep routes.
+	// Env: MINT_SCEP_ENABLED
+	Enabled bool
+
+	// ProvisionerID is the provisioner every SCEP enrollment is signed under.
+	// Env: MINT_SCEP_PROVISIONER_ID
+	ProvisionerID string
+
+	// DefaultTTLSeconds is the leaf lifetime granted to SCEP enrollments.
+	// Env: MINT_SCEP_DEFAULT_TTL_SECONDS
+	DefaultTTLSeconds int64
 }
 
 // Load reads all configuration from environment variables, applies defaults,
@@ -424,6 +454,17 @@ func Load() (*Config, error) {
 		c.Renewal.LeadSeconds = 7 * 24 * 3600 // 7 days
 	}
 	c.Renewal.WebhookURL = strings.TrimSpace(os.Getenv("MINT_RENEWAL_WEBHOOK_URL"))
+	c.Renewal.ExpiringSeconds = int64(envIntOptional("MINT_RENEWAL_EXPIRING_SECONDS"))
+	if c.Renewal.ExpiringSeconds == 0 {
+		c.Renewal.ExpiringSeconds = 48 * 3600 // 48h
+	}
+
+	c.SCEP.Enabled = envBool("MINT_SCEP_ENABLED")
+	c.SCEP.ProvisionerID = strings.TrimSpace(os.Getenv("MINT_SCEP_PROVISIONER_ID"))
+	c.SCEP.DefaultTTLSeconds = int64(envIntOptional("MINT_SCEP_DEFAULT_TTL_SECONDS"))
+	if c.SCEP.DefaultTTLSeconds == 0 {
+		c.SCEP.DefaultTTLSeconds = 90 * 24 * 3600 // 90 days
+	}
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)

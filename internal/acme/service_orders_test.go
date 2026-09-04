@@ -40,13 +40,13 @@ func TestListOrders(t *testing.T) {
 	svc := NewService(store, nil, NewNonceManager(store, 0), nil, nil, "https://ca.test")
 
 	// Two orders for account A, one for account B.
-	if _, _, prob := svc.NewOrder(ctx, accountA, prov, []Identifier{{Type: "dns", Value: "a1.example.com"}}); prob != nil {
+	if _, _, prob := svc.NewOrder(ctx, accountA, prov, []Identifier{{Type: "dns", Value: "a1.example.com"}}, ""); prob != nil {
 		t.Fatalf("NewOrder A1 failed: %v", prob)
 	}
-	if _, _, prob := svc.NewOrder(ctx, accountA, prov, []Identifier{{Type: "dns", Value: "a2.example.com"}}); prob != nil {
+	if _, _, prob := svc.NewOrder(ctx, accountA, prov, []Identifier{{Type: "dns", Value: "a2.example.com"}}, ""); prob != nil {
 		t.Fatalf("NewOrder A2 failed: %v", prob)
 	}
-	if _, _, prob := svc.NewOrder(ctx, accountB, prov, []Identifier{{Type: "dns", Value: "b1.example.com"}}); prob != nil {
+	if _, _, prob := svc.NewOrder(ctx, accountB, prov, []Identifier{{Type: "dns", Value: "b1.example.com"}}, ""); prob != nil {
 		t.Fatalf("NewOrder B1 failed: %v", prob)
 	}
 

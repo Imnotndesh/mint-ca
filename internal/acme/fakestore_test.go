@@ -29,6 +29,7 @@ type fakeStore struct {
 	deltaCRLs      map[uuid.UUID]*storage.DeltaCRLCache
 	crlCounter     map[uuid.UUID]int64
 	nonces         map[string]time.Time
+	profiles       map[uuid.UUID]*storage.Profile
 }
 
 func NewFakeStore() *fakeStore {
@@ -45,7 +46,34 @@ func NewFakeStore() *fakeStore {
 		deltaCRLs:      make(map[uuid.UUID]*storage.DeltaCRLCache),
 		crlCounter:     make(map[uuid.UUID]int64),
 		nonces:         make(map[string]time.Time),
+		profiles:       make(map[uuid.UUID]*storage.Profile),
 	}
+}
+
+// ---- Profiles (not part of storage.Store; used via the acme package's
+// local profileLookup interface assertion, mirroring the REST handler
+// pattern) ----
+
+func (f *fakeStore) CreateProfile(ctx context.Context, p *storage.Profile) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.profiles[p.ID] = p
+	return nil
+}
+func (f *fakeStore) GetProfile(ctx context.Context, id uuid.UUID) (*storage.Profile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.profiles[id], nil
+}
+func (f *fakeStore) GetProfileByName(ctx context.Context, name string) (*storage.Profile, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, p := range f.profiles {
+		if p.Name == name {
+			return p, nil
+		}
+	}
+	return nil, nil
 }
 
 func notImplemented(method string) {
@@ -284,7 +312,14 @@ func (f *fakeStore) UpdateACMEOrderStatus(ctx context.Context, id uuid.UUID, sta
 	return nil
 }
 func (f *fakeStore) FinalizeACMEOrder(ctx context.Context, orderID uuid.UUID, certID uuid.UUID) error {
-	notImplemented("FinalizeACMEOrder")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	o, ok := f.orders[orderID]
+	if !ok {
+		return fmt.Errorf("order %s not found", orderID)
+	}
+	o.Status = storage.ACMEOrderStatusValid
+	o.CertificateID = &certID
 	return nil
 }
 
@@ -313,7 +348,12 @@ func (f *fakeStore) ListChallengesByOrder(ctx context.Context, orderID uuid.UUID
 	return out, nil
 }
 func (f *fakeStore) UpdateChallengeStatus(ctx context.Context, id uuid.UUID, status storage.ACMEChallengeStatus, validatedAt *time.Time) error {
-	notImplemented("UpdateChallengeStatus")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c, ok := f.challenges[id]; ok {
+		c.Status = status
+		c.ValidatedAt = validatedAt
+	}
 	return nil
 }
 func (f *fakeStore) ListChallengesByAuthorization(ctx context.Context, authID uuid.UUID) ([]*storage.ACMEChallenge, error) {

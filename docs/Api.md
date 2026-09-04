@@ -844,3 +844,111 @@ Delete a rule.
 
 > Enforcement happens on `POST /api/v1/certs/sign`. The TLS/HTTPS config for CAA
 > checking is configured via env (`MINT_ACME_CAA_*`, see Setup.md), not the REST API.
+
+## 1.16 Renewal Lifecycle Intel
+
+Read-only visibility into certificate renewal risk, derived from existing
+certificate data (no separate tracking table). Useful for external automation
+to alert on certs needing action.
+
+### `GET /api/v1/renewal/status`
+Optionally filter with `?ca_id=<uuid>`.
+
+**Response (200 OK)**
+```json
+{
+  "certificates": [
+    {
+      "cert_id": "cert-uuid",
+      "ca_id": "ca-uuid",
+      "subject_cn": "svc.example.com",
+      "expires_at": "2026-09-10T00:00:00Z",
+      "days_left": 5,
+      "status": "due"
+    }
+  ],
+  "summary": {
+    "due": 1,
+    "expiring_soon": 0,
+    "expired": 0,
+    "revoked": 0
+  }
+}
+```
+
+Only certificates that are not classified `valid` are listed (i.e. `due`,
+`expiring_soon`, `expired`, or `revoked`); the `summary` gives totals per
+bucket. Buckets:
+- `revoked` — certificate status is revoked.
+- `expired` — certificate status is expired, or `NotAfter` has passed.
+- `expiring_soon` — `NotAfter` is within `MINT_RENEWAL_EXPIRING_SECONDS` (default 48h).
+- `due` — `NotAfter` is within `MINT_RENEWAL_LEAD_SECONDS` (default 7 days) but
+  beyond the expiring window.
+- `valid` — not returned in the list, but not counted as an issue either.
+
+## 1.17 ACME Profile Intents
+
+ACME orders can request a named certificate profile so `profile`-constrained
+issuance (see `POST /api/v1/certs/issue`'s `"profile"` field) works through
+ACME too. A provisioner may instead **pin** a profile via its existing
+`profile_id`, which always takes priority over a client-requested one.
+
+### `POST /acme/{provisionerID}/new-order`
+The new-order payload gains an optional `profile` field:
+```json
+{
+  "identifiers": [{"type": "dns", "value": "svc.example.com"}],
+  "profile": "internal-services"
+}
+```
+If the provisioner has a pinned profile, `profile` is ignored and the pinned
+one applies. An unknown requested profile name is rejected with `400
+malformed`. The resolved profile (if any) is evaluated against the order's
+identifiers immediately (e.g. rejecting a wildcard identifier when
+`allow_wildcard` is false) via `urn:ietf:params:acme:error:rejectedIdentifier`.
+
+### `POST /acme/{provisionerID}/order/{orderID}/finalize`
+The same profile is re-evaluated against the submitted CSR's actual SANs and
+key algorithm before issuance; a violation is rejected with
+`urn:ietf:params:acme:error:badCSR`.
+
+### Order responses
+`GET`/`POST` order responses include a `"profile"` field naming the applicable
+profile when one was resolved.
+
+## 1.18 SCEP Enrollment (Simplified)
+
+A public, unauthenticated SCEP-shaped enrollment endpoint at
+`/pki/{caID}/scep`, gated by `MINT_SCEP_ENABLED` (see Setup.md). Every
+enrollment is signed under one configured provisioner
+(`MINT_SCEP_PROVISIONER_ID`) — a pre-release, single-user simplification.
+
+> **Deviation from RFC 8894**: this endpoint does **not** wrap requests or
+> responses in PKCS#7 (`SignedData`/`EnvelopedData`), which the full SCEP spec
+> requires for `PKIOperation`. `PKCSReq` here accepts a **raw PKCS#10 CSR**
+> (DER-encoded) as the POST body and returns a **raw DER leaf certificate**,
+> not a PKCS#7 degenerate certs-only message. A genuine SCEP client (most
+> MDM/device-management stacks) needs a PKCS#7 unwrap/wrap shim in front of
+> this endpoint; `mint-ca` does not ship one (no PKCS#7 dependency in
+> `go.mod`).
+
+### `GET /pki/{caID}/scep?operation=GetCACaps`
+Returns `text/plain`, newline-separated capabilities:
+```
+GetNextCACert
+POSTPKIOperation
+SHA-256
+Renewal
+```
+
+### `GET /pki/{caID}/scep?operation=GetCACert`
+Returns the CA certificate as `application/x-x509-ca-cert` (raw DER).
+
+### `GET /pki/{caID}/scep?operation=GetNextCACert`
+`501 Not Implemented` — mint-ca does not cross-cert a renewal chain.
+
+### `POST /pki/{caID}/scep?operation=PKCSReq`
+Body: raw DER-encoded PKCS#10 CSR. Enforces the same CSR auto-approval rules
+as `POST /api/v1/certs/sign` (`403` if a rule exists for the provisioner and
+this CSR does not satisfy it). On success, returns the signed leaf as
+`application/x-x509-user-cert` (raw DER).
