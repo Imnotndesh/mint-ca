@@ -31,6 +31,9 @@ func newApprovalFakeStore() *approvalFakeStore {
 	return &approvalFakeStore{rules: map[uuid.UUID]*storage.CSRAutoApproveRule{}}
 }
 func (f *approvalFakeStore) Close() error { return nil }
+func (f *approvalFakeStore) GetProvisioner(ctx context.Context, id uuid.UUID) (*storage.Provisioner, error) {
+	return &storage.Provisioner{ID: id, Name: "any", Type: storage.ProvisionerTypeAPIKey, Status: storage.ProvisionerStatusActive}, nil
+}
 func (f *approvalFakeStore) CreateCSRAutoApproveRule(ctx context.Context, r *storage.CSRAutoApproveRule) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
