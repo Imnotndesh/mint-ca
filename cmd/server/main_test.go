@@ -526,7 +526,7 @@ func runRateLimitTrip(t *testing.T, ctx *liveState) {
 	// Dedicated key so this scenario's bucket is independent of every
 	// other case's usage of ctx.adminKey.
 	resp, data := doReq(t, http.MethodPost, "/api/v1/apikeys", ctx.adminKey, map[string]interface{}{
-		"name": "ratelimit-test-key", "scopes": []string{"*"},
+		"name": "ratelimit-test-key", "scopes": []string{"*"}, "platform_admin": true,
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create dedicated key: %d: %s", resp.StatusCode, data)
@@ -573,7 +573,7 @@ func runRateLimitTrip(t *testing.T, ctx *liveState) {
 // asserted, since it needs real DNS/HTTP reachability out of sandbox).
 func runACMELifecycle(t *testing.T, ctx *liveState) {
 	resp, data := doReq(t, http.MethodPost, "/api/v1/apikeys", ctx.adminKey, map[string]interface{}{
-		"name": "acme-test-admin", "scopes": []string{"*"},
+		"name": "acme-test-admin", "scopes": []string{"*"}, "platform_admin": true,
 	})
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("create fresh admin key: %d: %s", resp.StatusCode, data)

@@ -20,6 +20,8 @@ type postgresStore struct {
 	db *sql.DB
 }
 
+var _ TenantStore = (*postgresStore)(nil)
+
 const postgresDeltaCRLSchema = `
 CREATE TABLE IF NOT EXISTS crl_delta_cache (
 	id              TEXT        NOT NULL PRIMARY KEY,
@@ -119,6 +121,31 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 		UPDATE certificate_authorities SET logical_ca_id = id WHERE logical_ca_id IS NULL;
 	`); err != nil {
 		return fmt.Errorf("postgres: migrate logical_ca_id: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL;
+	`); err != nil {
+		return fmt.Errorf("postgres: migrate api_keys tenant_id: %w", err)
+	}
+	if err := seedDefaultTenantPostgres(ctx, s.db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// seedDefaultTenantPostgres inserts the fixed default tenant if no tenant
+// exists yet.
+func seedDefaultTenantPostgres(ctx context.Context, db *sql.DB) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenants`).Scan(&count); err != nil {
+		return fmt.Errorf("postgres: seed default tenant count: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO tenants (id, name, status, created_at) VALUES ($1, 'default', 'active', $2)`, DefaultTenantID.String(), time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: seed default tenant: %w", err)
 	}
 	return nil
 }
@@ -320,12 +347,20 @@ CREATE TABLE IF NOT EXISTS acme_retired_keys (
     retired_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tenants (
+	id         TEXT        NOT NULL PRIMARY KEY,
+	name       TEXT        NOT NULL UNIQUE,
+	status     TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+	created_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
 	id         TEXT        NOT NULL PRIMARY KEY,
 	name       TEXT        NOT NULL,
 	key_hash   TEXT        NOT NULL UNIQUE,
 	scopes     TEXT        NOT NULL DEFAULT '[]',
 	ca_id      TEXT        REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	tenant_id  TEXT        REFERENCES tenants(id) ON DELETE SET NULL,
 	expires_at TIMESTAMPTZ,
 	last_used  TIMESTAMPTZ,
 	created_at TIMESTAMPTZ NOT NULL
@@ -2029,10 +2064,10 @@ func (s *postgresStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
 	scopes, _ := pgMarshalStringSlice(k.Scopes)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO api_keys
-			(id, name, key_hash, scopes, ca_id, expires_at, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			(id, name, key_hash, scopes, ca_id, tenant_id, expires_at, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		k.ID.String(), k.Name, k.KeyHash, scopes,
-		pgUUIDToSQL(k.CAID), k.ExpiresAt, k.CreatedAt.UTC(),
+		pgUUIDToSQL(k.CAID), pgUUIDToSQL(k.TenantID), k.ExpiresAt, k.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateAPIKey: %w", err)
@@ -2042,14 +2077,14 @@ func (s *postgresStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
 
 func (s *postgresStore) GetAPIKeyByHash(ctx context.Context, hash string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys WHERE key_hash = $1`, hash)
 	return pgScanAPIKey(row)
 }
 
 func (s *postgresStore) ListAPIKeys(ctx context.Context) ([]*APIKey, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: ListAPIKeys: %w", err)
@@ -2059,15 +2094,16 @@ func (s *postgresStore) ListAPIKeys(ctx context.Context) ([]*APIKey, error) {
 	for rows.Next() {
 		var k APIKey
 		var idStr, scopesStr string
-		var caIDStr *string
+		var caIDStr, tenantIDStr *string
 		if err := rows.Scan(
 			&idStr, &k.Name, &k.KeyHash, &scopesStr,
-			&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
+			&caIDStr, &tenantIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		k.ID = uuid.MustParse(idStr)
 		k.CAID = pgSQLToUUID(caIDStr)
+		k.TenantID = pgSQLToUUID(tenantIDStr)
 		k.Scopes, _ = pgUnmarshalStringSlice(scopesStr)
 		out = append(out, &k)
 	}
@@ -2133,7 +2169,7 @@ func (s *postgresStore) SetSetupState(ctx context.Context, state SetupState) err
 
 func (s *postgresStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys WHERE name = $1`, name)
 	return pgScanAPIKey(row)
 }
@@ -2141,10 +2177,10 @@ func (s *postgresStore) GetAPIKeyByName(ctx context.Context, name string) (*APIK
 func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 	var k APIKey
 	var idStr, scopesStr string
-	var caIDStr *string
+	var caIDStr, tenantIDStr *string
 	err := row.Scan(
 		&idStr, &k.Name, &k.KeyHash, &scopesStr,
-		&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
+		&caIDStr, &tenantIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2154,9 +2190,75 @@ func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 	}
 	k.ID = uuid.MustParse(idStr)
 	k.CAID = pgSQLToUUID(caIDStr)
+	k.TenantID = pgSQLToUUID(tenantIDStr)
 	k.Scopes, _ = pgUnmarshalStringSlice(scopesStr)
 	return &k, nil
 }
+
+// ---- tenants ----
+
+const pgTenantSelectSQL = `SELECT id, name, status, created_at FROM tenants`
+
+func (s *postgresStore) CreateTenant(ctx context.Context, t *Tenant) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO tenants (id, name, status, created_at)
+		VALUES ($1, $2, $3, $4)`, t.ID.String(), t.Name, string(t.Status), t.CreatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: CreateTenant: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx, pgTenantSelectSQL+" WHERE id = $1", id.String())
+	return pgScanTenant(row)
+}
+
+func (s *postgresStore) GetTenantByName(ctx context.Context, name string) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx, pgTenantSelectSQL+" WHERE name = $1", name)
+	return pgScanTenant(row)
+}
+
+func (s *postgresStore) ListTenants(ctx context.Context) ([]*Tenant, error) {
+	rows, err := s.db.QueryContext(ctx, pgTenantSelectSQL+" ORDER BY created_at ASC")
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListTenants: %w", err)
+	}
+	defer rows.Close()
+	var out []*Tenant
+	for rows.Next() {
+		t, err := pgScanTenantRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateTenantStatus(ctx context.Context, id uuid.UUID, status TenantStatus) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = $1 WHERE id = $2`, string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateTenantStatus: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: UpdateTenantStatus: tenant %s not found", id)
+	}
+	return nil
+}
+
+func pgScanTenant(row *sql.Row) (*Tenant, error) {
+	t, err := scanTenantFields(func(dest ...interface{}) error { return row.Scan(dest...) })
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func pgScanTenantRows(rows *sql.Rows) (*Tenant, error) {
+	return scanTenantFields(rows.Scan)
+}
+
 func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities

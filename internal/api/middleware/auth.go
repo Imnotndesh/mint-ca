@@ -9,12 +9,26 @@ import (
 	"time"
 
 	"mint-ca/internal/storage"
+
+	"github.com/google/uuid"
 )
 
 type contextKey string
 
 const ActorKey contextKey = "actor"
 const APIKeyKey contextKey = "api_key"
+
+// TenantIDFromContext returns the API key's tenant id from an authenticated
+// request context. ok=false if no API key is present at all (should not happen
+// inside the authenticated route group, but guarded anyway). A nil tenant id
+// with ok=true means the caller is a platform-admin key.
+func TenantIDFromContext(ctx context.Context) (tenantID *uuid.UUID, ok bool) {
+	apiKey, ok := ctx.Value(APIKeyKey).(*storage.APIKey)
+	if !ok || apiKey == nil {
+		return nil, false
+	}
+	return apiKey.TenantID, true
+}
 
 func Auth(store storage.Store) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -44,6 +58,18 @@ func Auth(store storage.Store) func(http.Handler) http.Handler {
 			if apiKey.ExpiresAt != nil && time.Now().UTC().After(*apiKey.ExpiresAt) {
 				writeError(w, http.StatusUnauthorized, "API key has expired")
 				return
+			}
+
+			// A tenant-scoped key is refused while its tenant is suspended — the
+			// lockout applies to every subsequent request from that tenant, so no
+			// tenant handling logic runs for a suspended tenant.
+			if apiKey.TenantID != nil {
+				if ts, ok := store.(storage.TenantStore); ok {
+					if tn, err := ts.GetTenant(r.Context(), *apiKey.TenantID); err == nil && tn != nil && tn.Status == storage.TenantStatusSuspended {
+						writeError(w, http.StatusForbidden, "tenant is suspended")
+						return
+					}
+				}
 			}
 
 			// Touch last_used asynchronously — never block the request on it.
