@@ -29,6 +29,7 @@ type Config struct {
 	SCEP        SCEPConfig
 	Events      EventsConfig
 	Attestation AttestationConfig
+	HA          HAConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -303,6 +304,33 @@ type AttestationConfig struct {
 	TPMRootsFile string
 }
 
+// HAConfig controls active-passive leader election for running multiple
+// mint-ca processes against one shared Postgres database (see internal/ha).
+// Only one node — the current leader — serves API traffic at a time;
+// standbys return 503 until they win an election. Requires the postgres
+// storage backend, since sqlite is inherently single-process.
+type HAConfig struct {
+	// Enabled turns on leader election. Requires MINT_DB_DRIVER=postgres.
+	// Env: MINT_HA_ENABLED
+	Enabled bool
+
+	// NodeID identifies this process in the leader-election lock. Defaults
+	// to the OS hostname if unset.
+	// Env: MINT_HA_NODE_ID
+	NodeID string
+
+	// LeaseSeconds is how long a won leadership lease lasts before it can be
+	// taken over, if not renewed.
+	// Env: MINT_HA_LEASE_SECONDS
+	LeaseSeconds int64
+
+	// RenewSeconds is how often the leader (and every standby) attempts to
+	// acquire/renew the lease. Should be well under LeaseSeconds so a
+	// healthy leader doesn't lose its lease due to renewal jitter.
+	// Env: MINT_HA_RENEW_SECONDS
+	RenewSeconds int64
+}
+
 // Load reads all configuration from environment variables, applies defaults,
 // validates every field, and returns a fully populated Config.
 //
@@ -494,6 +522,33 @@ func Load() (*Config, error) {
 
 	c.Events.WebhookURL = strings.TrimSpace(os.Getenv("MINT_EVENTS_WEBHOOK_URL"))
 	c.Attestation.TPMRootsFile = strings.TrimSpace(os.Getenv("MINT_ATTESTATION_TPM_ROOTS_FILE"))
+
+	c.HA.Enabled = envBool("MINT_HA_ENABLED")
+	c.HA.NodeID = strings.TrimSpace(os.Getenv("MINT_HA_NODE_ID"))
+	if c.HA.NodeID == "" {
+		if h, err := os.Hostname(); err == nil {
+			c.HA.NodeID = h
+		}
+	}
+	c.HA.LeaseSeconds = int64(envIntOptional("MINT_HA_LEASE_SECONDS"))
+	if c.HA.LeaseSeconds == 0 {
+		c.HA.LeaseSeconds = 15
+	}
+	c.HA.RenewSeconds = int64(envIntOptional("MINT_HA_RENEW_SECONDS"))
+	if c.HA.RenewSeconds == 0 {
+		c.HA.RenewSeconds = 5
+	}
+	if c.HA.Enabled {
+		if c.Storage.Driver != "postgres" {
+			errs = append(errs, "MINT_HA_ENABLED requires MINT_DB_DRIVER=postgres (sqlite is single-process)")
+		}
+		if c.HA.NodeID == "" {
+			errs = append(errs, "MINT_HA_NODE_ID is required when MINT_HA_ENABLED=true and the hostname could not be determined")
+		}
+		if c.HA.RenewSeconds >= c.HA.LeaseSeconds {
+			errs = append(errs, "MINT_HA_RENEW_SECONDS must be less than MINT_HA_LEASE_SECONDS")
+		}
+	}
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)

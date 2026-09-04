@@ -20,6 +20,7 @@ import (
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
 	mintcrypto "mint-ca/internal/crypto"
+	"mint-ca/internal/ha"
 	"mint-ca/internal/mtls"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/renewal"
@@ -82,7 +83,23 @@ func main() {
 	sshKRLManager := krl.NewManager(store)
 	slog.Info("core services initialised")
 
+	var elector *ha.Elector
+	if cfg.HA.Enabled {
+		lstore, ok := store.(ha.LeadershipStore)
+		if !ok {
+			slog.Error("MINT_HA_ENABLED requires a storage backend that supports leader election (postgres)")
+			_ = store.Close()
+			ks.Zero()
+			os.Exit(1)
+		}
+		elector = ha.NewElector(lstore, cfg.HA.NodeID, time.Duration(cfg.HA.LeaseSeconds)*time.Second, time.Duration(cfg.HA.RenewSeconds)*time.Second)
+		slog.Info("HA leader election enabled", "node_id", cfg.HA.NodeID)
+	} else {
+		elector = ha.NewElector(nil, cfg.HA.NodeID, 0, 0) // single-node mode: always leader
+	}
+
 	apiWorkers := workers.NewWorkerGroup()
+	apiWorkers.Add(elector)
 	apiWorkers.Add(workers.NewCRLWorker(crlManager, cfg.CRL))
 	apiWorkers.Add(workers.NewNonceWorker(store))
 	apiWorkers.Add(workers.NewSSHKRLWorker(sshKRLManager, cfg.CRL))
@@ -176,7 +193,7 @@ func main() {
 
 	case storage.StateReady:
 		slog.Info("setup complete — starting full API")
-		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager)
+		router = api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, elector)
 	}
 
 	srv := &http.Server{

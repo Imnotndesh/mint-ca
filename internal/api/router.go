@@ -39,6 +39,7 @@ func BuildRouter(
 	policyEngine *policy.Engine,
 	rlEngine *ratelimit.Engine,
 	sshKRLMgr *krl.Manager,
+	elector apimiddleware.LeaderChecker,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -67,6 +68,7 @@ func BuildRouter(
 	})
 
 	r.Group(func(r chi.Router) {
+		r.Use(apimiddleware.RequireLeader(elector))
 		r.Use(apimiddleware.Auth(store))
 		r.Use(apimiddleware.RateLimit(rlEngine, store))
 		r.Use(apimiddleware.Audit(store))
@@ -96,7 +98,10 @@ func BuildRouter(
 			internalacme.SplitBypassLabels(cfg.ACME.CAABypassLabels),
 		)
 		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, caaChecker, cfg.ACME.BaseURL)
-		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
+		r.Group(func(r chi.Router) {
+			r.Use(apimiddleware.RequireLeader(elector))
+			handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
+		})
 	}
 
 	return r

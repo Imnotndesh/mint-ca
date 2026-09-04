@@ -298,6 +298,16 @@ CREATE TABLE IF NOT EXISTS audit_chain_state (
 );
 INSERT INTO audit_chain_state (id, last_hash) VALUES (1, '') ON CONFLICT (id) DO NOTHING;
 
+-- ha_leader_lock is a singleton row implementing an active-passive leader
+-- lease (see internal/ha): a node holds leadership until expires_at passes,
+-- at which point any node (including a new holder_id) may acquire it.
+CREATE TABLE IF NOT EXISTS ha_leader_lock (
+	id         INTEGER     NOT NULL PRIMARY KEY CHECK (id = 1),
+	holder_id  TEXT        NOT NULL DEFAULT '',
+	expires_at TIMESTAMPTZ NOT NULL DEFAULT 'epoch'
+);
+INSERT INTO ha_leader_lock (id, holder_id, expires_at) VALUES (1, '', 'epoch') ON CONFLICT (id) DO NOTHING;
+
 CREATE TABLE IF NOT EXISTS crl_cache (
 	id          TEXT        NOT NULL PRIMARY KEY,
 	ca_id       TEXT        NOT NULL UNIQUE REFERENCES certificate_authorities(id) ON DELETE CASCADE,
@@ -1856,6 +1866,41 @@ func (s *postgresStore) ListAuditLogsChronological(ctx context.Context) ([]*Audi
 	}
 	defer rows.Close()
 	return pgScanAuditLogs(rows)
+}
+
+// TryAcquireLeadership implements ha.LeadershipStore. The UPDATE's WHERE
+// clause only matches when no one currently holds an unexpired lease, or
+// when nodeID already holds it (renewal) — Postgres's row lock during the
+// UPDATE serializes concurrent callers, so exactly one wins a contested
+// campaign.
+func (s *postgresStore) TryAcquireLeadership(ctx context.Context, nodeID string, lease time.Duration) (bool, error) {
+	now := time.Now().UTC()
+	newExpiry := now.Add(lease)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE ha_leader_lock
+		SET holder_id = $1, expires_at = $2
+		WHERE id = 1 AND (holder_id = $1 OR expires_at < $3)`,
+		nodeID, newExpiry, now,
+	)
+	if err != nil {
+		return false, fmt.Errorf("postgres: TryAcquireLeadership: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("postgres: TryAcquireLeadership: rows affected: %w", err)
+	}
+	return n == 1, nil
+}
+
+// CurrentLeader implements ha.LeadershipStore.
+func (s *postgresStore) CurrentLeader(ctx context.Context) (string, time.Time, error) {
+	var holder string
+	var expires time.Time
+	err := s.db.QueryRowContext(ctx, `SELECT holder_id, expires_at FROM ha_leader_lock WHERE id = 1`).Scan(&holder, &expires)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("postgres: CurrentLeader: %w", err)
+	}
+	return holder, expires, nil
 }
 
 func pgScanAuditLogs(rows *sql.Rows) ([]*AuditLog, error) {
