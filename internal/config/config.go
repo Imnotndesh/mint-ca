@@ -27,6 +27,7 @@ type Config struct {
 	MTLS      MTLSConfig
 	Renewal   RenewalConfig
 	SCEP      SCEPConfig
+	Events    EventsConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -277,6 +278,16 @@ type SCEPConfig struct {
 	DefaultTTLSeconds int64
 }
 
+// EventsConfig controls the generic action-notification webhook. When set,
+// mint-ca POSTs a JSON event for each significant action (certificate issued,
+// certificate revoked) so external systems (SIEM, chat, ticketing) can react
+// in real time instead of polling the audit log.
+type EventsConfig struct {
+	// WebhookURL, when set, is POSTed a JSON payload for each event.
+	// Env: MINT_EVENTS_WEBHOOK_URL
+	WebhookURL string
+}
+
 // Load reads all configuration from environment variables, applies defaults,
 // validates every field, and returns a fully populated Config.
 //
@@ -465,6 +476,8 @@ func Load() (*Config, error) {
 	if c.SCEP.DefaultTTLSeconds == 0 {
 		c.SCEP.DefaultTTLSeconds = 90 * 24 * 3600 // 90 days
 	}
+
+	c.Events.WebhookURL = strings.TrimSpace(os.Getenv("MINT_EVENTS_WEBHOOK_URL"))
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)

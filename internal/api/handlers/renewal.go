@@ -73,47 +73,38 @@ func (h *RenewalHandler) status(w http.ResponseWriter, r *http.Request) {
 		hasFilter = true
 	}
 
-	cas, err := h.store.ListCAs(r.Context())
+	now := time.Now().UTC()
+	resp := renewalStatusResponse{Certificates: []renewalEntry{}}
+	var filter *uuid.UUID
+	if hasFilter {
+		filter = &caIDFilter
+	}
+	err := renewal.ForEachCert(r.Context(), h.store, filter, now, h.lead, h.exp, func(c *storage.Certificate, st renewal.Status) {
+		if st == renewal.StatusValid {
+			return
+		}
+		resp.Certificates = append(resp.Certificates, renewalEntry{
+			CertID:    c.ID.String(),
+			CAID:      c.CAID.String(),
+			SubjectCN: c.SubjectCN,
+			ExpiresAt: c.NotAfter,
+			DaysLeft:  int(c.NotAfter.Sub(now).Hours() / 24),
+			Status:    st,
+		})
+		switch st {
+		case renewal.StatusDue:
+			resp.Summary.Due++
+		case renewal.StatusExpiringSoon:
+			resp.Summary.ExpiringSoon++
+		case renewal.StatusExpired:
+			resp.Summary.Expired++
+		case renewal.StatusRevoked:
+			resp.Summary.Revoked++
+		}
+	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
-	}
-
-	now := time.Now().UTC()
-	resp := renewalStatusResponse{Certificates: []renewalEntry{}}
-	for _, ca := range cas {
-		if hasFilter && ca.ID != caIDFilter {
-			continue
-		}
-		certs, err := h.store.ListCertificatesByCA(r.Context(), ca.ID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		for _, c := range certs {
-			st := renewal.Classify(c.Status, c.NotAfter, now, h.lead, h.exp)
-			if st == renewal.StatusValid {
-				continue
-			}
-			resp.Certificates = append(resp.Certificates, renewalEntry{
-				CertID:    c.ID.String(),
-				CAID:      c.CAID.String(),
-				SubjectCN: c.SubjectCN,
-				ExpiresAt: c.NotAfter,
-				DaysLeft:  int(c.NotAfter.Sub(now).Hours() / 24),
-				Status:    st,
-			})
-			switch st {
-			case renewal.StatusDue:
-				resp.Summary.Due++
-			case renewal.StatusExpiringSoon:
-				resp.Summary.ExpiringSoon++
-			case renewal.StatusExpired:
-				resp.Summary.Expired++
-			case renewal.StatusRevoked:
-				resp.Summary.Revoked++
-			}
-		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)

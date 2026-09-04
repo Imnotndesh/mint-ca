@@ -1,10 +1,14 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
+	"mint-ca/internal/config"
+	"mint-ca/internal/renewal"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -22,10 +26,22 @@ const (
 	sshCARoute       = "POST /api/v1/sshca"
 )
 
-type MetricsHandler struct{ store storage.Store }
+type MetricsHandler struct {
+	store storage.Store
+	lead  time.Duration
+	exp   time.Duration
+}
 
-func NewMetricsHandler(store storage.Store) *MetricsHandler {
-	return &MetricsHandler{store: store}
+func NewMetricsHandler(store storage.Store, cfg config.RenewalConfig) *MetricsHandler {
+	lead := time.Duration(cfg.LeadSeconds) * time.Second
+	if lead <= 0 {
+		lead = 7 * 24 * time.Hour
+	}
+	exp := time.Duration(cfg.ExpiringSeconds) * time.Second
+	if exp <= 0 {
+		exp = 48 * time.Hour
+	}
+	return &MetricsHandler{store: store, lead: lead, exp: exp}
 }
 
 func (h *MetricsHandler) RegisterRoutes(r chi.Router) {
@@ -71,6 +87,30 @@ func (h *MetricsHandler) serve(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# HELP mintca_ssh_ca_created_total Total SSH CAs created\n")
 	fmt.Fprintf(w, "# TYPE mintca_ssh_ca_created_total counter\n")
 	fmt.Fprintf(w, "mintca_ssh_ca_created_total %d\n", sshCA)
+
+	counts, _ := renewalCounts(ctx, h.store, h.lead, h.exp)
+
+	fmt.Fprintf(w, "# HELP mintca_certs_due_total X.509 certificates due for renewal\n")
+	fmt.Fprintf(w, "# TYPE mintca_certs_due_total gauge\n")
+	fmt.Fprintf(w, "mintca_certs_due_total %d\n", counts[renewal.StatusDue])
+
+	fmt.Fprintf(w, "# HELP mintca_certs_expiring_soon_total X.509 certificates expiring within the tight window\n")
+	fmt.Fprintf(w, "# TYPE mintca_certs_expiring_soon_total gauge\n")
+	fmt.Fprintf(w, "mintca_certs_expiring_soon_total %d\n", counts[renewal.StatusExpiringSoon])
+
+	fmt.Fprintf(w, "# HELP mintca_certs_expired_total X.509 certificates past their NotAfter and still marked active\n")
+	fmt.Fprintf(w, "# TYPE mintca_certs_expired_total gauge\n")
+	fmt.Fprintf(w, "mintca_certs_expired_total %d\n", counts[renewal.StatusExpired])
+}
+
+// renewalCounts classifies every certificate across all CAs by renewal risk
+// bucket, for the gauges above.
+func renewalCounts(ctx context.Context, store storage.Store, lead, expiring time.Duration) (map[renewal.Status]int, error) {
+	counts := map[renewal.Status]int{}
+	err := renewal.ForEachCert(ctx, store, nil, time.Now().UTC(), lead, expiring, func(_ *storage.Certificate, st renewal.Status) {
+		counts[st]++
+	})
+	return counts, err
 }
 
 // countEvents classifies audit-log entries into metrics counters. Because the

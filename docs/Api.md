@@ -263,6 +263,17 @@ Download a tar.gz bundle of a certificate: `cert.pem`, `chain.pem`
 | Param | Description |
 |-------|-------------|
 | `passcode` | Required to include `key.pem` when the key is passcode‑protected. |
+| `format` | Set to `p12` to instead download a password‑protected PKCS#12 (`.p12`) file (see below). |
+
+With `?format=p12`, the response is a single `.p12`/`.pfx` file containing the
+leaf certificate, its private key, and its CA chain — for consumers that
+expect one self‑contained keystore file (Windows certificate stores, Java
+keystores, network appliances) rather than separate PEM parts. Requires an
+escrowed key: pass `passcode` if the key is passcode‑protected. Additional
+query parameters:
+| Param | Description |
+|-------|-------------|
+| `p12_password` | Password protecting the `.p12` file itself. Default: `changeit`. |
 
 ### Auto‑renewal webhook (background, not request/response)
 When `MINT_RENEWAL_ENABLED` and `MINT_RENEWAL_WEBHOOK_URL` are set, a background
@@ -952,3 +963,43 @@ Body: raw DER-encoded PKCS#10 CSR. Enforces the same CSR auto-approval rules
 as `POST /api/v1/certs/sign` (`403` if a rule exists for the provisioner and
 this CSR does not satisfy it). On success, returns the signed leaf as
 `application/x-x509-user-cert` (raw DER).
+
+## 1.19 Action-Notification Webhook (background, not request/response)
+
+When `MINT_EVENTS_WEBHOOK_URL` is set, mint-ca POSTs a JSON event to that URL
+for every certificate issuance and revocation — so external systems (SIEM,
+chat, ticketing) can react in real time instead of polling the audit log.
+Delivery is asynchronous and best-effort: a failed or slow webhook never
+affects the API response that triggered the event.
+
+**`cert.issued`** — sent after `POST /api/v1/certs/issue`, `POST
+/api/v1/certs/sign`, and each successfully-signed item in `POST
+/api/v1/certs/batch/sign`:
+```json
+{
+  "type": "cert.issued",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "data": {
+    "cert_id": "550e8400-e29b-41d4-a716-446655440000",
+    "ca_id": "...",
+    "serial": "12345",
+    "subject_cn": "api.example.com",
+    "not_after": "2027-01-01T00:00:00Z"
+  }
+}
+```
+
+**`cert.revoked`** — sent after `PUT /api/v1/certs/{certID}/revoke`:
+```json
+{
+  "type": "cert.revoked",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "data": {
+    "cert_id": "550e8400-e29b-41d4-a716-446655440000",
+    "ca_id": "...",
+    "serial": "12345",
+    "subject_cn": "api.example.com",
+    "reason": 1
+  }
+}
+```
