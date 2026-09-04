@@ -6,6 +6,15 @@ ACME endpoints are under `/acme/{provisionerID}` and follow the ACME protocol (n
 
 ## 1.1 Certificate Authorities
 
+> **Tenant scoping (multi-tenancy):** every CA, provisioner, profile and
+> policy is owned by exactly one tenant. A tenant-scoped key only sees and can
+> operate on its own tenant's resources — reads/updates of another tenant's
+> resource return `404` (never `403`, to hide existence). A platform-admin key
+> sees everything. A tenant-scoped caller creates resources only within its own
+> tenant; a platform admin may scope creation with an explicit `"tenant_id"`
+> field, defaulting to the default tenant when omitted (preserving single-tenant
+> operator flows). See §1.6.1.
+
 ### `POST /api/v1/ca/root`
 Create a new self‑signed root CA.
 
