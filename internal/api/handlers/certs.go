@@ -11,6 +11,7 @@ import (
 	gox509 "crypto/x509"
 	"mint-ca/internal/approval"
 	"mint-ca/internal/ca"
+	"mint-ca/internal/events"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
 
@@ -22,10 +23,36 @@ type CertHandler struct {
 	engine *ca.Engine
 	policy *policy.Engine
 	store  storage.Store
+	events events.Emitter
 }
 
-func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store) *CertHandler {
-	return &CertHandler{engine: engine, policy: policyEngine, store: store}
+func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store, emitter events.Emitter) *CertHandler {
+	if emitter == nil {
+		emitter = events.NoopEmitter{}
+	}
+	return &CertHandler{engine: engine, policy: policyEngine, store: store, events: emitter}
+}
+
+// emitCertIssued notifies the events bus that a certificate was issued.
+func (h *CertHandler) emitCertIssued(cert *storage.Certificate) {
+	h.events.Emit(events.New(events.CertIssued, map[string]any{
+		"cert_id":    cert.ID.String(),
+		"ca_id":      cert.CAID.String(),
+		"serial":     cert.Serial,
+		"subject_cn": cert.SubjectCN,
+		"not_after":  cert.NotAfter,
+	}))
+}
+
+// emitCertRevoked notifies the events bus that a certificate was revoked.
+func (h *CertHandler) emitCertRevoked(cert *storage.Certificate, reason *int) {
+	h.events.Emit(events.New(events.CertRevoked, map[string]any{
+		"cert_id":    cert.ID.String(),
+		"ca_id":      cert.CAID.String(),
+		"serial":     cert.Serial,
+		"subject_cn": cert.SubjectCN,
+		"reason":     reason,
+	}))
 }
 
 // loadProfileByName resolves a named profile via the store, or (nil,nil) when
@@ -250,6 +277,7 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.emitCertIssued(issued.Record)
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"certificate": issued.Record,
@@ -304,6 +332,7 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	h.emitCertIssued(issued.Record)
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"certificate": issued.Record,
@@ -368,6 +397,7 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 			res.Serial = issued.Record.Serial
 			res.SubjectCN = issued.Record.SubjectCN
 			res.CertPEM = string(issued.CertPEM)
+			h.emitCertIssued(issued.Record)
 		}
 		results = append(results, res)
 	}
@@ -445,8 +475,11 @@ func (h *CertHandler) key(w http.ResponseWriter, r *http.Request) {
 	w.Write(keyPEM)
 }
 
-// export returns a tar.gz bundle of a certificate (leaf, chain, manifest) and,
-// when the key was escrowed and a valid passcode is supplied, the key too.
+// export returns a certificate bundle: by default a tar.gz (leaf, chain,
+// manifest) and, when the key was escrowed and a valid passcode is supplied,
+// the key too. With ?format=p12 it instead returns a password-protected
+// PKCS#12 file (requires an escrowed key + passcode, since a p12 always
+// carries a key).
 func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "certID"))
 	if err != nil {
@@ -463,6 +496,29 @@ func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	if r.URL.Query().Get("format") == "p12" {
+		chainPEM, err := h.engine.GetLeafChainPEM(r.Context(), cert.CAID, []byte(cert.CertPEM))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		password := r.URL.Query().Get("p12_password")
+		if password == "" {
+			password = pkcs12DefaultPassword
+		}
+		data, err := exportP12([]byte(cert.CertPEM), chainPEM, keyPEM, password)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-pkcs12")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".p12\"")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		return
+	}
+
 	data, err := exportCert(r.Context(), h.engine, cert, keyPEM)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -509,9 +565,13 @@ func (h *CertHandler) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	var req revokeRequest
 	_ = decodeJSON(r, &req)
+	cert, _ := h.store.GetCertificate(r.Context(), id)
 	if err := h.store.RevokeCertificate(r.Context(), id, req.Reason); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if cert != nil {
+		h.emitCertRevoked(cert, &req.Reason)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }

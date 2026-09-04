@@ -10,6 +10,7 @@ import (
 	"mint-ca/internal/ca"
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
+	"mint-ca/internal/events"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
@@ -66,7 +67,11 @@ func BuildRouter(
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
 		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterRoutes(r)
-		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
+		var emitter events.Emitter = events.NoopEmitter{}
+		if cfg.Events.WebhookURL != "" {
+			emitter = events.NewWebhookEmitter(cfg.Events.WebhookURL)
+		}
+		handlers.NewCertHandler(caEngine, policyEngine, store, emitter).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
 		handlers.NewProfileHandler(store).RegisterRoutes(r)
@@ -75,7 +80,7 @@ func BuildRouter(
 		handlers.NewEABHandler(store).RegisterRoutes(r)
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
-		handlers.NewMetricsHandler(store).RegisterRoutes(r)
+		handlers.NewMetricsHandler(store, cfg.Renewal).RegisterRoutes(r)
 	})
 
 	if cfg.ACME.Enabled {
