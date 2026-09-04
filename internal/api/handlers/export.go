@@ -5,12 +5,19 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/rand"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"time"
 
 	"mint-ca/internal/ca"
 	"mint-ca/internal/storage"
+
+	"github.com/pavlo-v-chernykh/keystore-go/v4"
+	"software.sslmate.com/src/go-pkcs12"
 )
 
 // exportCert bundles an issued certificate into a tar.gz artifact for
@@ -70,6 +77,153 @@ persists leaf keys unless store_key=true was set at issue time.
 		files["key.pem"] = keyPEM
 	}
 	return tarGz(files)
+}
+
+// pkcs12DefaultPassword is used when the caller doesn't supply ?p12_password=.
+const pkcs12DefaultPassword = pkcs12.DefaultPassword
+
+// exportP12 bundles a leaf certificate, its private key, and its CA chain
+// into a password-protected PKCS#12 (.p12/.pfx) file for legacy consumers
+// (Windows cert stores, Java keystores, network appliances) that expect one
+// self-contained keystore file rather than separate PEM parts. certPEM is the
+// leaf certificate; chainPEM is the leaf followed by its intermediates and
+// root (as returned by ca.Engine.GetLeafChainPEM); keyPEM is the leaf's
+// private key and must be non-empty (a p12 file always carries a key).
+func exportP12(certPEM, chainPEM, keyPEM []byte, password string) ([]byte, error) {
+	if len(keyPEM) == 0 {
+		return nil, errors.New("export: pkcs12 export requires an escrowed key with a valid passcode")
+	}
+	leaf, err := parseCertPEM(certPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse leaf cert: %w", err)
+	}
+	chain, err := parseCertChainPEM(chainPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse chain: %w", err)
+	}
+	var caCerts []*x509.Certificate
+	for _, c := range chain {
+		if c.Equal(leaf) {
+			continue
+		}
+		caCerts = append(caCerts, c)
+	}
+	key, err := parseKeyPEM(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse key: %w", err)
+	}
+	data, err := pkcs12.Encode(rand.Reader, key, leaf, caCerts, password)
+	if err != nil {
+		return nil, fmt.Errorf("export: pkcs12 encode: %w", err)
+	}
+	return data, nil
+}
+
+// exportJKS bundles a leaf certificate, its private key, and its CA chain
+// into a password-protected Java KeyStore (.jks) file, for JVM consumers
+// (Java/Kotlin services, Android, Java-based network appliances) that expect
+// a JKS rather than a PKCS#12 file. The private key is stored PKCS#8-encoded,
+// as JKS requires. alias names the entry within the keystore.
+func exportJKS(certPEM, chainPEM, keyPEM []byte, password, alias string) ([]byte, error) {
+	if len(keyPEM) == 0 {
+		return nil, errors.New("export: jks export requires an escrowed key with a valid passcode")
+	}
+	leaf, err := parseCertPEM(certPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse leaf cert: %w", err)
+	}
+	chain, err := parseCertChainPEM(chainPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse chain: %w", err)
+	}
+	key, err := parseKeyPEM(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse key: %w", err)
+	}
+	pkcs8DER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("export: marshal PKCS8 key: %w", err)
+	}
+
+	// chain is leaf-first (see GetLeafChainPEM); ensure the leaf itself heads
+	// the certificate chain entry even if certPEM/chainPEM disagree on order.
+	certChain := make([]keystore.Certificate, 0, len(chain)+1)
+	certChain = append(certChain, keystore.Certificate{Type: "X509", Content: leaf.Raw})
+	for _, c := range chain {
+		if c.Equal(leaf) {
+			continue
+		}
+		certChain = append(certChain, keystore.Certificate{Type: "X509", Content: c.Raw})
+	}
+
+	ks := keystore.New()
+	entry := keystore.PrivateKeyEntry{
+		CreationTime:     time.Now(),
+		PrivateKey:       pkcs8DER,
+		CertificateChain: certChain,
+	}
+	if err := ks.SetPrivateKeyEntry(alias, entry, []byte(password)); err != nil {
+		return nil, fmt.Errorf("export: set private key entry: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := ks.Store(&buf, []byte(password)); err != nil {
+		return nil, fmt.Errorf("export: store JKS: %w", err)
+	}
+	return buf.Bytes(), nil
+}
+
+// parseCertPEM decodes the first certificate in a PEM block.
+func parseCertPEM(pemBytes []byte) (*x509.Certificate, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, errors.New("no PEM block found")
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+// parseCertChainPEM decodes every CERTIFICATE block in pemBytes, in order.
+func parseCertChainPEM(pemBytes []byte) ([]*x509.Certificate, error) {
+	var certs []*x509.Certificate
+	rest := pemBytes
+	for {
+		var block *pem.Block
+		block, rest = pem.Decode(rest)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, err
+		}
+		certs = append(certs, cert)
+	}
+	if len(certs) == 0 {
+		return nil, errors.New("no certificates found in chain PEM")
+	}
+	return certs, nil
+}
+
+// parseKeyPEM decodes a PEM-encoded private key. Handles EC PRIVATE KEY,
+// RSA PRIVATE KEY, and PRIVATE KEY (PKCS8) blocks.
+func parseKeyPEM(pemBytes []byte) (interface{}, error) {
+	block, _ := pem.Decode(pemBytes)
+	if block == nil {
+		return nil, errors.New("no PEM block found")
+	}
+	switch block.Type {
+	case "EC PRIVATE KEY":
+		return x509.ParseECPrivateKey(block.Bytes)
+	case "RSA PRIVATE KEY":
+		return x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		return x509.ParsePKCS8PrivateKey(block.Bytes)
+	default:
+		return nil, fmt.Errorf("unrecognised PEM block type %q", block.Type)
+	}
 }
 
 // tarGz packs entries into a gzip-compressed tar archive.

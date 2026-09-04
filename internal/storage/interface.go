@@ -134,6 +134,9 @@ type SANs struct {
 	DNS   []string `json:"dns,omitempty"`
 	IP    []string `json:"ip,omitempty"`
 	Email []string `json:"email,omitempty"`
+	// URI holds URI SAN values, notably SPIFFE IDs (spiffe://trust-domain/path)
+	// for issuing X.509-SVIDs (see internal/spiffe).
+	URI []string `json:"uri,omitempty"`
 }
 
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.
@@ -427,6 +430,12 @@ type AuditLog struct {
 	Payload   JSON       `json:"payload"`
 	IPAddress string     `json:"ip_address"`
 	CreatedAt time.Time  `json:"created_at"`
+	// PrevHash and EntryHash form a tamper-evident hash chain (see
+	// internal/audit): EntryHash is derived from this entry's fields plus the
+	// previous entry's EntryHash, so editing, deleting, or reordering any
+	// entry is detectable. Populated by the storage backend on write.
+	PrevHash  string `json:"prev_hash"`
+	EntryHash string `json:"entry_hash"`
 }
 
 // APIKey is a bearer token used to authenticate calls to the management API.
