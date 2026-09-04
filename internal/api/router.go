@@ -89,6 +89,7 @@ func BuildRouter(
 		handlers.NewEABHandler(store).RegisterRoutes(r)
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewTenantHandler(store).RegisterRoutes(r)
+		handlers.NewSettingsHandler(store, rlEngine).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
 		handlers.NewSystemHandler(store, elector).RegisterRoutes(r)
 		handlers.NewMetricsHandler(store, cfg.Renewal).RegisterRoutes(r)
