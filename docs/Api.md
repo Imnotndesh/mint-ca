@@ -495,6 +495,12 @@ Delete an API key.
 
 ## 1.7 Audit Log
 
+Every mutating action is appended to a tamper-evident hash chain: each entry's
+`entry_hash` is derived from its own fields plus the previous entry's
+`entry_hash` (genesis chains from the empty string). Editing, deleting, or
+reordering any past entry breaks the chain from that point forward, which
+`GET /api/v1/audit/verify` detects.
+
 ### `GET /api/v1/audit`
 List audit entries (most recent first).
 
@@ -513,13 +519,36 @@ List audit entries (most recent first).
     "cert_id": "...",
     "payload": { ... },
     "ip_address": "10.0.0.1",
-    "created_at": "..."
+    "created_at": "...",
+    "prev_hash": "...",
+    "entry_hash": "..."
   }
 ]
 ```
 
 ### `GET /api/v1/audit/ca/{caID}`
 Same as above, filtered by CA.
+
+### `GET /api/v1/audit/verify`
+Walks the entire audit log's hash chain, oldest first, and reports whether it
+is intact.
+
+**Response (200 OK)** — intact:
+```json
+{ "ok": true, "entries": 1234, "verified_at": "2026-01-01T00:00:00Z" }
+```
+
+**Response (200 OK)** — broken (e.g. a row was edited or deleted directly in
+the database, bypassing the API):
+```json
+{
+  "ok": false,
+  "entries": 1234,
+  "verified_at": "2026-01-01T00:00:00Z",
+  "broken_at_index": 57,
+  "broken_entry_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
 
 ---
 

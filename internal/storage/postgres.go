@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"mint-ca/internal/audit"
+
 	"github.com/google/uuid"
 	_ "github.com/lib/pq"
 )
@@ -272,6 +274,7 @@ CREATE TABLE IF NOT EXISTS acme_challenges (
 CREATE INDEX IF NOT EXISTS idx_pg_challenges_order_id ON acme_challenges(order_id);
 
 CREATE TABLE IF NOT EXISTS audit_log (
+	seq        BIGSERIAL,
 	id         TEXT        NOT NULL PRIMARY KEY,
 	event_type TEXT        NOT NULL,
 	actor      TEXT        NOT NULL,
@@ -279,10 +282,21 @@ CREATE TABLE IF NOT EXISTS audit_log (
 	cert_id    TEXT        REFERENCES certificates(id) ON DELETE SET NULL,
 	payload    TEXT        NOT NULL DEFAULT '{}',
 	ip_address TEXT        NOT NULL DEFAULT '',
-	created_at TIMESTAMPTZ NOT NULL
+	created_at TIMESTAMPTZ NOT NULL,
+	prev_hash  TEXT        NOT NULL DEFAULT '',
+	entry_hash TEXT        NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_pg_audit_ca_id      ON audit_log(ca_id);
 CREATE INDEX IF NOT EXISTS idx_pg_audit_created_at ON audit_log(created_at);
+
+-- audit_chain_state is a singleton row tracking the tail hash of the audit
+-- log's tamper-evident chain (see internal/audit), so WriteAuditLog can
+-- extend it without re-scanning the whole table.
+CREATE TABLE IF NOT EXISTS audit_chain_state (
+	id        INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+	last_hash TEXT    NOT NULL DEFAULT ''
+);
+INSERT INTO audit_chain_state (id, last_hash) VALUES (1, '') ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS crl_cache (
 	id          TEXT        NOT NULL PRIMARY KEY,
@@ -1754,25 +1768,61 @@ func (s *sqliteStore) ListChallengesByAuthorization(ctx context.Context, authID 
 	}
 	return out, rows.Err()
 }
+
+// WriteAuditLog appends an entry and extends the tamper-evident hash chain
+// (see internal/audit). SELECT ... FOR UPDATE on the singleton chain-state
+// row serializes concurrent writers so the chain never forks.
 func (s *postgresStore) WriteAuditLog(ctx context.Context, entry *AuditLog) error {
 	payload, _ := pgMarshalJSON(entry.Payload)
-	_, err := s.db.ExecContext(ctx, `
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: WriteAuditLog: begin: %w", err)
+	}
+	defer tx.Rollback()
+
+	var prevHash string
+	if err := tx.QueryRowContext(ctx, `SELECT last_hash FROM audit_chain_state WHERE id = 1 FOR UPDATE`).Scan(&prevHash); err != nil {
+		return fmt.Errorf("postgres: WriteAuditLog: read chain state: %w", err)
+	}
+
+	var caIDStr, certIDStr string
+	if entry.CAID != nil {
+		caIDStr = entry.CAID.String()
+	}
+	if entry.CertID != nil {
+		certIDStr = entry.CertID.String()
+	}
+	entryHash := audit.ComputeHash(prevHash, audit.Entry{
+		ID: entry.ID.String(), EventType: entry.EventType, Actor: entry.Actor,
+		CAID: caIDStr, CertID: certIDStr,
+		Payload: payload, IPAddress: entry.IPAddress, CreatedAt: entry.CreatedAt,
+	})
+
+	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO audit_log
-			(id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			(id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at, prev_hash, entry_hash)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		entry.ID.String(), entry.EventType, entry.Actor,
 		pgUUIDToSQL(entry.CAID), pgUUIDToSQL(entry.CertID),
-		payload, entry.IPAddress, entry.CreatedAt.UTC(),
-	)
-	if err != nil {
-		return fmt.Errorf("postgres: WriteAuditLog: %w", err)
+		payload, entry.IPAddress, entry.CreatedAt.UTC(), prevHash, entryHash,
+	); err != nil {
+		return fmt.Errorf("postgres: WriteAuditLog: insert: %w", err)
 	}
+	if _, err := tx.ExecContext(ctx, `UPDATE audit_chain_state SET last_hash = $1 WHERE id = 1`, entryHash); err != nil {
+		return fmt.Errorf("postgres: WriteAuditLog: update chain state: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("postgres: WriteAuditLog: commit: %w", err)
+	}
+	entry.PrevHash = prevHash
+	entry.EntryHash = entryHash
 	return nil
 }
 
 func (s *postgresStore) ListAuditLogs(ctx context.Context, limit, offset int) ([]*AuditLog, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at
+		SELECT id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at, prev_hash, entry_hash
 		FROM audit_log ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
 		limit, offset)
 	if err != nil {
@@ -1784,11 +1834,25 @@ func (s *postgresStore) ListAuditLogs(ctx context.Context, limit, offset int) ([
 
 func (s *postgresStore) ListAuditLogsByCA(ctx context.Context, caID uuid.UUID, limit, offset int) ([]*AuditLog, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at
+		SELECT id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at, prev_hash, entry_hash
 		FROM audit_log WHERE ca_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		caID.String(), limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: ListAuditLogsByCA: %w", err)
+	}
+	defer rows.Close()
+	return pgScanAuditLogs(rows)
+}
+
+// ListAuditLogsChronological returns every audit log entry in insertion
+// order (oldest first), for hash-chain verification. Ordered by the seq
+// BIGSERIAL column since created_at alone can tie within the same instant.
+func (s *postgresStore) ListAuditLogsChronological(ctx context.Context) ([]*AuditLog, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, event_type, actor, ca_id, cert_id, payload, ip_address, created_at, prev_hash, entry_hash
+		FROM audit_log ORDER BY seq ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListAuditLogsChronological: %w", err)
 	}
 	defer rows.Close()
 	return pgScanAuditLogs(rows)
@@ -1804,6 +1868,7 @@ func pgScanAuditLogs(rows *sql.Rows) ([]*AuditLog, error) {
 			&idStr, &l.EventType, &l.Actor,
 			&caIDStr, &certIDStr,
 			&payloadStr, &l.IPAddress, &l.CreatedAt,
+			&l.PrevHash, &l.EntryHash,
 		); err != nil {
 			return nil, err
 		}
