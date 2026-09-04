@@ -23,8 +23,11 @@ type BootstrapKey struct {
 }
 
 // GenerateBootstrapKey creates a temporary API key scoped only to setup
-// endpoints, stores its hash, and returns the plaintext for printing.
-func GenerateBootstrapKey(ctx context.Context, store storage.Store) (*BootstrapKey, error) {
+// endpoints and returns its plaintext. When operatorSecret is non-empty it is
+// used verbatim as the key (so automated/remote onboarding can supply a known
+// MINT_BOOTSTRAP_KEY); otherwise a random key is generated. Returns the
+// plaintext for printing/logging.
+func GenerateBootstrapKey(ctx context.Context, store storage.Store, operatorSecret string) (*BootstrapKey, error) {
 	existing, err := store.GetAPIKeyByName(ctx, bootstrapKeyName)
 	if err != nil {
 		return nil, fmt.Errorf("setup: check existing bootstrap key: %w", err)
@@ -37,11 +40,14 @@ func GenerateBootstrapKey(ctx context.Context, store storage.Store) (*BootstrapK
 		)
 	}
 
-	raw := make([]byte, 32)
-	if _, err := rand.Read(raw); err != nil {
-		return nil, fmt.Errorf("setup: generate bootstrap key: %w", err)
+	rawKey := operatorSecret
+	if rawKey == "" {
+		raw := make([]byte, 32)
+		if _, err := rand.Read(raw); err != nil {
+			return nil, fmt.Errorf("setup: generate bootstrap key: %w", err)
+		}
+		rawKey = "mca_" + hex.EncodeToString(raw)
 	}
-	rawKey := "mca_" + hex.EncodeToString(raw)
 
 	sum := sha256.Sum256([]byte(rawKey))
 	hash := hex.EncodeToString(sum[:])

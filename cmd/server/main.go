@@ -134,7 +134,7 @@ func main() {
 			ks.Zero()
 			os.Exit(1)
 		}
-		bk, err := setup.GenerateBootstrapKey(context.Background(), store)
+		bk, err := setup.GenerateBootstrapKey(context.Background(), store, cfg.Server.BootstrapKey)
 		if err != nil {
 			slog.Error("failed to generate bootstrap key", "err", err)
 			apiWorkers.Stop()
