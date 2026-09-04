@@ -20,3 +20,18 @@ func tenantOwns(resourceTenantID uuid.UUID, callerTenantID *uuid.UUID) bool {
 	}
 	return resourceTenantID == *callerTenantID
 }
+
+// normalizedTenant maps a legacy/nil tenant watermark to the default tenant so
+// two server-side resources (no caller tenant involved) compare deterministically.
+func normalizedTenant(id uuid.UUID) uuid.UUID {
+	if id == uuid.Nil {
+		return storage.DefaultTenantID
+	}
+	return id
+}
+
+// sameTenant reports whether two resources (CA vs provisioner, etc.) share a
+// tenant after normalizing the legacy nil watermark.
+func sameTenant(a, b uuid.UUID) bool {
+	return normalizedTenant(a) == normalizedTenant(b)
+}
