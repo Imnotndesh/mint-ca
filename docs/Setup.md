@@ -121,6 +121,7 @@ Default values are shown; variables marked **Required** must be set.
 | `MINT_SCEP_PROVISIONER_ID` | The provisioner UUID every SCEP enrollment is signed under. Required if `MINT_SCEP_ENABLED=true`. | – | If SCEP enabled |
 | `MINT_SCEP_DEFAULT_TTL_SECONDS` | Leaf certificate lifetime granted to SCEP enrollments. | `7776000` (90 days) | No |
 | `MINT_EVENTS_WEBHOOK_URL` | When set, mint-ca POSTs a JSON event (`cert.issued`, `cert.revoked`) for each certificate issuance/revocation, asynchronously and best-effort. | – | No |
+| `MINT_ATTESTATION_TPM_ROOTS_FILE` | Path to a PEM bundle of trusted TPM manufacturer root certificates. Narrows the built-in `tpm2` attestation verifier to only accept EK certificates chaining to one of these. When unset, any well-formed EK certificate is accepted (see Api.md 1.20). | – | No |
 | **Logging** | | | |
 | `MINT_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error`. | `info` | No |
 | `MINT_LOG_JSON` | Output logs as JSON (structured) instead of human‑readable. | `false` | No |

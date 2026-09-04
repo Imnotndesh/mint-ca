@@ -9,7 +9,10 @@ import (
 	"net/http"
 
 	gox509 "crypto/x509"
+	"encoding/base64"
+
 	"mint-ca/internal/approval"
+	"mint-ca/internal/attestation"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/events"
 	"mint-ca/internal/policy"
@@ -20,17 +23,55 @@ import (
 )
 
 type CertHandler struct {
-	engine *ca.Engine
-	policy *policy.Engine
-	store  storage.Store
-	events events.Emitter
+	engine      *ca.Engine
+	policy      *policy.Engine
+	store       storage.Store
+	events      events.Emitter
+	attestation *attestation.Registry
 }
 
-func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store, emitter events.Emitter) *CertHandler {
+func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store, emitter events.Emitter, attestationRegistry *attestation.Registry) *CertHandler {
 	if emitter == nil {
 		emitter = events.NoopEmitter{}
 	}
-	return &CertHandler{engine: engine, policy: policyEngine, store: store, events: emitter}
+	if attestationRegistry == nil {
+		attestationRegistry = attestation.NewRegistry()
+	}
+	return &CertHandler{engine: engine, policy: policyEngine, store: store, events: emitter, attestation: attestationRegistry}
+}
+
+// attestationRequest optionally accompanies a CSR-signing request, proving
+// the requested key is bound to a hardware root of trust (see
+// internal/attestation). DataB64 is the format-specific evidence, base64
+// encoded.
+type attestationRequest struct {
+	Format  string `json:"format"`
+	DataB64 string `json:"data_b64"`
+}
+
+// verifyAttestation, when req is non-nil, decodes the CSR to DER and checks
+// req against the handler's attestation registry. A nil req is a no-op:
+// attestation is opt-in per request.
+func (h *CertHandler) verifyAttestation(ctx context.Context, csrPEM string, req *attestationRequest) error {
+	if req == nil {
+		return nil
+	}
+	block, _ := pem.Decode([]byte(csrPEM))
+	if block == nil {
+		return errors.New("attestation: no PEM block found in csr_pem")
+	}
+	data, err := base64.StdEncoding.DecodeString(req.DataB64)
+	if err != nil {
+		return fmt.Errorf("attestation: decode data_b64: %w", err)
+	}
+	result, err := h.attestation.Verify(ctx, block.Bytes, attestation.Statement{Format: req.Format, Data: data})
+	if err != nil {
+		return fmt.Errorf("attestation: %w", err)
+	}
+	if !result.Verified {
+		return errors.New("attestation: statement did not verify")
+	}
+	return nil
 }
 
 // emitCertIssued notifies the events bus that a certificate was issued.
@@ -293,6 +334,10 @@ type signCSRRequest struct {
 	CSRPEM        string       `json:"csr_pem"`
 	TTLSeconds    int64        `json:"ttl_seconds"`
 	Metadata      storage.JSON `json:"metadata"`
+	// Attestation optionally proves the CSR's key is bound to a hardware
+	// root of trust (TPM, WebAuthn authenticator, ...). Opt-in: omit to sign
+	// without an attestation check.
+	Attestation *attestationRequest `json:"attestation,omitempty"`
 }
 
 func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
@@ -316,6 +361,10 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 	// CSR auto-approval rules (opt-in): if rules exist for this provisioner,
 	// the CSR must be auto-approved or it is refused.
 	if err := h.enforceCSRAutoApproval(r.Context(), provID, req.CSRPEM, req.TTLSeconds); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
+	if err := h.verifyAttestation(r.Context(), req.CSRPEM, req.Attestation); err != nil {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -382,6 +431,11 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 		if item.Metadata != nil {
 			meta = item.Metadata
 		}
+		if err := h.verifyAttestation(r.Context(), item.CSRPEM, item.Attestation); err != nil {
+			res.Error = err.Error()
+			results = append(results, res)
+			continue
+		}
 		issued, err := h.engine.SignCSR(r.Context(), ca.SignCSRRequest{
 			CAID:          caID,
 			ProvisionerID: provID,
@@ -411,9 +465,10 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 
 // batchSignItem is one CSR to sign in a batch request.
 type batchSignItem struct {
-	CSRPEM     string       `json:"csr_pem"`
-	TTLSeconds int64        `json:"ttl_seconds"`
-	Metadata   storage.JSON `json:"metadata,omitempty"`
+	CSRPEM      string              `json:"csr_pem"`
+	TTLSeconds  int64               `json:"ttl_seconds"`
+	Metadata    storage.JSON        `json:"metadata,omitempty"`
+	Attestation *attestationRequest `json:"attestation,omitempty"`
 }
 
 // batchSignResult is the per-item outcome.

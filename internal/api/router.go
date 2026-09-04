@@ -1,12 +1,18 @@
 package api
 
 import (
+	"crypto/x509"
+	"log/slog"
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ratelimit"
 	"net/http"
+	"os"
 
 	"mint-ca/internal/api/handlers"
 	apimiddleware "mint-ca/internal/api/middleware"
+	"mint-ca/internal/attestation"
+	"mint-ca/internal/attestation/tpm2"
+	"mint-ca/internal/attestation/webauthn"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
@@ -71,7 +77,7 @@ func BuildRouter(
 		if cfg.Events.WebhookURL != "" {
 			emitter = events.NewWebhookEmitter(cfg.Events.WebhookURL)
 		}
-		handlers.NewCertHandler(caEngine, policyEngine, store, emitter).RegisterRoutes(r)
+		handlers.NewCertHandler(caEngine, policyEngine, store, emitter, buildAttestationRegistry(cfg.Attestation)).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
 		handlers.NewProfileHandler(store).RegisterRoutes(r)
@@ -134,4 +140,27 @@ func BuildSetupRouter(
 	})
 
 	return r
+}
+
+// buildAttestationRegistry wires up the built-in attestation verifiers (see
+// internal/attestation). Attestation itself is opt-in per request, so both
+// are always registered; cfg only narrows what the TPM2 verifier accepts.
+func buildAttestationRegistry(cfg config.AttestationConfig) *attestation.Registry {
+	reg := attestation.NewRegistry()
+
+	var roots *x509.CertPool
+	if cfg.TPMRootsFile != "" {
+		pemBytes, err := os.ReadFile(cfg.TPMRootsFile)
+		if err != nil {
+			slog.Warn("attestation: failed to read TPM roots file, EK certificates will not be chain-verified", "file", cfg.TPMRootsFile, "err", err)
+		} else {
+			roots = x509.NewCertPool()
+			if !roots.AppendCertsFromPEM(pemBytes) {
+				slog.Warn("attestation: TPM roots file contained no usable certificates", "file", cfg.TPMRootsFile)
+			}
+		}
+	}
+	reg.Register(tpm2.New(roots))
+	reg.Register(webauthn.New())
+	return reg
 }

@@ -90,7 +90,7 @@ func setupEventsHandler(t *testing.T) (*eventsFakeStore, *capturingEmitter, chi.
 	}
 	store.rootID = root.ID
 	emitter := &capturingEmitter{}
-	h := NewCertHandler(engine, policy.NewEngine(store), store, emitter)
+	h := NewCertHandler(engine, policy.NewEngine(store), store, emitter, nil)
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)
 	return store, emitter, r, root.ID
