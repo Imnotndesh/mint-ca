@@ -993,6 +993,42 @@ func (s *sqliteStore) ListAllCertificates(ctx context.Context, limit, offset int
 	return scanCerts(rows)
 }
 
+// ListCertificatesFiltered returns certificates with optional filters: a CA
+// (caID), a status, and a case-insensitive subject/CN substring for search.
+// Newest first, paginated.
+func (s *sqliteStore) ListCertificatesFiltered(ctx context.Context, caID *uuid.UUID, status CertStatus, q string, limit, offset int) ([]*Certificate, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	q = strings.TrimSpace(q)
+	var conds []string
+	var args []interface{}
+	if caID != nil {
+		conds = append(conds, "c.ca_id = ?")
+		args = append(args, caID.String())
+	}
+	if status != "" {
+		conds = append(conds, "c.status = ?")
+		args = append(args, string(status))
+	}
+	if q != "" {
+		conds = append(conds, "c.subject_cn LIKE ?")
+		args = append(args, "%"+q+"%")
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+	args = append(args, limit, offset)
+	query := certSelectSQL + where + " ORDER BY c.issued_at DESC LIMIT ? OFFSET ?"
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListCertificatesFiltered: %w", err)
+	}
+	defer rows.Close()
+	return scanCerts(rows)
+}
+
 func (s *sqliteStore) ListRevokedByCA(ctx context.Context, caID uuid.UUID) ([]*Certificate, error) {
 	rows, err := s.db.QueryContext(ctx,
 		certSelectSQL+" WHERE c.ca_id = ? AND c.status = 'revoked' ORDER BY c.revoked_at DESC",
