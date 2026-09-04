@@ -222,6 +222,15 @@ Existing single‑tenant databases upgraded from a pre‑multi‑tenant version 
 their prior API keys with no tenant (treated as platform‑admin / operator scoped)
 and continue operating unchanged under the seeded default tenant.
 
+To onboard an actual tenant: (1) `POST /api/v1/tenants` to create it,
+(2) `POST /api/v1/apikeys` with that `"tenant_id"` to mint a key scoped to it,
+and (3) act with that key so its CAs, SSH CAs, provisioners, profiles, policies,
+CSR-approval rules, EAB keys, certs, audit (per-CA) and renewal status all stay
+isolated to the tenant. Cross-tenant access returns `404`; the global audit
+stream and its verify/Merkle endpoints are platform‑admin only. When a platform‑
+admin creates a CA/SSH‑CA via the API you can supply `"tenant_id"` to scope it
+(otherwise it lands in the default tenant). See `docs/Api.md` §1.6.1.
+
 
 ## 2.6 Minimal Configuration (Development)
 
