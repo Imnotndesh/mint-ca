@@ -120,6 +120,27 @@ func (h *SCEPHandler) pkcsReq(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "SCEP provisioner is not configured")
 		return
 	}
+	// Multi-tenant cross-check: the URL CA and the server-wide configured SCEP
+	// provisioner must belong to the same tenant. Single-tenant (legacy/default)
+	// setups pass naturally.
+	caRec, err := h.store.GetCA(r.Context(), caID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if caRec == nil {
+		writeError(w, http.StatusNotFound, "CA not found")
+		return
+	}
+	prov, err := h.store.GetProvisioner(r.Context(), provID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if prov == nil || !sameTenant(caRec.TenantID, prov.TenantID) {
+		writeError(w, http.StatusForbidden, "SCEP provisioner not authorized for this CA")
+		return
+	}
 
 	csrDER, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 	if err != nil {

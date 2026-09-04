@@ -41,6 +41,52 @@ func (h *ApprovalHandler) rules() (csrApprovalStore, bool) {
 	return s, ok
 }
 
+// callerTenantIsPlatformAdminOr returns false after writing 404 (existence
+// hiding) when the caller is tenant-scoped and does not own the provisioner.
+// A platform-admin caller passes. Writes 404 when the provisioner is missing.
+func (h *ApprovalHandler) permissionOnProvisioner(w http.ResponseWriter, r *http.Request, provID uuid.UUID) bool {
+	prov, err := h.store.GetProvisioner(r.Context(), provID)
+	if err != nil || prov == nil {
+		writeError(w, http.StatusNotFound, "provisioner not found")
+		return false
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(prov.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "provisioner not found")
+		return false
+	}
+	return true
+}
+
+// ruleIsOwnedByCaller resolves a rule by listing its owner provisioner and
+// confirming the caller may act on it. Used for delete (no provisioner body).
+func (h *ApprovalHandler) ruleIsOwnedByCaller(w http.ResponseWriter, r *http.Request, ruleID uuid.UUID) bool {
+	s, ok := h.rules()
+	if !ok {
+		return false
+	}
+	caller, _ := tenantFromContext(r)
+	if caller == nil {
+		return true // platform admin may delete any rule
+	}
+	rules, err := s.ListCSRAutoApproveRules(r.Context(), uuid.Nil)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return false
+	}
+	for _, rule := range rules {
+		if rule.ID == ruleID {
+			if !h.permissionOnProvisioner(w, r, rule.ProvisionerID) {
+				writeError(w, http.StatusNotFound, "rule not found")
+				return false
+			}
+			return true
+		}
+	}
+	writeError(w, http.StatusNotFound, "rule not found")
+	return false
+}
+
 type csrRuleRequest struct {
 	ProvisionerID      string   `json:"provisioner_id"`
 	Name               string   `json:"name"`
@@ -59,6 +105,9 @@ func (h *ApprovalHandler) create(w http.ResponseWriter, r *http.Request) {
 	provID, err := uuid.Parse(req.ProvisionerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
+		return
+	}
+	if !h.permissionOnProvisioner(w, r, provID) {
 		return
 	}
 	s, ok := h.rules()
@@ -96,12 +145,35 @@ func (h *ApprovalHandler) list(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid provisioner_id")
 			return
 		}
+		if !h.permissionOnProvisioner(w, r, id) {
+			return
+		}
 		provID = id
 	}
 	rs, err := s.ListCSRAutoApproveRules(r.Context(), provID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	// Tenant-scoped callers only ever see rules belonging to their own
+	// provisioners.
+	caller, _ := tenantFromContext(r)
+	if caller != nil {
+		var out []*storage.CSRAutoApproveRule
+		for _, rule := range rs {
+			if rule.ProvisionerID == provID {
+				if out == nil {
+					out = []*storage.CSRAutoApproveRule{}
+				}
+				out = append(out, rule)
+				continue
+			}
+			prov, err := h.store.GetProvisioner(r.Context(), rule.ProvisionerID)
+			if err == nil && prov != nil && tenantOwns(prov.TenantID, caller) {
+				out = append(out, rule)
+			}
+		}
+		rs = out
 	}
 	writeJSON(w, http.StatusOK, rs)
 }
@@ -120,6 +192,9 @@ func (h *ApprovalHandler) update(w http.ResponseWriter, r *http.Request) {
 	provID, err := uuid.Parse(req.ProvisionerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
+		return
+	}
+	if !h.permissionOnProvisioner(w, r, provID) {
 		return
 	}
 	s, ok := h.rules()
@@ -147,6 +222,9 @@ func (h *ApprovalHandler) delete(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "ruleID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid rule ID")
+		return
+	}
+	if !h.ruleIsOwnedByCaller(w, r, id) {
 		return
 	}
 	s, ok := h.rules()

@@ -45,6 +45,7 @@ type profileRequest struct {
 	MaxTTLSeconds   int64    `json:"max_ttl_seconds"`
 	RequireSAN      bool     `json:"require_san"`
 	AllowWildcard   bool     `json:"allow_wildcard"`
+	TenantID        string   `json:"tenant_id"`
 }
 
 func (h *ProfileHandler) profilesStore() (profileStore, bool) {
@@ -67,9 +68,14 @@ func (h *ProfileHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store does not support profiles")
 		return
 	}
+	tid, ok := createTenant(r, req.TenantID, w)
+	if !ok {
+		return
+	}
 	p := &storage.Profile{
 		ID:              uuid.New(),
 		Name:            req.Name,
+		TenantID:        tid,
 		AllowedKeyAlgos: req.AllowedKeyAlgos,
 		MinTTLSeconds:   req.MinTTLSeconds,
 		MaxTTLSeconds:   req.MaxTTLSeconds,
@@ -95,6 +101,16 @@ func (h *ProfileHandler) list(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	caller, _ := tenantFromContext(r)
+	if caller != nil {
+		var out []*storage.Profile
+		for _, p := range ps {
+			if tenantOwns(p.TenantID, caller) {
+				out = append(out, p)
+			}
+		}
+		ps = out
+	}
 	writeJSON(w, http.StatusOK, ps)
 }
 
@@ -114,6 +130,11 @@ func (h *ProfileHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "profile not found")
 		return
 	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(p.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return
+	}
 	writeJSON(w, http.StatusOK, p)
 }
 
@@ -123,18 +144,29 @@ func (h *ProfileHandler) update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid profile ID")
 		return
 	}
-	var req profileRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
 	s, ok := h.profilesStore()
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "store does not support profiles")
 		return
 	}
+	existing, err := s.GetProfile(r.Context(), id)
+	if err != nil || existing == nil {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(existing.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return
+	}
+	var req profileRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	p := &storage.Profile{
 		ID:              id,
+		TenantID:        existing.TenantID,
 		Name:            req.Name,
 		AllowedKeyAlgos: req.AllowedKeyAlgos,
 		MinTTLSeconds:   req.MinTTLSeconds,
@@ -160,9 +192,32 @@ func (h *ProfileHandler) delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "store does not support profiles")
 		return
 	}
+	if !h.profileAllowed(w, r, id) {
+		return
+	}
 	if err := s.DeleteProfile(r.Context(), id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// profileAllowed reports whether the caller may mutate profile id.
+func (h *ProfileHandler) profileAllowed(w http.ResponseWriter, r *http.Request, id uuid.UUID) bool {
+	s, ok := h.profilesStore()
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "store does not support profiles")
+		return false
+	}
+	p, err := s.GetProfile(r.Context(), id)
+	if err != nil || p == nil {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return false
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(p.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "profile not found")
+		return false
+	}
+	return true
 }

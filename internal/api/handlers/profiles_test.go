@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	apimiddleware "mint-ca/internal/api/middleware"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
 
@@ -86,10 +87,11 @@ func TestProfiles_CRUD(t *testing.T) {
 	store := newProfileFakeStore()
 	r := setupProfilesRouter(store)
 
-	// Create
+	// Create (caller is a platform-admin key so it may create into default tenant).
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/profiles/", strings.NewReader(
 		`{"name":"web","allowed_key_algos":["ecdsa-p256"],"max_ttl_seconds":86400,"require_san":true}`))
+	req = req.WithContext(context.WithValue(req.Context(), apimiddleware.APIKeyKey, &storage.APIKey{Name: "caller"}))
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: %d: %s", rec.Code, rec.Body.String())
@@ -104,7 +106,6 @@ func TestProfiles_CRUD(t *testing.T) {
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"web"`) {
 		t.Fatalf("list: %d: %s", rec.Code, rec.Body.String())
 	}
-
 }
 func TestProfiles_EnforcedOnIssue(t *testing.T) {
 	store := newProfileFakeStore()

@@ -23,6 +23,30 @@ func NewSSHCAHandler(engine *sshca.Engine, store storage.Store, krlMgr *krl.Mana
 	return &SSHCAHandler{engine: engine, store: store, krlMgr: krlMgr}
 }
 
+// sshOwnerOK reports whether a tenant-scoped caller may act on an SSH CA.
+// Writes 404 (exists-hiding) when it is owned by another tenant.
+func sshOwnerOK(w http.ResponseWriter, r *http.Request, ca *storage.SSHCertificateAuthority) bool {
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(ca.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "SSH CA not found")
+		return false
+	}
+	return true
+}
+
+// sshLoadCA loads an SSH CA by physical id and applies the tenant check.
+func (h *SSHCAHandler) sshLoadCA(w http.ResponseWriter, r *http.Request, caID uuid.UUID) (*storage.SSHCertificateAuthority, bool) {
+	ca, err := h.store.GetSSHCA(r.Context(), caID)
+	if err != nil || ca == nil {
+		writeError(w, http.StatusNotFound, "SSH CA not found")
+		return nil, false
+	}
+	if !sshOwnerOK(w, r, ca) {
+		return nil, false
+	}
+	return ca, true
+}
+
 func (h *SSHCAHandler) RegisterRoutes(r chi.Router) {
 	r.Route("/api/v1/sshca", func(r chi.Router) {
 		r.Post("/", h.createCA)
@@ -76,8 +100,9 @@ func (h *SSHCAHandler) getKRL(w http.ResponseWriter, r *http.Request) {
 }
 
 type createSSHCARequest struct {
-	Name    string `json:"name"`
-	KeyAlgo string `json:"key_algo"`
+	Name     string `json:"name"`
+	KeyAlgo  string `json:"key_algo"`
+	TenantID string `json:"tenant_id"`
 }
 
 func (h *SSHCAHandler) createCA(w http.ResponseWriter, r *http.Request) {
@@ -86,10 +111,15 @@ func (h *SSHCAHandler) createCA(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	tid, ok := createTenant(r, req.TenantID, w)
+	if !ok {
+		return
+	}
 
 	record, err := h.engine.CreateCA(r.Context(), sshca.CreateCARequest{
-		Name:    req.Name,
-		KeyAlgo: sshca.KeyAlgo(req.KeyAlgo),
+		Name:     req.Name,
+		KeyAlgo:  sshca.KeyAlgo(req.KeyAlgo),
+		TenantID: tid,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -109,6 +139,9 @@ func (h *SSHCAHandler) rekeyCA(w http.ResponseWriter, r *http.Request) {
 		KeyAlgo string `json:"key_algo"`
 	}
 	_ = decodeJSON(r, &req) // key_algo optional
+	if _, ok := h.sshLoadCA(w, r, id); !ok {
+		return
+	}
 	ca, err := h.engine.RekeyCA(r.Context(), sshca.RekeyCARequest{CAID: id, KeyAlgo: sshca.KeyAlgo(req.KeyAlgo)})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -138,6 +171,9 @@ func (h *SSHCAHandler) crossSignCA(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if _, ok := h.sshLoadCA(w, r, targetID); !ok {
+		return
+	}
 	ca, err := h.engine.CrossSignCA(r.Context(), sshca.CrossSignCARequest{TargetCAID: targetID})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -152,6 +188,16 @@ func (h *SSHCAHandler) listCAs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	caller, _ := tenantFromContext(r)
+	if caller != nil {
+		var out []*storage.SSHCertificateAuthority
+		for _, c := range cas {
+			if tenantOwns(c.TenantID, caller) {
+				out = append(out, c)
+			}
+		}
+		cas = out
+	}
 	writeJSON(w, http.StatusOK, cas)
 }
 
@@ -164,6 +210,9 @@ func (h *SSHCAHandler) getCA(w http.ResponseWriter, r *http.Request) {
 	record, err := h.engine.ResolveActiveCA(r.Context(), id)
 	if err != nil || record == nil {
 		writeError(w, http.StatusNotFound, "SSH CA not found")
+		return
+	}
+	if !sshOwnerOK(w, r, record) {
 		return
 	}
 	writeJSON(w, http.StatusOK, record)
@@ -234,6 +283,13 @@ func (h *SSHCAHandler) issue(w http.ResponseWriter, certType storage.SSHCertType
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if active == nil {
+		writeError(w, http.StatusNotFound, "SSH CA not found")
+		return
+	}
+	if !sshOwnerOK(w, r, active) {
+		return
+	}
 
 	issued, err := h.engine.IssueCert(r.Context(), sshca.IssueCertRequest{
 		CAID:            active.ID,
@@ -282,6 +338,9 @@ func (h *SSHCAHandler) listCertsByCA(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid CA ID")
 		return
 	}
+	if _, ok := h.sshLoadCA(w, r, id); !ok {
+		return
+	}
 	certs, err := h.store.ListSSHCertificatesByCA(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -299,6 +358,9 @@ func (h *SSHCAHandler) getCert(w http.ResponseWriter, r *http.Request) {
 	cert, err := h.store.GetSSHCertificate(r.Context(), id)
 	if err != nil || cert == nil {
 		writeError(w, http.StatusNotFound, "SSH certificate not found")
+		return
+	}
+	if _, ok := h.sshLoadCA(w, r, cert.CAID); !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, cert)
@@ -320,6 +382,9 @@ func (h *SSHCAHandler) getCertBySerial(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "SSH certificate not found")
 		return
 	}
+	if _, ok := h.sshLoadCA(w, r, caID); !ok {
+		return
+	}
 	writeJSON(w, http.StatusOK, cert)
 }
 
@@ -328,6 +393,14 @@ func (h *SSHCAHandler) revokeCert(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "certID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid cert ID")
+		return
+	}
+	cert, err := h.store.GetSSHCertificate(r.Context(), id)
+	if err != nil || cert == nil {
+		writeError(w, http.StatusNotFound, "SSH certificate not found")
+		return
+	}
+	if _, ok := h.sshLoadCA(w, r, cert.CAID); !ok {
 		return
 	}
 	if err := h.krlMgr.RevokeAndRefresh(r.Context(), id); err != nil {

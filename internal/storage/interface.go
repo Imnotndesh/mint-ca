@@ -155,16 +155,21 @@ type CertificateAuthority struct {
 	KeyEnc          []byte           `json:"-"`
 	KeyAlgo         string           `json:"key_algo"`
 	NameConstraints *NameConstraints `json:"name_constraints,omitempty"`
-	NotBefore       time.Time        `json:"not_before"`
-	NotAfter        time.Time        `json:"not_after"`
-	CreatedAt       time.Time        `json:"created_at"`
+	// TenantID is the owning tenant (uuid.Nil means legacy/unset, treated as
+	// the default tenant by isolation checks).
+	TenantID  uuid.UUID `json:"tenant_id,omitempty"`
+	NotBefore time.Time `json:"not_before"`
+	NotAfter  time.Time `json:"not_after"`
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // SSHCertificateAuthority is a signing key used to issue SSH user/host
 // certificates. Unlike X.509 CAs, SSH CAs are flat — no parent/child chain.
 type SSHCertificateAuthority struct {
-	ID        uuid.UUID  `json:"id"`
-	Name      string     `json:"name"`
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+	// TenantID is the owning tenant (uuid.Nil means legacy/unset).
+	TenantID  uuid.UUID  `json:"tenant_id,omitempty"`
 	KeyAlgo   SSHKeyAlgo `json:"key_algo"`
 	PublicKey string     `json:"public_key"` // OpenSSH authorized_keys format
 	KeyEnc    []byte     `json:"-"`
@@ -298,6 +303,8 @@ type Certificate struct {
 type Profile struct {
 	ID   uuid.UUID `json:"id"`
 	Name string    `json:"name"`
+	// TenantID is the owning tenant (uuid.Nil means legacy/unset).
+	TenantID uuid.UUID `json:"tenant_id,omitempty"`
 
 	// AllowedKeyAlgos restricts the leaf key algorithm (e.g. "ecdsa-p256",
 	// "rsa-2048", "ed25519"). Empty means any.
@@ -335,8 +342,10 @@ type CSRAutoApproveRule struct {
 }
 
 type Provisioner struct {
-	ID        uuid.UUID         `json:"id"`
-	CAID      uuid.UUID         `json:"ca_id"`
+	ID   uuid.UUID `json:"id"`
+	CAID uuid.UUID `json:"ca_id"`
+	// TenantID is the CA/tenant ownership (uuid.Nil means legacy/unset).
+	TenantID  uuid.UUID         `json:"tenant_id,omitempty"`
 	Name      string            `json:"name"`
 	Type      ProvisionerType   `json:"type"`
 	Config    JSON              `json:"config"`
@@ -348,8 +357,10 @@ type Provisioner struct {
 
 // Policy defines the rules that govern what a provisioner or CA may issue.
 type Policy struct {
-	ID             uuid.UUID   `json:"id"`
-	Name           string      `json:"name"`
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+	// TenantID is the owning tenant (uuid.Nil means legacy/unset).
+	TenantID       uuid.UUID   `json:"tenant_id,omitempty"`
 	Scope          PolicyScope `json:"scope"`
 	MaxTTL         int64       `json:"max_ttl_seconds"`
 	AllowedDomains []string    `json:"allowed_domains"`
@@ -440,14 +451,52 @@ type AuditLog struct {
 
 // APIKey is a bearer token used to authenticate calls to the management API.
 type APIKey struct {
-	ID        uuid.UUID  `json:"id"`
-	Name      string     `json:"name"`
-	KeyHash   string     `json:"-"`
-	Scopes    []string   `json:"scopes"`
-	CAID      *uuid.UUID `json:"ca_id,omitempty"`
+	ID      uuid.UUID  `json:"id"`
+	Name    string     `json:"name"`
+	KeyHash string     `json:"-"`
+	Scopes  []string   `json:"scopes"`
+	CAID    *uuid.UUID `json:"ca_id,omitempty"`
+	// TenantID scopes this key to exactly one tenant (nil = platform admin).
+	// A tenant-scoped key can only see/act on rows belonging to its own tenant.
+	TenantID  *uuid.UUID `json:"tenant_id,omitempty"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
 	LastUsed  *time.Time `json:"last_used,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
+}
+
+// TenantStatus is the lifecycle state of a Tenant.
+type TenantStatus string
+
+const (
+	TenantStatusActive    TenantStatus = "active"
+	TenantStatusSuspended TenantStatus = "suspended"
+)
+
+// Tenant is the multi-tenancy scoping unit: every tenant-private resource is
+// owned by exactly one tenant.
+type Tenant struct {
+	ID        uuid.UUID    `json:"id"`
+	Name      string       `json:"name"`
+	Status    TenantStatus `json:"status"`
+	CreatedAt time.Time    `json:"created_at"`
+}
+
+// DefaultTenantID is the fixed, well-known UUID of the seeded default tenant
+// that pre-existing single-tenant rows are backfilled to. Chosen so existing
+// deployments migrate deterministically without a runtime-generated ID.
+var DefaultTenantID = uuid.MustParse("00000000-0000-0000-0000-000000000000")
+
+// TenantStore is the CRUD surface the multi-tenancy handlers need. It is kept
+// separate from Store (which the whole codebase depends on) so the extensive
+// fake-store test suite is not forced to implement tenant methods. The real
+// backends satisfy it via a local interface assertion, mirroring the repo's
+// profileStore/csrApprovalStore convention.
+type TenantStore interface {
+	CreateTenant(ctx context.Context, t *Tenant) error
+	GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error)
+	GetTenantByName(ctx context.Context, name string) (*Tenant, error)
+	ListTenants(ctx context.Context) ([]*Tenant, error)
+	UpdateTenantStatus(ctx context.Context, id uuid.UUID, status TenantStatus) error
 }
 
 // JSON is a free-form map that round-trips through the database as a JSON string.

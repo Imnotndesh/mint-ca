@@ -6,6 +6,19 @@ ACME endpoints are under `/acme/{provisionerID}` and follow the ACME protocol (n
 
 ## 1.1 Certificate Authorities
 
+> **Tenant scoping (multi-tenancy):** every CA, SSH CA, provisioner, profile,
+> policy, CSR auto-approval rule, EAB key, and issued certificate (scoped
+> transitively via its CA) is owned by exactly one tenant. A tenant-scoped key
+> only sees and can operate on its own tenant's resources — cross-tenant
+> reads/updates return `404` (never `403`, to hide existence), except the
+> global audit/Merkle verification and unscoped audit endpoints, which are
+> **platform-admin only** (`403` for tenant keys). A platform-admin key sees
+> everything. A tenant-scoped caller creates resources only within its own
+> tenant; a platform admin may scope creation with an explicit `"tenant_id"`
+> field on CAs/SSH CAs, defaulting to the default tenant when omitted
+> (preserving single-tenant operator flows). The public SCEP endpoint refuses a
+> CA whose tenant differs from its configured provisioner. See §1.6.1.
+
 ### `POST /api/v1/ca/root`
 Create a new self‑signed root CA.
 
@@ -464,6 +477,9 @@ Revoke (mark as used) an EAB credential.
 
 ### `POST /api/v1/apikeys`
 Create a new management API key.
+> The legacy optional `ca_id` field (restrict a key to one CA) is retained
+> for backward compatibility; prefer tenant-based `tenant_id` scoping for
+> isolation. Removing `ca_id` entirely is tracked as a follow-up cleanup.
 
 **Request body**
 ```json
@@ -471,13 +487,27 @@ Create a new management API key.
   "name": "my-key",
   "scopes": ["*"],                // scope strings, "*" for all
   "ca_id": "ca-uuid",             // optional, restrict to a CA
+  "tenant_id": "tenant-uuid",     // optional; scope to a tenant
+  "platform_admin": false,         // optional; create a platform-admin key
   "expires_in_seconds": 31536000,  // optional; default applies when omitted
   "never_expires": false           // optional; true for an explicit never‑expiring key
 }
 ```
+Tenant scoping (multi-tenancy):
+- A **tenant-scoped caller** may only create keys for its own tenant. Any
+  `tenant_id` supplied must match its own tenant (a mismatch returns `400`)
+  and `platform_admin` is never permitted.
+- A **platform-admin caller** (the operator; a key with no `tenant_id`) must
+  choose exactly one of:
+  - set `tenant_id` to mint a key scoped to that tenant, **or**
+  - set `"platform_admin": true` to mint another platform-admin key.
+  Omitting both returns `400` so a platform-admin key is never created
+  accidentally.
+
 When `expires_in_seconds` is omitted (and `never_expires` is false), a
 conservative default lifetime of **90 days** is applied so automation tokens are
-rotated by default rather than long‑lived. Keys are enforced to be rejected after	expiry, and `last_used` is tracked per key.
+rotated by default rather than long‑lived. Keys are enforced to be rejected after
+expiry, and `last_used` is tracked per key.
 
 **Response (201 Created)**
 ```json
@@ -486,13 +516,16 @@ rotated by default rather than long‑lived. Keys are enforced to be rejected af
   "name": "my-key",
   "key": "mca_abc123...",          // raw key – store it immediately
   "scopes": ["*"],
+  "tenant_id": "tenant-uuid",       // absent for platform-admin keys
   "expires_at": "2026-01-01T00:00:00Z",
   "note": "store the key securely — it will not be shown again"
 }
 ```
 
 ### `GET /api/v1/apikeys`
-List all API keys (only metadata, no keys).
+List API keys (only metadata, no keys). A tenant-scoped caller sees only its
+own tenant's keys (never other tenants' or platform-admin keys); a platform
+admin sees all.
 
 ### `POST /api/v1/apikeys/{keyID}/rotate`
 Issue a fresh bearer token for an existing key identity. Keeps its
@@ -505,7 +538,46 @@ replaced) — callers must stop using it. No request body.
 ```
 
 ### `DELETE /api/v1/apikeys/{keyID}`
-Delete an API key.
+Delete an API key. A tenant-scoped caller may only delete keys within its own
+tenant; attempting to delete another tenant's or a platform-admin key returns
+`404`.
+
+---
+
+## 1.6.1 Tenants (Multi-tenancy)
+
+A running mint-ca instance can serve several isolated tenants. Every
+tenant-private resource (CAs, provisioners, profiles, policies, API keys, …)
+is owned by exactly one tenant and is invisible to every other. Tenant
+management endpoints are **platform-admin only** (except reading one's own
+tenant), enforced by which API key signs the request.
+
+Every deployment always has a single seeded **default tenant** (fixed UUID
+`00000000-0000-0000-0000-000000000000`) created at first boot; single-tenant
+installs continue to operate entirely under it.
+
+### `GET /api/v1/tenants`
+List tenants. **Platform-admin only.**
+
+### `POST /api/v1/tenants`
+Create a new tenant. **Platform-admin only.**
+
+**Request body**
+```json
+{ "name": "acme-corp" }
+```
+Returns `409 Conflict` if a tenant with the same name already exists.
+
+### `GET /api/v1/tenants/{tenantID}`
+Get a tenant. Platform admin sees any; a tenant-scoped caller may only read its
+own tenant (a mismatch returns `404`).
+
+### `PUT /api/v1/tenants/{tenantID}/suspend`
+Suspend a tenant. **Platform-admin only.** Once suspended, every subsequent
+authenticated request from that tenant's API keys is rejected with `403`.
+
+### `PUT /api/v1/tenants/{tenantID}/activate`
+Re-activate a suspended tenant. **Platform-admin only.**
 
 ---
 
