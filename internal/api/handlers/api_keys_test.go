@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	apimiddleware "mint-ca/internal/api/middleware"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -67,7 +68,8 @@ func setupAPIKeys() (*apiKeyFakeStore, chi.Router) {
 	return store, r
 }
 
-// doAPIKeyRequest issues a request against the router.
+// doAPIKeyRequest issues a request against the router, injecting a platform-admin
+// caller into context so the multi-tenancy guards pass through to the logic under test.
 func doAPIKeyRequest(r chi.Router, method, path, body string) *httptest.ResponseRecorder {
 	var req *http.Request
 	if body == "" {
@@ -75,6 +77,8 @@ func doAPIKeyRequest(r chi.Router, method, path, body string) *httptest.Response
 	} else {
 		req = httptest.NewRequest(method, path, strings.NewReader(body))
 	}
+	req = req.WithContext(context.WithValue(req.Context(), apimiddleware.APIKeyKey,
+		&storage.APIKey{Name: "test-caller"}))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
@@ -82,7 +86,7 @@ func doAPIKeyRequest(r chi.Router, method, path, body string) *httptest.Response
 
 func TestAPIKey_DefaultExpiryApplied(t *testing.T) {
 	store, r := setupAPIKeys()
-	rec := doAPIKeyRequest(r, http.MethodPost, "/api/v1/apikeys/", `{"name":"ci-bot"}`)
+	rec := doAPIKeyRequest(r, http.MethodPost, "/api/v1/apikeys/", `{"name":"ci-bot","platform_admin":true}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: %d: %s", rec.Code, rec.Body.String())
 	}
@@ -100,7 +104,7 @@ func TestAPIKey_DefaultExpiryApplied(t *testing.T) {
 
 func TestAPIKey_ExplicitNeverExpires(t *testing.T) {
 	store, r := setupAPIKeys()
-	rec := doAPIKeyRequest(r, http.MethodPost, "/api/v1/apikeys/", `{"name":"long","never_expires":true}`)
+	rec := doAPIKeyRequest(r, http.MethodPost, "/api/v1/apikeys/", `{"name":"long","never_expires":true,"platform_admin":true}`)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("create: %d", rec.Code)
 	}

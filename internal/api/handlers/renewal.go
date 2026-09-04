@@ -75,36 +75,71 @@ func (h *RenewalHandler) status(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	resp := renewalStatusResponse{Certificates: []renewalEntry{}}
-	var filter *uuid.UUID
+	caller, _ := tenantFromContext(r)
+
+	// Build the set of CAs whose renewal risk this caller may see. A
+	// platform-admin caller (nil tenant) sees all (or a single ca_id filter).
+	// A tenant-scoped caller is restricted to CAs it owns.
+	filters := []*uuid.UUID{}
 	if hasFilter {
-		filter = &caIDFilter
-	}
-	err := renewal.ForEachCert(r.Context(), h.store, filter, now, h.lead, h.exp, func(c *storage.Certificate, st renewal.Status) {
-		if st == renewal.StatusValid {
+		if caller != nil {
+			if ca, err := h.store.GetCA(r.Context(), caIDFilter); err == nil && ca != nil && tenantOwns(ca.TenantID, caller) {
+				// allowed
+			} else {
+				writeError(w, http.StatusNotFound, "CA not found")
+				return
+			}
+		}
+		f := caIDFilter
+		filters = append(filters, &f)
+	} else if caller != nil {
+		cas, err := h.store.ListCAs(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		resp.Certificates = append(resp.Certificates, renewalEntry{
-			CertID:    c.ID.String(),
-			CAID:      c.CAID.String(),
-			SubjectCN: c.SubjectCN,
-			ExpiresAt: c.NotAfter,
-			DaysLeft:  int(c.NotAfter.Sub(now).Hours() / 24),
-			Status:    st,
-		})
-		switch st {
-		case renewal.StatusDue:
-			resp.Summary.Due++
-		case renewal.StatusExpiringSoon:
-			resp.Summary.ExpiringSoon++
-		case renewal.StatusExpired:
-			resp.Summary.Expired++
-		case renewal.StatusRevoked:
-			resp.Summary.Revoked++
+		for _, c := range cas {
+			if tenantOwns(c.TenantID, caller) {
+				id := c.ID
+				filters = append(filters, &id)
+			}
 		}
-	})
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		if len(filters) == 0 {
+			writeJSON(w, http.StatusOK, resp)
+			return
+		}
+	} else {
+		filters = append(filters, nil)
+	}
+
+	for _, f := range filters {
+		err := renewal.ForEachCert(r.Context(), h.store, f, now, h.lead, h.exp, func(c *storage.Certificate, st renewal.Status) {
+			if st == renewal.StatusValid {
+				return
+			}
+			resp.Certificates = append(resp.Certificates, renewalEntry{
+				CertID:    c.ID.String(),
+				CAID:      c.CAID.String(),
+				SubjectCN: c.SubjectCN,
+				ExpiresAt: c.NotAfter,
+				DaysLeft:  int(c.NotAfter.Sub(now).Hours() / 24),
+				Status:    st,
+			})
+			switch st {
+			case renewal.StatusDue:
+				resp.Summary.Due++
+			case renewal.StatusExpiringSoon:
+				resp.Summary.ExpiringSoon++
+			case renewal.StatusExpired:
+				resp.Summary.Expired++
+			case renewal.StatusRevoked:
+				resp.Summary.Revoked++
+			}
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)

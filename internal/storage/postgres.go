@@ -20,6 +20,8 @@ type postgresStore struct {
 	db *sql.DB
 }
 
+var _ TenantStore = (*postgresStore)(nil)
+
 const postgresDeltaCRLSchema = `
 CREATE TABLE IF NOT EXISTS crl_delta_cache (
 	id              TEXT        NOT NULL PRIMARY KEY,
@@ -119,6 +121,39 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 		UPDATE certificate_authorities SET logical_ca_id = id WHERE logical_ca_id IS NULL;
 	`); err != nil {
 		return fmt.Errorf("postgres: migrate logical_ca_id: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL;
+	`); err != nil {
+		return fmt.Errorf("postgres: migrate api_keys tenant_id: %w", err)
+	}
+	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies", "ssh_certificate_authorities"} {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+t+` ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL;`); err != nil {
+			return fmt.Errorf("postgres: migrate %s tenant_id: %w", t, err)
+		}
+	}
+	if err := seedDefaultTenantPostgres(ctx, s.db); err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE certificate_authorities SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE provisioners SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE profiles SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE policies SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE ssh_certificate_authorities SET tenant_id = $1 WHERE tenant_id IS NULL;`, DefaultTenantID.String()); err != nil {
+		return fmt.Errorf("postgres: backfill tenant_id: %w", err)
+	}
+	return nil
+}
+
+// seedDefaultTenantPostgres inserts the fixed default tenant if no tenant
+// exists yet.
+func seedDefaultTenantPostgres(ctx context.Context, db *sql.DB) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenants`).Scan(&count); err != nil {
+		return fmt.Errorf("postgres: seed default tenant count: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO tenants (id, name, status, created_at) VALUES ($1, 'default', 'active', $2)`, DefaultTenantID.String(), time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: seed default tenant: %w", err)
 	}
 	return nil
 }
@@ -320,12 +355,20 @@ CREATE TABLE IF NOT EXISTS acme_retired_keys (
     retired_at TIMESTAMPTZ NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tenants (
+	id         TEXT        NOT NULL PRIMARY KEY,
+	name       TEXT        NOT NULL UNIQUE,
+	status     TEXT        NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+	created_at TIMESTAMPTZ NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS api_keys (
 	id         TEXT        NOT NULL PRIMARY KEY,
 	name       TEXT        NOT NULL,
 	key_hash   TEXT        NOT NULL UNIQUE,
 	scopes     TEXT        NOT NULL DEFAULT '[]',
 	ca_id      TEXT        REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	tenant_id  TEXT        REFERENCES tenants(id) ON DELETE SET NULL,
 	expires_at TIMESTAMPTZ,
 	last_used  TIMESTAMPTZ,
 	created_at TIMESTAMPTZ NOT NULL
@@ -488,11 +531,11 @@ func (s *postgresStore) CreateCA(ctx context.Context, ca *CertificateAuthority) 
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificate_authorities
 			(id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-			 name_constraints, not_before, not_after, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			 name_constraints, tenant_id, not_before, not_after, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		ca.ID.String(), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), ca.Name,
 		string(ca.Type), string(ca.Status), ca.CertPEM, ca.KeyEnc, ca.KeyAlgo,
-		ncStr, ca.NotBefore.UTC(), ca.NotAfter.UTC(), ca.CreatedAt.UTC(),
+		ncStr, pgUUIDNullable(ca.TenantID), ca.NotBefore.UTC(), ca.NotAfter.UTC(), ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateCA: %w", err)
@@ -630,7 +673,7 @@ const pgCrossCertSelectSQL = `
 
 const pgCASelectSQL = `
 	SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-	       name_constraints, not_before, not_after, created_at
+	       name_constraints, tenant_id, not_before, not_after, created_at
 	FROM certificate_authorities`
 
 func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
@@ -638,12 +681,12 @@ func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
 	var idStr string
 	var logicalCAIDStr *string
 	var parentIDStr *string
-	var ncStr *string
+	var ncStr, tenantIDStr *string
 	err := row.Scan(
 		&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 		&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 		&ncStr,
-		&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
+		&tenantIDStr, &ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -652,6 +695,7 @@ func pgScanCA(row *sql.Row) (*CertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.TenantID = pgSQLToUUIDValue(tenantIDStr)
 	ca.LogicalCAID = pgSQLToUUID(logicalCAIDStr)
 	ca.ParentID = pgSQLToUUID(parentIDStr)
 	nc, err := pgUnmarshalNameConstraints(ncStr)
@@ -669,16 +713,17 @@ func pgScanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 		var idStr string
 		var logicalCAIDStr *string
 		var parentIDStr *string
-		var ncStr *string
+		var ncStr, tenantIDStr *string
 		if err := rows.Scan(
 			&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 			&ncStr,
-			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
+			&tenantIDStr, &ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.TenantID = pgSQLToUUIDValue(tenantIDStr)
 		ca.LogicalCAID = pgSQLToUUID(logicalCAIDStr)
 		ca.ParentID = pgSQLToUUID(parentIDStr)
 		nc, err := pgUnmarshalNameConstraints(ncStr)
@@ -874,10 +919,10 @@ func pgScanCerts(rows *sql.Rows) ([]*Certificate, error) {
 func (s *postgresStore) CreateProvisioner(ctx context.Context, p *Provisioner) error {
 	cfg, _ := pgMarshalJSON(p.Config)
 	_, err := s.db.ExecContext(ctx, `
-		INSERT INTO provisioners (id, ca_id, name, type, config, policy_id, status, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		INSERT INTO provisioners (id, ca_id, name, type, config, policy_id, tenant_id, status, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
 		p.ID.String(), p.CAID.String(), p.Name, string(p.Type),
-		cfg, pgUUIDToSQL(p.PolicyID), string(p.Status), p.CreatedAt.UTC(),
+		cfg, pgUUIDToSQL(p.PolicyID), pgUUIDNullable(p.TenantID), string(p.Status), p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateProvisioner: %w", err)
@@ -906,13 +951,14 @@ func (s *postgresStore) ListProvisionersByCA(ctx context.Context, caID uuid.UUID
 	for rows.Next() {
 		var p Provisioner
 		var idStr, caIDStr, cfgStr string
-		var policyIDStr *string
-		if err := rows.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &p.Status, &p.CreatedAt); err != nil {
+		var policyIDStr, tenantIDStr *string
+		if err := rows.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &tenantIDStr, &p.Status, &p.CreatedAt); err != nil {
 			return nil, err
 		}
 		p.ID = uuid.MustParse(idStr)
 		p.CAID = uuid.MustParse(caIDStr)
 		p.PolicyID = pgSQLToUUID(policyIDStr)
+		p.TenantID = pgSQLToUUIDValue(tenantIDStr)
 		_ = pgUnmarshalJSON(cfgStr, &p.Config)
 		out = append(out, &p)
 	}
@@ -930,14 +976,14 @@ func (s *postgresStore) UpdateProvisionerStatus(ctx context.Context, id uuid.UUI
 }
 
 const pgProvisionerSelectSQL = `
-	SELECT id, ca_id, name, type, config, policy_id, status, created_at
+	SELECT id, ca_id, name, type, config, policy_id, tenant_id, status, created_at
 	FROM provisioners`
 
 func pgScanProvisioner(row *sql.Row) (*Provisioner, error) {
 	var p Provisioner
 	var idStr, caIDStr, cfgStr string
-	var policyIDStr *string
-	err := row.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &p.Status, &p.CreatedAt)
+	var policyIDStr, tenantIDStr *string
+	err := row.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &tenantIDStr, &p.Status, &p.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -947,6 +993,7 @@ func pgScanProvisioner(row *sql.Row) (*Provisioner, error) {
 	p.ID = uuid.MustParse(idStr)
 	p.CAID = uuid.MustParse(caIDStr)
 	p.PolicyID = pgSQLToUUID(policyIDStr)
+	p.TenantID = pgSQLToUUIDValue(tenantIDStr)
 	_ = pgUnmarshalJSON(cfgStr, &p.Config)
 	return &p, nil
 }
@@ -961,10 +1008,10 @@ func (s *postgresStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO policies
 			(id, name, scope, max_ttl_seconds, allowed_domains, denied_domains,
-			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, ssh_policy, tenant_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 		p.ID.String(), p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), p.CreatedAt.UTC(),
+		ad, dd, ai, as_, p.RequireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), pgUUIDNullable(p.TenantID), p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreatePolicy: %w", err)
@@ -982,13 +1029,15 @@ func (s *postgresStore) ListPolicies(ctx context.Context) ([]*Policy, error) {
 	for rows.Next() {
 		var p Policy
 		var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
+		var tenantIDStr *string
 		if err := rows.Scan(
 			&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-			&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
+			&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &tenantIDStr, &p.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		p.ID = uuid.MustParse(idStr)
+		p.TenantID = pgSQLToUUIDValue(tenantIDStr)
 		p.AllowedDomains, _ = pgUnmarshalStringSlice(adStr)
 		p.DeniedDomains, _ = pgUnmarshalStringSlice(ddStr)
 		p.AllowedIPs, _ = pgUnmarshalStringSlice(aiStr)
@@ -1037,15 +1086,16 @@ func (s *postgresStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 const pgPolicySelectSQL = `
 	SELECT id, name, scope, max_ttl_seconds,
 	       allowed_domains, denied_domains, allowed_ips, allowed_sans,
-	       require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at
+	       require_san, key_algos, policy_oids, cps_uri, ssh_policy, tenant_id, created_at
 	FROM policies`
 
 func pgScanPolicy(row *sql.Row) (*Policy, error) {
 	var p Policy
 	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
+	var tenantIDStr *string
 	err := row.Scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &p.RequireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &tenantIDStr, &p.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -1054,6 +1104,7 @@ func pgScanPolicy(row *sql.Row) (*Policy, error) {
 		return nil, err
 	}
 	p.ID = uuid.MustParse(idStr)
+	p.TenantID = pgSQLToUUIDValue(tenantIDStr)
 	p.AllowedDomains, _ = pgUnmarshalStringSlice(adStr)
 	p.DeniedDomains, _ = pgUnmarshalStringSlice(ddStr)
 	p.AllowedIPs, _ = pgUnmarshalStringSlice(aiStr)
@@ -1080,9 +1131,9 @@ func pgWriteProfileArgs(p *Profile) ([]interface{}, []string) {
 	aka, _ := pgMarshalStringSlice(p.AllowedKeyAlgos)
 	return []interface{}{
 			p.ID.String(), p.Name, aka, p.MinTTLSeconds, p.MaxTTLSeconds,
-			p.RequireSAN, p.AllowWildcard, p.CreatedAt.UTC(),
+			p.RequireSAN, p.AllowWildcard, pgUUIDNullable(p.TenantID), p.CreatedAt.UTC(),
 		}, []string{"id", "name", "allowed_key_algos", "min_ttl_seconds",
-			"max_ttl_seconds", "require_san", "allow_wildcard", "created_at"}
+			"max_ttl_seconds", "require_san", "allow_wildcard", "tenant_id", "created_at"}
 }
 
 func (s *postgresStore) CreateProfile(ctx context.Context, p *Profile) error {
@@ -1150,7 +1201,7 @@ func (s *postgresStore) DeleteProfile(ctx context.Context, id uuid.UUID) error {
 
 const pgProfileSelectSQL = `
 	SELECT id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
-	       require_san, allow_wildcard, created_at
+	       require_san, allow_wildcard, tenant_id, created_at
 	FROM profiles`
 
 func pgGetProfile(ctx context.Context, db *sql.DB, query string, arg interface{}) (*Profile, error) {
@@ -1160,7 +1211,8 @@ func pgGetProfile(ctx context.Context, db *sql.DB, query string, arg interface{}
 func pgScanProfile(scan func(...interface{}) error) (*Profile, error) {
 	var p Profile
 	var idStr, akaStr string
-	err := scan(&idStr, &p.Name, &akaStr, &p.MinTTLSeconds, &p.MaxTTLSeconds, &p.RequireSAN, &p.AllowWildcard, &p.CreatedAt)
+	var tenantIDStr *string
+	err := scan(&idStr, &p.Name, &akaStr, &p.MinTTLSeconds, &p.MaxTTLSeconds, &p.RequireSAN, &p.AllowWildcard, &tenantIDStr, &p.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -1168,6 +1220,7 @@ func pgScanProfile(scan func(...interface{}) error) (*Profile, error) {
 		return nil, err
 	}
 	p.ID = uuid.MustParse(idStr)
+	p.TenantID = pgSQLToUUIDValue(tenantIDStr)
 	p.AllowedKeyAlgos, _ = pgUnmarshalStringSlice(akaStr)
 	return &p, nil
 }
@@ -2029,10 +2082,10 @@ func (s *postgresStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
 	scopes, _ := pgMarshalStringSlice(k.Scopes)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO api_keys
-			(id, name, key_hash, scopes, ca_id, expires_at, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+			(id, name, key_hash, scopes, ca_id, tenant_id, expires_at, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
 		k.ID.String(), k.Name, k.KeyHash, scopes,
-		pgUUIDToSQL(k.CAID), k.ExpiresAt, k.CreatedAt.UTC(),
+		pgUUIDToSQL(k.CAID), pgUUIDToSQL(k.TenantID), k.ExpiresAt, k.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateAPIKey: %w", err)
@@ -2042,14 +2095,14 @@ func (s *postgresStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
 
 func (s *postgresStore) GetAPIKeyByHash(ctx context.Context, hash string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys WHERE key_hash = $1`, hash)
 	return pgScanAPIKey(row)
 }
 
 func (s *postgresStore) ListAPIKeys(ctx context.Context) ([]*APIKey, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: ListAPIKeys: %w", err)
@@ -2059,15 +2112,16 @@ func (s *postgresStore) ListAPIKeys(ctx context.Context) ([]*APIKey, error) {
 	for rows.Next() {
 		var k APIKey
 		var idStr, scopesStr string
-		var caIDStr *string
+		var caIDStr, tenantIDStr *string
 		if err := rows.Scan(
 			&idStr, &k.Name, &k.KeyHash, &scopesStr,
-			&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
+			&caIDStr, &tenantIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		k.ID = uuid.MustParse(idStr)
 		k.CAID = pgSQLToUUID(caIDStr)
+		k.TenantID = pgSQLToUUID(tenantIDStr)
 		k.Scopes, _ = pgUnmarshalStringSlice(scopesStr)
 		out = append(out, &k)
 	}
@@ -2133,7 +2187,7 @@ func (s *postgresStore) SetSetupState(ctx context.Context, state SetupState) err
 
 func (s *postgresStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys WHERE name = $1`, name)
 	return pgScanAPIKey(row)
 }
@@ -2141,10 +2195,10 @@ func (s *postgresStore) GetAPIKeyByName(ctx context.Context, name string) (*APIK
 func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 	var k APIKey
 	var idStr, scopesStr string
-	var caIDStr *string
+	var caIDStr, tenantIDStr *string
 	err := row.Scan(
 		&idStr, &k.Name, &k.KeyHash, &scopesStr,
-		&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
+		&caIDStr, &tenantIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2154,16 +2208,83 @@ func pgScanAPIKey(row *sql.Row) (*APIKey, error) {
 	}
 	k.ID = uuid.MustParse(idStr)
 	k.CAID = pgSQLToUUID(caIDStr)
+	k.TenantID = pgSQLToUUID(tenantIDStr)
 	k.Scopes, _ = pgUnmarshalStringSlice(scopesStr)
 	return &k, nil
 }
+
+// ---- tenants ----
+
+const pgTenantSelectSQL = `SELECT id, name, status, created_at FROM tenants`
+
+func (s *postgresStore) CreateTenant(ctx context.Context, t *Tenant) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO tenants (id, name, status, created_at)
+		VALUES ($1, $2, $3, $4)`, t.ID.String(), t.Name, string(t.Status), t.CreatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("postgres: CreateTenant: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx, pgTenantSelectSQL+" WHERE id = $1", id.String())
+	return pgScanTenant(row)
+}
+
+func (s *postgresStore) GetTenantByName(ctx context.Context, name string) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx, pgTenantSelectSQL+" WHERE name = $1", name)
+	return pgScanTenant(row)
+}
+
+func (s *postgresStore) ListTenants(ctx context.Context) ([]*Tenant, error) {
+	rows, err := s.db.QueryContext(ctx, pgTenantSelectSQL+" ORDER BY created_at ASC")
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListTenants: %w", err)
+	}
+	defer rows.Close()
+	var out []*Tenant
+	for rows.Next() {
+		t, err := pgScanTenantRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateTenantStatus(ctx context.Context, id uuid.UUID, status TenantStatus) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = $1 WHERE id = $2`, string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateTenantStatus: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: UpdateTenantStatus: tenant %s not found", id)
+	}
+	return nil
+}
+
+func pgScanTenant(row *sql.Row) (*Tenant, error) {
+	t, err := scanTenantFields(func(dest ...interface{}) error { return row.Scan(dest...) })
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func pgScanTenantRows(rows *sql.Rows) (*Tenant, error) {
+	return scanTenantFields(rows.Scan)
+}
+
 func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities
-			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
-		ca.KeyEnc, string(ca.Status), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), ca.CreatedAt.UTC(),
+		ca.KeyEnc, string(ca.Status), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), pgUUIDNullable(ca.TenantID),
+		ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateSSHCA: %w", err)
@@ -2172,14 +2293,14 @@ func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAutho
 }
 
 const pgSSHCASelectSQL = `
-	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at
+	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at
 	FROM ssh_certificate_authorities`
 
 func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 	var ca SSHCertificateAuthority
 	var idStr string
-	var logicalID, parentID *string
-	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt)
+	var logicalID, parentID, tenantID *string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2187,6 +2308,7 @@ func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.TenantID = pgSQLToUUIDValue(tenantID)
 	ca.LogicalCAID = pgSQLToUUID(logicalID)
 	ca.ParentID = pgSQLToUUID(parentID)
 	return &ca, nil
@@ -2220,11 +2342,12 @@ func (s *postgresStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthor
 	for rows.Next() {
 		var ca SSHCertificateAuthority
 		var idStr string
-		var logicalID, parentID *string
-		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt); err != nil {
+		var logicalID, parentID, tenantID *string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.TenantID = pgSQLToUUIDValue(tenantID)
 		ca.LogicalCAID = pgSQLToUUID(logicalID)
 		ca.ParentID = pgSQLToUUID(parentID)
 		out = append(out, &ca)

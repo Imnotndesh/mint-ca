@@ -208,6 +208,30 @@ Using `curl` (or any HTTP client), perform the following two requests **before**
 After the second request, the server automatically deletes the bootstrap key and restarts its HTTP listener (now in ready mode).  
 If you are using Docker, the container does **not** restart; the listener is replaced in‑process, but the process stays alive.
 
+The first permanent key created via `POST /setup/api-key` is a **platform‑admin** key — the person standing up the instance is, by definition, the platform operator. A platform‑admin key bypasses tenant isolation and can also mint tenants and per‑tenant (or additional platform‑admin) keys afterward:
+
+- `POST /api/v1/tenants` — onboard a new tenant (platform admin only).
+- `POST /api/v1/apikeys` with `"tenant_id"` — create a key scoped to a tenant.
+- `POST /api/v1/apikeys` with `"platform_admin": true` — create another operator key.
+
+Tenant management is described in `docs/Api.md` §1.6.1. Tenant creation is
+meaningless until you have issued keys, so onboard tenants with the
+platform‑admin key created during setup.
+
+Existing single‑tenant databases upgraded from a pre‑multi‑tenant version leave
+their prior API keys with no tenant (treated as platform‑admin / operator scoped)
+and continue operating unchanged under the seeded default tenant.
+
+To onboard an actual tenant: (1) `POST /api/v1/tenants` to create it,
+(2) `POST /api/v1/apikeys` with that `"tenant_id"` to mint a key scoped to it,
+and (3) act with that key so its CAs, SSH CAs, provisioners, profiles, policies,
+CSR-approval rules, EAB keys, certs, audit (per-CA) and renewal status all stay
+isolated to the tenant. Cross-tenant access returns `404`; the global audit
+stream and its verify/Merkle endpoints are platform‑admin only. When a platform‑
+admin creates a CA/SSH‑CA via the API you can supply `"tenant_id"` to scope it
+(otherwise it lands in the default tenant). See `docs/Api.md` §1.6.1.
+
+
 ## 2.6 Minimal Configuration (Development)
 
 For local testing without TLS, use this minimal setup:

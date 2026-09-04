@@ -30,10 +30,27 @@ type createEABRequest struct {
 	ExpiresInSeconds int64 `json:"expires_in_seconds"`
 }
 
+func (h *EABHandler) provisionerPermitted(w http.ResponseWriter, r *http.Request, provID uuid.UUID) bool {
+	prov, err := h.store.GetProvisioner(r.Context(), provID)
+	if err != nil || prov == nil {
+		writeError(w, http.StatusNotFound, "provisioner not found")
+		return false
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(prov.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "provisioner not found")
+		return false
+	}
+	return true
+}
+
 func (h *EABHandler) create(w http.ResponseWriter, r *http.Request) {
 	provID, err := uuid.Parse(chi.URLParam(r, "provisionerID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid provisioner ID")
+		return
+	}
+	if !h.provisionerPermitted(w, r, provID) {
 		return
 	}
 
@@ -93,6 +110,9 @@ func (h *EABHandler) revoke(w http.ResponseWriter, r *http.Request) {
 	cred, err := h.store.GetEABCredential(r.Context(), keyID)
 	if err != nil || cred == nil {
 		writeError(w, http.StatusNotFound, "EAB credential not found")
+		return
+	}
+	if !h.provisionerPermitted(w, r, cred.ProvisionerID) {
 		return
 	}
 	if err := h.store.MarkEABUsed(r.Context(), cred.ID); err != nil {

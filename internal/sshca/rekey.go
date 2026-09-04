@@ -199,7 +199,8 @@ func (e *Engine) establishNewCA(
 
 	newCA := &storage.SSHCertificateAuthority{
 		ID:          uuid.New(),
-		Name:        target.Name, // re-keyed CA keeps the operator-facing name
+		Name:        target.Name,     // re-keyed CA keeps the operator-facing name
+		TenantID:    target.TenantID, // inherit tenant across re-key/cross-sign
 		KeyAlgo:     newKeyAlgo,
 		PublicKey:   newPublicKey,
 		KeyEnc:      newKeyEnc,

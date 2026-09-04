@@ -77,6 +77,43 @@ func (h *CertHandler) verifyAttestation(ctx context.Context, csrPEM string, req 
 	return nil
 }
 
+// caTenantAllowed checks that the caller may act within caID's tenant. Returns
+// false after writing 404 when the CA is missing or owned by another tenant.
+func (h *CertHandler) caTenantAllowed(w http.ResponseWriter, r *http.Request, caID uuid.UUID) bool {
+	ca, err := h.store.GetCA(r.Context(), caID)
+	if err != nil || ca == nil {
+		writeError(w, http.StatusNotFound, "CA not found")
+		return false
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(ca.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "CA not found")
+		return false
+	}
+	return true
+}
+
+// certTenantAllowed checks the caller may act on cert (found by its id), by
+// verifying the cert's CA belongs to the caller's tenant. Returns false after
+// writing 404 on missing cert or foreign-tenant CA.
+func (h *CertHandler) certTenantAllowed(w http.ResponseWriter, r *http.Request, cert *storage.Certificate) bool {
+	if cert == nil {
+		writeError(w, http.StatusNotFound, "certificate not found")
+		return false
+	}
+	ca, err := h.store.GetCA(r.Context(), cert.CAID)
+	if err != nil || ca == nil {
+		writeError(w, http.StatusNotFound, "certificate not found")
+		return false
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(ca.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "certificate not found")
+		return false
+	}
+	return true
+}
+
 // emitCertIssued notifies the events bus that a certificate was issued.
 func (h *CertHandler) emitCertIssued(cert *storage.Certificate) {
 	h.events.Emit(events.New(events.CertIssued, map[string]any{
@@ -227,6 +264,11 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 	provID, err := uuid.Parse(req.ProvisionerID)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid provisioner_id")
+		return
+	}
+
+	// phase-3: only issue under a CA the caller may access.
+	if !h.caTenantAllowed(w, r, caID) {
 		return
 	}
 
@@ -394,6 +436,10 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !h.caTenantAllowed(w, r, caID) {
+		return
+	}
+
 	// CSR auto-approval rules (opt-in): if rules exist for this provisioner,
 	// the CSR must be auto-approved or it is refused.
 	if err := h.enforceCSRAutoApproval(r.Context(), provID, req.CSRPEM, req.TTLSeconds); err != nil {
@@ -456,6 +502,9 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.Items) > 1000 {
 		writeError(w, http.StatusBadRequest, "too many items (max 1000)")
+		return
+	}
+	if !h.caTenantAllowed(w, r, caID) {
 		return
 	}
 
@@ -538,6 +587,9 @@ func (h *CertHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "certificate not found")
 		return
 	}
+	if !h.certTenantAllowed(w, r, cert) {
+		return
+	}
 	writeJSON(w, http.StatusOK, cert)
 }
 
@@ -552,6 +604,14 @@ func (h *CertHandler) key(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = r.ParseForm()
 	passcode := r.URL.Query().Get("passcode")
+	cert, err := h.store.GetCertificate(r.Context(), id)
+	if err != nil || cert == nil {
+		writeError(w, http.StatusNotFound, "certificate not found")
+		return
+	}
+	if !h.certTenantAllowed(w, r, cert) {
+		return
+	}
 	keyPEM, err := h.engine.RetrieveKey(r.Context(), id, passcode)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -580,6 +640,9 @@ func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 	cert, err := h.store.GetCertificate(r.Context(), id)
 	if err != nil || cert == nil {
 		writeError(w, http.StatusNotFound, "certificate not found")
+		return
+	}
+	if !h.certTenantAllowed(w, r, cert) {
 		return
 	}
 	keyPEM, err := h.engine.RetrieveKey(r.Context(), id, r.URL.Query().Get("passcode"))
@@ -653,6 +716,9 @@ func (h *CertHandler) getBySerial(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "certificate not found")
 		return
 	}
+	if !h.certTenantAllowed(w, r, cert) {
+		return
+	}
 	writeJSON(w, http.StatusOK, cert)
 }
 
@@ -660,6 +726,9 @@ func (h *CertHandler) listByCA(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "caID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid CA ID")
+		return
+	}
+	if !h.caTenantAllowed(w, r, id) {
 		return
 	}
 	certs, err := h.store.ListCertificatesByCA(r.Context(), id)
@@ -683,6 +752,9 @@ func (h *CertHandler) revoke(w http.ResponseWriter, r *http.Request) {
 	var req revokeRequest
 	_ = decodeJSON(r, &req)
 	cert, _ := h.store.GetCertificate(r.Context(), id)
+	if !h.certTenantAllowed(w, r, cert) {
+		return
+	}
 	if err := h.store.RevokeCertificate(r.Context(), id, req.Reason); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

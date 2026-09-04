@@ -95,6 +95,10 @@ type CreateRootCARequest struct {
 	// TTLDays is how long the root CA certificate is valid.
 	// A root CA typically has a long lifetime: 10–20 years.
 	TTLDays int
+
+	// TenantID, when set (non-zero), is stamped onto the CA row so the CA is
+	// isolated to a tenant. Zero is used by legacy/bootstrap flows.
+	TenantID uuid.UUID
 }
 
 func (r *CreateRootCARequest) setDefaults() {
@@ -142,6 +146,10 @@ type CreateIntermediateCARequest struct {
 	MaxPathLen int
 
 	NameConstraints *NameConstraints
+
+	// TenantID stamps the new CA row so it is tenant-isolated. Zero for
+	// legacy/bootstrap flows.
+	TenantID uuid.UUID
 }
 
 func (r *CreateIntermediateCARequest) setDefaults() {
@@ -170,6 +178,9 @@ type RekeyCARequest struct {
 	// TTLDays for the new CA certificate. Defaults to the re-keyed CA's
 	// remaining lifetime if <= 0.
 	TTLDays int
+
+	// TenantID stamps the new (re-keyed) CA row with its owning tenant.
+	TenantID uuid.UUID
 }
 
 func (r *RekeyCARequest) validate() error {
@@ -685,6 +696,7 @@ func (e *Engine) CreateRootCA(ctx context.Context, req CreateRootCARequest) (*st
 		NotBefore:   now,
 		NotAfter:    notAfter,
 		CreatedAt:   now,
+		TenantID:    req.TenantID,
 	}
 	record.LogicalCAID = &record.ID
 
@@ -826,6 +838,7 @@ func (e *Engine) CreateIntermediateCA(ctx context.Context, req CreateIntermediat
 		NotBefore:       now,
 		NotAfter:        notAfter,
 		CreatedAt:       now,
+		TenantID:        req.TenantID,
 	}
 	record.LogicalCAID = &record.ID
 
@@ -985,6 +998,7 @@ func (e *Engine) RekeyCA(ctx context.Context, req RekeyCARequest) (*storage.Cert
 		NotBefore:       now,
 		NotAfter:        notAfter,
 		CreatedAt:       now,
+		TenantID:        old.TenantID,
 	}
 	if newRecord.LogicalCAID == nil {
 		newRecord.LogicalCAID = &old.ID

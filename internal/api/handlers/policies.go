@@ -29,6 +29,7 @@ func (h *PolicyHandler) RegisterRoutes(r chi.Router) {
 
 type policyRequest struct {
 	Name           string              `json:"name"`
+	TenantID       string              `json:"tenant_id"`
 	Scope          storage.PolicyScope `json:"scope"`
 	MaxTTLSeconds  int64               `json:"max_ttl_seconds"`
 	AllowedDomains []string            `json:"allowed_domains"`
@@ -48,9 +49,14 @@ func (h *PolicyHandler) create(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	tid, ok := createTenant(r, req.TenantID, w)
+	if !ok {
+		return
+	}
 	pol := &storage.Policy{
 		ID:             uuid.New(),
 		Name:           req.Name,
+		TenantID:       tid,
 		Scope:          req.Scope,
 		MaxTTL:         req.MaxTTLSeconds,
 		AllowedDomains: req.AllowedDomains,
@@ -79,6 +85,16 @@ func (h *PolicyHandler) list(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	caller, _ := tenantFromContext(r)
+	if caller != nil {
+		var out []*storage.Policy
+		for _, p := range ps {
+			if tenantOwns(p.TenantID, caller) {
+				out = append(out, p)
+			}
+		}
+		ps = out
+	}
 	writeJSON(w, http.StatusOK, ps)
 }
 
@@ -93,6 +109,11 @@ func (h *PolicyHandler) get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "policy not found")
 		return
 	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(pol.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "policy not found")
+		return
+	}
 	writeJSON(w, http.StatusOK, pol)
 }
 
@@ -102,6 +123,16 @@ func (h *PolicyHandler) update(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid policy ID")
 		return
 	}
+	existing, err := h.store.GetPolicy(r.Context(), id)
+	if err != nil || existing == nil {
+		writeError(w, http.StatusNotFound, "policy not found")
+		return
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(existing.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "policy not found")
+		return
+	}
 	var req policyRequest
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -109,6 +140,7 @@ func (h *PolicyHandler) update(w http.ResponseWriter, r *http.Request) {
 	}
 	pol := &storage.Policy{
 		ID:             id,
+		TenantID:       existing.TenantID,
 		Name:           req.Name,
 		Scope:          req.Scope,
 		MaxTTL:         req.MaxTTLSeconds,
@@ -135,6 +167,16 @@ func (h *PolicyHandler) delete(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "policyID"))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid policy ID")
+		return
+	}
+	pol, err := h.store.GetPolicy(r.Context(), id)
+	if err != nil || pol == nil {
+		writeError(w, http.StatusNotFound, "policy not found")
+		return
+	}
+	caller, _ := tenantFromContext(r)
+	if !tenantOwns(pol.TenantID, caller) {
+		writeError(w, http.StatusNotFound, "policy not found")
 		return
 	}
 	if err := h.store.DeletePolicy(r.Context(), id); err != nil {

@@ -28,6 +28,8 @@ type sqliteStore struct {
 	db *sql.DB
 }
 
+var _ TenantStore = (*sqliteStore)(nil)
+
 func newSQLiteStore(dsn string) (*sqliteStore, error) {
 	fullDSN := fmt.Sprintf(
 		"%s?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=5000&_synchronous=NORMAL",
@@ -131,6 +133,52 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 	}
 	if _, err := s.db.ExecContext(ctx, sqliteNonceSchema); err != nil {
 		return err
+	}
+	if err := addColumnIfAbsentSQLite(ctx, s.db, "api_keys", "tenant_id",
+		"ALTER TABLE api_keys ADD COLUMN tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL"); err != nil {
+		return err
+	}
+	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies", "ssh_certificate_authorities"} {
+		if err := addColumnIfAbsentSQLite(ctx, s.db, t, "tenant_id",
+			"ALTER TABLE "+t+" ADD COLUMN tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL"); err != nil {
+			return err
+		}
+	}
+	if err := seedDefaultTenantSQLite(ctx, s.db); err != nil {
+		return err
+	}
+	if err := backfillTenantSQLite(ctx, s.db); err != nil {
+		return err
+	}
+	return nil
+}
+
+// backfillTenantSQLite points pre-existing single-tenant rows at the default
+// tenant so isolation has a watermark to enforce against.
+func backfillTenantSQLite(ctx context.Context, db *sql.DB) error {
+	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies", "ssh_certificate_authorities"} {
+		if _, err := db.ExecContext(ctx, `UPDATE `+t+` SET tenant_id = ? WHERE tenant_id IS NULL`, DefaultTenantID.String()); err != nil {
+			return fmt.Errorf("sqlite: backfill %s tenant_id: %w", t, err)
+		}
+	}
+	return nil
+}
+
+// seedDefaultTenantSQLite inserts the fixed default tenant if no tenant
+// exists yet, so every deployment has a deterministic anchor row for its
+// pre-existing single-tenant data.
+func seedDefaultTenantSQLite(ctx context.Context, db *sql.DB) error {
+	var count int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tenants`).Scan(&count); err != nil {
+		return fmt.Errorf("sqlite: seed default tenant count: %w", err)
+	}
+	if count > 0 {
+		return nil
+	}
+	_, err := db.ExecContext(ctx, `INSERT INTO tenants (id, name, status, created_at) VALUES (?, 'default', 'active', ?)`,
+		DefaultTenantID.String(), time.Now().UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: seed default tenant: %w", err)
 	}
 	return nil
 }
@@ -247,6 +295,13 @@ CREATE TABLE IF NOT EXISTS ca_cross_certs (
 	not_after    DATETIME NOT NULL,
 	created_at   DATETIME NOT NULL,
 	UNIQUE(target_ca_id, signing_ca_id)
+);
+
+CREATE TABLE IF NOT EXISTS tenants (
+	id         TEXT    NOT NULL PRIMARY KEY,
+	name       TEXT    NOT NULL UNIQUE,
+	status     TEXT    NOT NULL DEFAULT 'active' CHECK(status IN ('active','suspended')),
+	created_at DATETIME NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS policies (
@@ -432,6 +487,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
 	key_hash   TEXT    NOT NULL UNIQUE,
 	scopes     TEXT    NOT NULL DEFAULT '[]',
 	ca_id      TEXT    REFERENCES certificate_authorities(id) ON DELETE CASCADE,
+	tenant_id  TEXT    REFERENCES tenants(id) ON DELETE SET NULL,
 	expires_at DATETIME,
 	last_used  DATETIME,
 	created_at DATETIME NOT NULL
@@ -613,8 +669,8 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 	_, err = s.db.ExecContext(ctx, `
 		INSERT INTO certificate_authorities
 			(id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-			 name_constraints, not_before, not_after, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 name_constraints, tenant_id, not_before, not_after, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ca.ID.String(),
 		uuidToSQL(ca.LogicalCAID),
 		uuidToSQL(ca.ParentID),
@@ -625,6 +681,7 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 		ca.KeyEnc,
 		ca.KeyAlgo,
 		ncStr,
+		uuidNullable(ca.TenantID),
 		ca.NotBefore.UTC(),
 		ca.NotAfter.UTC(),
 		ca.CreatedAt.UTC(),
@@ -638,7 +695,7 @@ func (s *sqliteStore) CreateCA(ctx context.Context, ca *CertificateAuthority) er
 func (s *sqliteStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuthority, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       name_constraints, not_before, not_after, created_at
+		       name_constraints, tenant_id, not_before, not_after, created_at
 		FROM certificate_authorities WHERE id = ?`, id.String())
 	ca, err := scanCA(row)
 	if err != nil {
@@ -650,7 +707,7 @@ func (s *sqliteStore) GetCA(ctx context.Context, id uuid.UUID) (*CertificateAuth
 func (s *sqliteStore) GetCAByName(ctx context.Context, name string) (*CertificateAuthority, error) {
 	row := s.db.QueryRowContext(ctx, `
 		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       name_constraints, not_before, not_after, created_at
+		       name_constraints, tenant_id, not_before, not_after, created_at
 		FROM certificate_authorities WHERE name = ?`, name)
 	ca, err := scanCA(row)
 	if err != nil {
@@ -662,7 +719,7 @@ func (s *sqliteStore) GetCAByName(ctx context.Context, name string) (*Certificat
 func (s *sqliteStore) ListCAs(ctx context.Context) ([]*CertificateAuthority, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       name_constraints, not_before, not_after, created_at
+		       name_constraints, tenant_id, not_before, not_after, created_at
 		FROM certificate_authorities ORDER BY created_at ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: ListCAs: %w", err)
@@ -674,7 +731,7 @@ func (s *sqliteStore) ListCAs(ctx context.Context) ([]*CertificateAuthority, err
 func (s *sqliteStore) ListChildCAs(ctx context.Context, parentID uuid.UUID) ([]*CertificateAuthority, error) {
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, logical_ca_id, parent_id, name, type, status, cert_pem, key_enc, key_algo,
-		       name_constraints, not_before, not_after, created_at
+		       name_constraints, tenant_id, not_before, not_after, created_at
 		FROM certificate_authorities WHERE parent_id = ? ORDER BY created_at ASC`,
 		parentID.String())
 	if err != nil {
@@ -768,12 +825,12 @@ func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 	var idStr string
 	var logicalCAIDStr *string
 	var parentIDStr *string
-	var ncStr *string
+	var ncStr, tenantIDStr *string
 	err := row.Scan(
 		&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 		&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 		&ncStr,
-		&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
+		&tenantIDStr, &ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -782,6 +839,7 @@ func scanCA(row *sql.Row) (*CertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.TenantID = sqlToUUIDValue(tenantIDStr)
 	ca.LogicalCAID = sqlToUUID(logicalCAIDStr)
 	ca.ParentID = sqlToUUID(parentIDStr)
 	ca.NameConstraints, err = unmarshalNameConstraints(ncStr)
@@ -798,16 +856,17 @@ func scanCAs(rows *sql.Rows) ([]*CertificateAuthority, error) {
 		var idStr string
 		var logicalCAIDStr *string
 		var parentIDStr *string
-		var ncStr *string
+		var ncStr, tenantIDStr *string
 		if err := rows.Scan(
 			&idStr, &logicalCAIDStr, &parentIDStr, &ca.Name, &ca.Type, &ca.Status,
 			&ca.CertPEM, &ca.KeyEnc, &ca.KeyAlgo,
 			&ncStr,
-			&ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
+			&tenantIDStr, &ca.NotBefore, &ca.NotAfter, &ca.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.TenantID = sqlToUUIDValue(tenantIDStr)
 		ca.LogicalCAID = sqlToUUID(logicalCAIDStr)
 		ca.ParentID = sqlToUUID(parentIDStr)
 		nc, err := unmarshalNameConstraints(ncStr)
@@ -1019,14 +1078,15 @@ func (s *sqliteStore) CreateProvisioner(ctx context.Context, p *Provisioner) err
 		return fmt.Errorf("sqlite: CreateProvisioner: marshal config: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-		INSERT INTO provisioners (id, ca_id, name, type, config, policy_id, status, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		INSERT INTO provisioners (id, ca_id, name, type, config, policy_id, tenant_id, status, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID.String(),
 		p.CAID.String(),
 		p.Name,
 		string(p.Type),
 		cfg,
 		uuidToSQL(p.PolicyID),
+		uuidNullable(p.TenantID),
 		string(p.Status),
 		p.CreatedAt.UTC(),
 	)
@@ -1078,14 +1138,14 @@ func (s *sqliteStore) UpdateProvisionerStatus(ctx context.Context, id uuid.UUID,
 }
 
 const provisionerSelectSQL = `
-	SELECT id, ca_id, name, type, config, policy_id, status, created_at
+	SELECT id, ca_id, name, type, config, policy_id, tenant_id, status, created_at
 	FROM provisioners`
 
 func scanProvisioner(row *sql.Row) (*Provisioner, error) {
 	var p Provisioner
 	var idStr, caIDStr, cfgStr string
-	var policyIDStr *string
-	err := row.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &p.Status, &p.CreatedAt)
+	var policyIDStr, tenantIDStr *string
+	err := row.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &tenantIDStr, &p.Status, &p.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1095,6 +1155,7 @@ func scanProvisioner(row *sql.Row) (*Provisioner, error) {
 	p.ID = uuid.MustParse(idStr)
 	p.CAID = uuid.MustParse(caIDStr)
 	p.PolicyID = sqlToUUID(policyIDStr)
+	p.TenantID = sqlToUUIDValue(tenantIDStr)
 	_ = unmarshalJSON(cfgStr, &p.Config)
 	return &p, nil
 }
@@ -1102,13 +1163,14 @@ func scanProvisioner(row *sql.Row) (*Provisioner, error) {
 func scanProvisionerRows(rows *sql.Rows) (*Provisioner, error) {
 	var p Provisioner
 	var idStr, caIDStr, cfgStr string
-	var policyIDStr *string
-	if err := rows.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &p.Status, &p.CreatedAt); err != nil {
+	var policyIDStr, tenantIDStr *string
+	if err := rows.Scan(&idStr, &caIDStr, &p.Name, &p.Type, &cfgStr, &policyIDStr, &tenantIDStr, &p.Status, &p.CreatedAt); err != nil {
 		return nil, err
 	}
 	p.ID = uuid.MustParse(idStr)
 	p.CAID = uuid.MustParse(caIDStr)
 	p.PolicyID = sqlToUUID(policyIDStr)
+	p.TenantID = sqlToUUIDValue(tenantIDStr)
 	_ = unmarshalJSON(cfgStr, &p.Config)
 	return &p, nil
 }
@@ -1127,10 +1189,10 @@ func (s *sqliteStore) CreatePolicy(ctx context.Context, p *Policy) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO policies
 			(id, name, scope, max_ttl_seconds, allowed_domains, denied_domains,
-			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 allowed_ips, allowed_sans, require_san, key_algos, policy_oids, cps_uri, ssh_policy, tenant_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		p.ID.String(), p.Name, string(p.Scope), p.MaxTTL,
-		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), p.CreatedAt.UTC(),
+		ad, dd, ai, as_, requireSAN, ka, po, p.CPSURI, string(p.SSHPolicy), uuidNullable(p.TenantID), p.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreatePolicy: %w", err)
@@ -1198,16 +1260,21 @@ func (s *sqliteStore) UpdatePolicy(ctx context.Context, p *Policy) error {
 const policySelectSQL = `
 	SELECT id, name, scope, max_ttl_seconds,
 	       allowed_domains, denied_domains, allowed_ips, allowed_sans,
-	       require_san, key_algos, policy_oids, cps_uri, ssh_policy, created_at
+	       require_san, key_algos, policy_oids, cps_uri, ssh_policy, tenant_id, created_at
 	FROM policies`
 
 func scanPolicy(row *sql.Row) (*Policy, error) {
+	return scanPolicyFields(func(dest ...interface{}) error { return row.Scan(dest...) })
+}
+
+func scanPolicyFields(scan func(...interface{}) error) (*Policy, error) {
 	var p Policy
 	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
+	var tenantIDStr *string
 	var requireSAN int
-	err := row.Scan(
+	err := scan(
 		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
+		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &tenantIDStr, &p.CreatedAt,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -1216,6 +1283,7 @@ func scanPolicy(row *sql.Row) (*Policy, error) {
 		return nil, err
 	}
 	p.ID = uuid.MustParse(idStr)
+	p.TenantID = sqlToUUIDValue(tenantIDStr)
 	p.RequireSAN = requireSAN == 1
 	p.AllowedDomains, _ = unmarshalStringSlice(adStr)
 	p.DeniedDomains, _ = unmarshalStringSlice(ddStr)
@@ -1230,27 +1298,7 @@ func scanPolicy(row *sql.Row) (*Policy, error) {
 }
 
 func scanPolicyRows(rows *sql.Rows) (*Policy, error) {
-	var p Policy
-	var idStr, adStr, ddStr, aiStr, asStr, kaStr, poStr, sshStr string
-	var requireSAN int
-	if err := rows.Scan(
-		&idStr, &p.Name, &p.Scope, &p.MaxTTL,
-		&adStr, &ddStr, &aiStr, &asStr, &requireSAN, &kaStr, &poStr, &p.CPSURI, &sshStr, &p.CreatedAt,
-	); err != nil {
-		return nil, err
-	}
-	p.ID = uuid.MustParse(idStr)
-	p.RequireSAN = requireSAN == 1
-	p.AllowedDomains, _ = unmarshalStringSlice(adStr)
-	p.DeniedDomains, _ = unmarshalStringSlice(ddStr)
-	p.AllowedIPs, _ = unmarshalStringSlice(aiStr)
-	p.AllowedSANs, _ = unmarshalStringSlice(asStr)
-	p.KeyAlgos, _ = unmarshalStringSlice(kaStr)
-	p.PolicyOIDs, _ = unmarshalStringSlice(poStr)
-	if sshStr != "" {
-		p.SSHPolicy = []byte(sshStr)
-	}
-	return &p, nil
+	return scanPolicyFields(rows.Scan)
 }
 
 func (s *sqliteStore) DeletePolicy(ctx context.Context, id uuid.UUID) error {
@@ -1280,11 +1328,12 @@ func writeProfileArgs(p *Profile) []interface{} {
 
 func (s *sqliteStore) CreateProfile(ctx context.Context, p *Profile) error {
 	args := writeProfileArgs(p)
+	args = append(args, uuidNullable(p.TenantID), p.CreatedAt.UTC())
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO profiles
 			(id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
-			 require_san, allow_wildcard, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+			 require_san, allow_wildcard, tenant_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateProfile: %w", err)
 	}
@@ -1422,7 +1471,7 @@ func (s *sqliteStore) sqliteScanCSRApproval(scan func(...interface{}) error) (*C
 
 const profileSelectSQL = `
 	SELECT id, name, allowed_key_algos, min_ttl_seconds, max_ttl_seconds,
-	       require_san, allow_wildcard, created_at
+	       require_san, allow_wildcard, tenant_id, created_at
 	FROM profiles`
 
 func scanProfileRow(row *sql.Row) (*Profile, error) {
@@ -1440,12 +1489,14 @@ func scanProfileRows(rows *sql.Rows) (*Profile, error) {
 func scanProfileFields(scan func(...interface{}) error) (*Profile, error) {
 	var p Profile
 	var idStr, akaStr string
+	var tenantIDStr *string
 	var rs, aw int
-	err := scan(&idStr, &p.Name, &akaStr, &p.MinTTLSeconds, &p.MaxTTLSeconds, &rs, &aw, &p.CreatedAt)
+	err := scan(&idStr, &p.Name, &akaStr, &p.MinTTLSeconds, &p.MaxTTLSeconds, &rs, &aw, &tenantIDStr, &p.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
 	p.ID = uuid.MustParse(idStr)
+	p.TenantID = sqlToUUIDValue(tenantIDStr)
 	p.AllowedKeyAlgos, _ = unmarshalStringSlice(akaStr)
 	p.RequireSAN = rs == 1
 	p.AllowWildcard = aw == 1
@@ -2137,10 +2188,10 @@ func (s *sqliteStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
 	scopes, _ := marshalStringSlice(k.Scopes)
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO api_keys
-			(id, name, key_hash, scopes, ca_id, expires_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, key_hash, scopes, ca_id, tenant_id, expires_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		k.ID.String(), k.Name, k.KeyHash, scopes,
-		uuidToSQL(k.CAID), k.ExpiresAt, k.CreatedAt.UTC(),
+		uuidToSQL(k.CAID), uuidToSQL(k.TenantID), k.ExpiresAt, k.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateAPIKey: %w", err)
@@ -2150,14 +2201,14 @@ func (s *sqliteStore) CreateAPIKey(ctx context.Context, k *APIKey) error {
 
 func (s *sqliteStore) GetAPIKeyByHash(ctx context.Context, hash string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys WHERE key_hash = ?`, hash)
 	return scanAPIKey(row)
 }
 
 func (s *sqliteStore) ListAPIKeys(ctx context.Context) ([]*APIKey, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys ORDER BY created_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: ListAPIKeys: %w", err)
@@ -2167,15 +2218,16 @@ func (s *sqliteStore) ListAPIKeys(ctx context.Context) ([]*APIKey, error) {
 	for rows.Next() {
 		var k APIKey
 		var idStr, scopesStr string
-		var caIDStr *string
+		var caIDStr, tenantIDStr *string
 		if err := rows.Scan(
 			&idStr, &k.Name, &k.KeyHash, &scopesStr,
-			&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
+			&caIDStr, &tenantIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
 		k.ID = uuid.MustParse(idStr)
 		k.CAID = sqlToUUID(caIDStr)
+		k.TenantID = sqlToUUID(tenantIDStr)
 		k.Scopes, _ = unmarshalStringSlice(scopesStr)
 		out = append(out, &k)
 	}
@@ -2214,10 +2266,10 @@ func (s *sqliteStore) TouchAPIKey(ctx context.Context, id uuid.UUID) error {
 func scanAPIKey(row *sql.Row) (*APIKey, error) {
 	var k APIKey
 	var idStr, scopesStr string
-	var caIDStr *string
+	var caIDStr, tenantIDStr *string
 	err := row.Scan(
 		&idStr, &k.Name, &k.KeyHash, &scopesStr,
-		&caIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
+		&caIDStr, &tenantIDStr, &k.ExpiresAt, &k.LastUsed, &k.CreatedAt,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -2227,6 +2279,7 @@ func scanAPIKey(row *sql.Row) (*APIKey, error) {
 	}
 	k.ID = uuid.MustParse(idStr)
 	k.CAID = sqlToUUID(caIDStr)
+	k.TenantID = sqlToUUID(tenantIDStr)
 	k.Scopes, _ = unmarshalStringSlice(scopesStr)
 	return &k, nil
 }
@@ -2260,17 +2313,97 @@ func (s *sqliteStore) SetSetupState(ctx context.Context, state SetupState) error
 
 func (s *sqliteStore) GetAPIKeyByName(ctx context.Context, name string) (*APIKey, error) {
 	row := s.db.QueryRowContext(ctx, `
-		SELECT id, name, key_hash, scopes, ca_id, expires_at, last_used, created_at
+		SELECT id, name, key_hash, scopes, ca_id, tenant_id, expires_at, last_used, created_at
 		FROM api_keys WHERE name = ?`, name)
 	return scanAPIKey(row)
 }
+
+// ---- tenants ----
+
+const tenantSelectSQL = `SELECT id, name, status, created_at FROM tenants`
+
+func (s *sqliteStore) CreateTenant(ctx context.Context, t *Tenant) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO tenants (id, name, status, created_at)
+		VALUES (?, ?, ?, ?)`, t.ID.String(), t.Name, string(t.Status), t.CreatedAt.UTC())
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateTenant: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetTenant(ctx context.Context, id uuid.UUID) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx, tenantSelectSQL+" WHERE id = ?", id.String())
+	return sqliteScanTenant(row)
+}
+
+func (s *sqliteStore) GetTenantByName(ctx context.Context, name string) (*Tenant, error) {
+	row := s.db.QueryRowContext(ctx, tenantSelectSQL+" WHERE name = ?", name)
+	return sqliteScanTenant(row)
+}
+
+func (s *sqliteStore) ListTenants(ctx context.Context) ([]*Tenant, error) {
+	rows, err := s.db.QueryContext(ctx, tenantSelectSQL+" ORDER BY created_at ASC")
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListTenants: %w", err)
+	}
+	defer rows.Close()
+	var out []*Tenant
+	for rows.Next() {
+		t, err := sqliteScanTenantRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpdateTenantStatus(ctx context.Context, id uuid.UUID, status TenantStatus) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE tenants SET status = ? WHERE id = ?`, string(status), id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateTenantStatus: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateTenantStatus: tenant %s not found", id)
+	}
+	return nil
+}
+
+func sqliteScanTenant(row *sql.Row) (*Tenant, error) {
+	t, err := scanTenantFields(func(dest ...interface{}) error { return row.Scan(dest...) })
+	if err != nil {
+		return nil, err
+	}
+	return t, nil
+}
+
+func sqliteScanTenantRows(rows *sql.Rows) (*Tenant, error) {
+	return scanTenantFields(rows.Scan)
+}
+
+func scanTenantFields(scan func(...interface{}) error) (*Tenant, error) {
+	var t Tenant
+	var idStr string
+	err := scan(&idStr, &t.Name, &t.Status, &t.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: scanTenantFields: %w", err)
+	}
+	t.ID = uuid.MustParse(idStr)
+	return &t, nil
+}
+
 func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities
-			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
-		ca.KeyEnc, string(ca.Status), uuidToSQL(ca.LogicalCAID), uuidToSQL(ca.ParentID), ca.CreatedAt.UTC(),
+		ca.KeyEnc, string(ca.Status), uuidToSQL(ca.LogicalCAID), uuidToSQL(ca.ParentID), uuidNullable(ca.TenantID),
+		ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateSSHCA: %w", err)
@@ -2279,14 +2412,14 @@ func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthori
 }
 
 const sqliteSSHCASelectSQL = `
-	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at
+	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at
 	FROM ssh_certificate_authorities`
 
 func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 	var ca SSHCertificateAuthority
 	var idStr string
-	var logicalID, parentID *string
-	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt)
+	var logicalID, parentID, tenantID *string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2294,6 +2427,7 @@ func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.TenantID = sqlToUUIDValue(tenantID)
 	ca.LogicalCAID = sqlToUUID(logicalID)
 	ca.ParentID = sqlToUUID(parentID)
 	return &ca, nil
@@ -2327,11 +2461,12 @@ func (s *sqliteStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthorit
 	for rows.Next() {
 		var ca SSHCertificateAuthority
 		var idStr string
-		var logicalID, parentID *string
-		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt); err != nil {
+		var logicalID, parentID, tenantID *string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.TenantID = sqlToUUIDValue(tenantID)
 		ca.LogicalCAID = sqlToUUID(logicalID)
 		ca.ParentID = sqlToUUID(parentID)
 		out = append(out, &ca)

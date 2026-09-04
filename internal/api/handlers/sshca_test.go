@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	apimiddleware "mint-ca/internal/api/middleware"
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/sshca"
 	"mint-ca/internal/sshca/krl"
@@ -502,6 +503,7 @@ func doRequest(t *testing.T, r chi.Router, method, path, body string) *httptest.
 	if body != "" {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req = req.WithContext(context.WithValue(req.Context(), apimiddleware.APIKeyKey, &storage.APIKey{Name: "ssh-test-caller"}))
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	return rec
