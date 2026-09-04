@@ -36,6 +36,7 @@ type CertHandler struct {
 // certAllStore is the minimal surface for listing certificates across all CAs.
 type certAllStore interface {
 	ListAllCertificates(ctx context.Context, limit, offset int) ([]*storage.Certificate, error)
+	ListCertificatesFiltered(ctx context.Context, caID *uuid.UUID, status storage.CertStatus, q string, limit, offset int) ([]*storage.Certificate, error)
 }
 
 func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store, emitter events.Emitter, attestationRegistry *attestation.Registry) *CertHandler {
@@ -723,27 +724,61 @@ func (h *CertHandler) listAllCerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	limit, offset := paginationParams(r)
-	certs, err := s.ListAllCertificates(r.Context(), limit, offset)
+
+	// Query filters: ca_id, status, and a subject search token q.
+	var caID *uuid.UUID
+	if v := r.URL.Query().Get("ca_id"); v != "" {
+		id, err := uuid.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid ca_id")
+			return
+		}
+		caID = &id
+	}
+	var status storage.CertStatus
+	if v := r.URL.Query().Get("status"); v != "" {
+		status = storage.CertStatus(v)
+	}
+	q := r.URL.Query().Get("q")
+
+	// Determine which CAs a tenant-scoped caller may see; validate any ca_id
+	// filter against it (404, existence-hiding), then filter results below.
+	caller, _ := tenantFromContext(r)
+	allowed := map[string]bool{}
+	if caller != nil {
+		cas, err := h.store.ListCAs(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		for _, c := range cas {
+			if tenantOwns(c.TenantID, caller) {
+				allowed[c.ID.String()] = true
+			}
+		}
+		if caID != nil && !allowed[caID.String()] {
+			writeError(w, http.StatusNotFound, "CA not found")
+			return
+		}
+	}
+
+	hasFilter := caID != nil || status != "" || strings.TrimSpace(q) != ""
+	var (
+		certs []*storage.Certificate
+		err   error
+	)
+	if hasFilter {
+		certs, err = s.ListCertificatesFiltered(r.Context(), caID, status, q, limit, offset)
+	} else {
+		certs, err = s.ListAllCertificates(r.Context(), limit, offset)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	caller, _ := tenantFromContext(r)
 	if caller == nil {
 		writeJSON(w, http.StatusOK, certs)
 		return
-	}
-	// Tenant-scoped callers may only see certs under CAs they own.
-	cas, err := h.store.ListCAs(r.Context())
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	allowed := map[string]bool{}
-	for _, c := range cas {
-		if tenantOwns(c.TenantID, caller) {
-			allowed[c.ID.String()] = true
-		}
 	}
 	out := []*storage.Certificate{}
 	for _, c := range certs {

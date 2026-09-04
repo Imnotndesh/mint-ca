@@ -205,6 +205,18 @@ Sign a CSR submitted by the client (the private key stays with the client).
 
 **Response (201 Created)** – same as issue, but without `key_pem`.
 
+### `GET /api/v1/certs`
+List certificates across **all CAs** (aggregate estate view), newest first.
+
+**Query parameters**
+- `ca_id` — restrict to a CA (any CA for platform-admin).
+- `status` — `active`, `revoked`, or `expired`.
+- `q` — case‑insensitive subject/common‑name substring search.
+- `limit` (default 500), `offset` (default 0).
+
+A tenant‑scoped key sees only certificates under CAs it owns, and a `ca_id` it
+does not own returns `404`.
+
 ### `GET /api/v1/certs/{certID}`
 Retrieve a certificate record by ID.
 
@@ -674,7 +686,14 @@ the database, bypassing the API):
 
 ---
 
-## 1.8 Metrics
+## 1.8 Metrics / System
+
+### `GET /api/v1/system/status`
+Operator-only runtime intel (**platform-admin required**; tenant keys get `403`):
+```json
+{ "state": "ready"|"setup"|"uninitialized", "db": "ok", "leader": bool }
+```
+Note: this only exists in the full/ready router (not during setup first boot). Use `GET /setup/state` or `/healthz` first to know which router is mounted.
 
 ### `GET /metrics`
 Prometheus metrics (text format).

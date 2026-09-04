@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -796,6 +797,41 @@ func (s *postgresStore) ListAllCertificates(ctx context.Context, limit, offset i
 		pgCertSelectSQL+" ORDER BY c.issued_at DESC LIMIT $1 OFFSET $2", limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: ListAllCertificates: %w", err)
+	}
+	defer rows.Close()
+	return pgScanCerts(rows)
+}
+
+// ListCertificatesFiltered returns certificates with optional ca_id / status /
+// subject-substring (LIKE) filters, newest first, paginated.
+func (s *postgresStore) ListCertificatesFiltered(ctx context.Context, caID *uuid.UUID, status CertStatus, q string, limit, offset int) ([]*Certificate, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	q = strings.TrimSpace(q)
+	var conds []string
+	var args []interface{}
+	if caID != nil {
+		conds = append(conds, "c.ca_id = $"+strconv.Itoa(len(args)+1))
+		args = append(args, caID.String())
+	}
+	if status != "" {
+		conds = append(conds, "c.status = $"+strconv.Itoa(len(args)+1))
+		args = append(args, string(status))
+	}
+	if q != "" {
+		conds = append(conds, "c.subject_cn ILIKE $"+strconv.Itoa(len(args)+1))
+		args = append(args, "%"+q+"%")
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+	args = append(args, limit, offset)
+	query := pgCertSelectSQL + where + " ORDER BY c.issued_at DESC LIMIT $" + strconv.Itoa(len(args)-1) + " OFFSET $" + strconv.Itoa(len(args))
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListCertificatesFiltered: %w", err)
 	}
 	defer rows.Close()
 	return pgScanCerts(rows)
