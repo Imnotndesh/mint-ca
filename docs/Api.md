@@ -912,6 +912,16 @@ The directory response also includes `"keyChange"` alongside `newNonce`, `newAcc
 ### `GET /healthz`
 Health check. In setup mode it returns a `status: "setup"` message.
 
+### `GET /setup/state`
+Machine-readable onboarding state, callable **without** a bootstrap key so
+`mca init` / `terraform` / the web UI wizard can detect where a server is:
+```json
+{ "state": "uninitialized" | "setup" | "ready", "configured": bool }
+```
+Only reachable while the server is not yet ready (the setup router is mounted
+only pre‑ready); a `404` means the server is already serving the full API (check
+`/healthz` for `ok`).
+
 ### `POST /setup/root-ca`
 Only available during initial setup (bootstrap key required). Create the first root CA.  
 Same body as `/api/v1/ca/root`. Response indicates success.

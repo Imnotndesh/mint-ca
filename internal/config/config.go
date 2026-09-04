@@ -58,6 +58,13 @@ type ServerConfig struct {
 	ReadTimeout  time.Duration
 	WriteTimeout time.Duration
 	IdleTimeout  time.Duration
+
+	// BootstrapKey, when set, is used as the bootstrap API key for first-boot
+	// setup instead of mint-ca generating (and only printing to console) a
+	// random one. This lets a CLI/CI init drive onboarding without a human on
+	// the server console. Empty by default (then a random one is printed).
+	// Env: MINT_BOOTSTRAP_KEY
+	BootstrapKey string
 }
 
 // StorageConfig controls which database backend is used and how to connect.
@@ -348,6 +355,7 @@ func Load() (*Config, error) {
 	c.Server.ReadTimeout = envDuration("MINT_READ_TIMEOUT_SECONDS", 30*time.Second)
 	c.Server.WriteTimeout = envDuration("MINT_WRITE_TIMEOUT_SECONDS", 60*time.Second)
 	c.Server.IdleTimeout = envDuration("MINT_IDLE_TIMEOUT_SECONDS", 120*time.Second)
+	c.Server.BootstrapKey = strings.TrimSpace(os.Getenv("MINT_BOOTSTRAP_KEY"))
 
 	if !c.Server.TLSDisabled {
 		if c.Server.TLSCertFile == "" {

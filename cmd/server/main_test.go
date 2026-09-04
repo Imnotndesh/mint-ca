@@ -200,7 +200,7 @@ func runLiveStack(m *testing.M) (int, error) {
 	setupSrv := httptest.NewServer(setupRouter)
 	defer setupSrv.Close()
 
-	bk, err := setup.GenerateBootstrapKey(context.Background(), store)
+	bk, err := setup.GenerateBootstrapKey(context.Background(), store, "")
 	if err != nil {
 		return 1, fmt.Errorf("bootstrap key: %w", err)
 	}
