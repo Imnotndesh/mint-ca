@@ -33,6 +33,11 @@ type CertHandler struct {
 	attestation *attestation.Registry
 }
 
+// certAllStore is the minimal surface for listing certificates across all CAs.
+type certAllStore interface {
+	ListAllCertificates(ctx context.Context, limit, offset int) ([]*storage.Certificate, error)
+}
+
 func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store, emitter events.Emitter, attestationRegistry *attestation.Registry) *CertHandler {
 	if emitter == nil {
 		emitter = events.NoopEmitter{}
@@ -210,6 +215,7 @@ func parseCSR(pemStr string) (*gox509.CertificateRequest, error) {
 
 func (h *CertHandler) RegisterRoutes(r chi.Router) {
 	r.Route("/api/v1/certs", func(r chi.Router) {
+		r.Get("/", h.listAllCerts)
 		r.Post("/issue", h.issue)
 		r.Post("/sign", h.signCSR)
 		r.Post("/batch/sign", h.batchSignCSR)
@@ -708,6 +714,44 @@ func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".tgz\"")
 	w.WriteHeader(http.StatusOK)
 	w.Write(data)
+}
+
+func (h *CertHandler) listAllCerts(w http.ResponseWriter, r *http.Request) {
+	s, ok := h.store.(certAllStore)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "store does not support cross-CA certificate listing")
+		return
+	}
+	limit, offset := paginationParams(r)
+	certs, err := s.ListAllCertificates(r.Context(), limit, offset)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	caller, _ := tenantFromContext(r)
+	if caller == nil {
+		writeJSON(w, http.StatusOK, certs)
+		return
+	}
+	// Tenant-scoped callers may only see certs under CAs they own.
+	cas, err := h.store.ListCAs(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	allowed := map[string]bool{}
+	for _, c := range cas {
+		if tenantOwns(c.TenantID, caller) {
+			allowed[c.ID.String()] = true
+		}
+	}
+	out := []*storage.Certificate{}
+	for _, c := range certs {
+		if allowed[c.CAID.String()] {
+			out = append(out, c)
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (h *CertHandler) getBySerial(w http.ResponseWriter, r *http.Request) {

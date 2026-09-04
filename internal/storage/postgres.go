@@ -787,6 +787,20 @@ func (s *postgresStore) ListCertificatesByCA(ctx context.Context, caID uuid.UUID
 	return pgScanCerts(rows)
 }
 
+// ListAllCertificates returns every certificate across all CAs, newest first.
+func (s *postgresStore) ListAllCertificates(ctx context.Context, limit, offset int) ([]*Certificate, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx,
+		pgCertSelectSQL+" ORDER BY c.issued_at DESC LIMIT $1 OFFSET $2", limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListAllCertificates: %w", err)
+	}
+	defer rows.Close()
+	return pgScanCerts(rows)
+}
+
 func (s *postgresStore) ListRevokedByCA(ctx context.Context, caID uuid.UUID) ([]*Certificate, error) {
 	rows, err := s.db.QueryContext(ctx,
 		pgCertSelectSQL+" WHERE c.ca_id = $1 AND c.status = 'revoked' ORDER BY c.revoked_at DESC",

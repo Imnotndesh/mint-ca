@@ -979,6 +979,20 @@ func (s *sqliteStore) ListCertificatesByCA(ctx context.Context, caID uuid.UUID) 
 	return scanCerts(rows)
 }
 
+// ListAllCertificates returns every certificate across all CAs, newest first.
+func (s *sqliteStore) ListAllCertificates(ctx context.Context, limit, offset int) ([]*Certificate, error) {
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.db.QueryContext(ctx,
+		certSelectSQL+" ORDER BY c.issued_at DESC LIMIT ? OFFSET ?", limit, offset)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListAllCertificates: %w", err)
+	}
+	defer rows.Close()
+	return scanCerts(rows)
+}
+
 func (s *sqliteStore) ListRevokedByCA(ctx context.Context, caID uuid.UUID) ([]*Certificate, error) {
 	rows, err := s.db.QueryContext(ctx,
 		certSelectSQL+" WHERE c.ca_id = ? AND c.status = 'revoked' ORDER BY c.revoked_at DESC",
