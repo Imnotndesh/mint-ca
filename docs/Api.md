@@ -6,14 +6,18 @@ ACME endpoints are under `/acme/{provisionerID}` and follow the ACME protocol (n
 
 ## 1.1 Certificate Authorities
 
-> **Tenant scoping (multi-tenancy):** every CA, provisioner, profile and
-> policy is owned by exactly one tenant. A tenant-scoped key only sees and can
-> operate on its own tenant's resources — reads/updates of another tenant's
-> resource return `404` (never `403`, to hide existence). A platform-admin key
-> sees everything. A tenant-scoped caller creates resources only within its own
+> **Tenant scoping (multi-tenancy):** every CA, SSH CA, provisioner, profile,
+> policy, CSR auto-approval rule, EAB key, and issued certificate (scoped
+> transitively via its CA) is owned by exactly one tenant. A tenant-scoped key
+> only sees and can operate on its own tenant's resources — cross-tenant
+> reads/updates return `404` (never `403`, to hide existence), except the
+> global audit/Merkle verification and unscoped audit endpoints, which are
+> **platform-admin only** (`403` for tenant keys). A platform-admin key sees
+> everything. A tenant-scoped caller creates resources only within its own
 > tenant; a platform admin may scope creation with an explicit `"tenant_id"`
-> field, defaulting to the default tenant when omitted (preserving single-tenant
-> operator flows). See §1.6.1.
+> field on CAs/SSH CAs, defaulting to the default tenant when omitted
+> (preserving single-tenant operator flows). The public SCEP endpoint refuses a
+> CA whose tenant differs from its configured provisioner. See §1.6.1.
 
 ### `POST /api/v1/ca/root`
 Create a new self‑signed root CA.
@@ -473,6 +477,9 @@ Revoke (mark as used) an EAB credential.
 
 ### `POST /api/v1/apikeys`
 Create a new management API key.
+> The legacy optional `ca_id` field (restrict a key to one CA) is retained
+> for backward compatibility; prefer tenant-based `tenant_id` scoping for
+> isolation. Removing `ca_id` entirely is tracked as a follow-up cleanup.
 
 **Request body**
 ```json
