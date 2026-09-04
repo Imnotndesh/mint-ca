@@ -47,6 +47,7 @@ func BuildRouter(
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(apimiddleware.Logger())
+	r.Use(apimiddleware.CORS)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -123,6 +124,7 @@ func BuildSetupRouter(
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
 	r.Use(apimiddleware.Logger())
+	r.Use(apimiddleware.CORS)
 
 	r.Get("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
