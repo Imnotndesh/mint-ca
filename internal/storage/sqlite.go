@@ -138,7 +138,7 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 		"ALTER TABLE api_keys ADD COLUMN tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL"); err != nil {
 		return err
 	}
-	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies"} {
+	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies", "ssh_certificate_authorities"} {
 		if err := addColumnIfAbsentSQLite(ctx, s.db, t, "tenant_id",
 			"ALTER TABLE "+t+" ADD COLUMN tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL"); err != nil {
 			return err
@@ -156,7 +156,7 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 // backfillTenantSQLite points pre-existing single-tenant rows at the default
 // tenant so isolation has a watermark to enforce against.
 func backfillTenantSQLite(ctx context.Context, db *sql.DB) error {
-	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies"} {
+	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies", "ssh_certificate_authorities"} {
 		if _, err := db.ExecContext(ctx, `UPDATE `+t+` SET tenant_id = ? WHERE tenant_id IS NULL`, DefaultTenantID.String()); err != nil {
 			return fmt.Errorf("sqlite: backfill %s tenant_id: %w", t, err)
 		}
@@ -2399,10 +2399,11 @@ func scanTenantFields(scan func(...interface{}) error) (*Tenant, error) {
 func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities
-			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
-		ca.KeyEnc, string(ca.Status), uuidToSQL(ca.LogicalCAID), uuidToSQL(ca.ParentID), ca.CreatedAt.UTC(),
+		ca.KeyEnc, string(ca.Status), uuidToSQL(ca.LogicalCAID), uuidToSQL(ca.ParentID), uuidNullable(ca.TenantID),
+		ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("sqlite: CreateSSHCA: %w", err)
@@ -2411,14 +2412,14 @@ func (s *sqliteStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthori
 }
 
 const sqliteSSHCASelectSQL = `
-	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at
+	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at
 	FROM ssh_certificate_authorities`
 
 func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 	var ca SSHCertificateAuthority
 	var idStr string
-	var logicalID, parentID *string
-	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt)
+	var logicalID, parentID, tenantID *string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2426,6 +2427,7 @@ func sqliteScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.TenantID = sqlToUUIDValue(tenantID)
 	ca.LogicalCAID = sqlToUUID(logicalID)
 	ca.ParentID = sqlToUUID(parentID)
 	return &ca, nil
@@ -2459,11 +2461,12 @@ func (s *sqliteStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthorit
 	for rows.Next() {
 		var ca SSHCertificateAuthority
 		var idStr string
-		var logicalID, parentID *string
-		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt); err != nil {
+		var logicalID, parentID, tenantID *string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.TenantID = sqlToUUIDValue(tenantID)
 		ca.LogicalCAID = sqlToUUID(logicalID)
 		ca.ParentID = sqlToUUID(parentID)
 		out = append(out, &ca)

@@ -166,8 +166,10 @@ type CertificateAuthority struct {
 // SSHCertificateAuthority is a signing key used to issue SSH user/host
 // certificates. Unlike X.509 CAs, SSH CAs are flat — no parent/child chain.
 type SSHCertificateAuthority struct {
-	ID        uuid.UUID  `json:"id"`
-	Name      string     `json:"name"`
+	ID   uuid.UUID `json:"id"`
+	Name string    `json:"name"`
+	// TenantID is the owning tenant (uuid.Nil means legacy/unset).
+	TenantID  uuid.UUID  `json:"tenant_id,omitempty"`
 	KeyAlgo   SSHKeyAlgo `json:"key_algo"`
 	PublicKey string     `json:"public_key"` // OpenSSH authorized_keys format
 	KeyEnc    []byte     `json:"-"`
