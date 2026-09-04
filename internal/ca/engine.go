@@ -42,6 +42,31 @@ const (
 // DefaultKeyAlgo is what the engine uses when no algorithm is specified.
 const DefaultKeyAlgo = KeyAlgoECDSAP256
 
+// KeyAlgoFromPublicKey identifies the KeyAlgo of a public key, e.g. one
+// extracted from an incoming CSR, so it can be checked against a profile's
+// AllowedKeyAlgos.
+func KeyAlgoFromPublicKey(pub crypto.PublicKey) (KeyAlgo, error) {
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		switch k.Curve {
+		case elliptic.P256():
+			return KeyAlgoECDSAP256, nil
+		case elliptic.P384():
+			return KeyAlgoECDSAP384, nil
+		}
+		return "", fmt.Errorf("unsupported ECDSA curve")
+	case *rsa.PublicKey:
+		if k.N.BitLen() <= 2048 {
+			return KeyAlgoRSA2048, nil
+		}
+		return KeyAlgoRSA4096, nil
+	case ed25519.PublicKey:
+		return KeyAlgoEd25519, nil
+	default:
+		return "", fmt.Errorf("unsupported public key type %T", pub)
+	}
+}
+
 // Valid returns true if the algorithm string is one we support.
 func (a KeyAlgo) Valid() bool {
 	switch a {

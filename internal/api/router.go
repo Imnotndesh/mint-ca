@@ -51,6 +51,7 @@ func BuildRouter(
 
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
+		handlers.NewSCEPHandler(caEngine, store, cfg.SCEP).RegisterRoutes(r)
 		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterPublicRoutes(r)
 		r.Get(setup.TermsPath, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -70,6 +71,7 @@ func BuildRouter(
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
 		handlers.NewProfileHandler(store).RegisterRoutes(r)
 		handlers.NewApprovalHandler(store).RegisterRoutes(r)
+		handlers.NewRenewalHandler(store, cfg.Renewal).RegisterRoutes(r)
 		handlers.NewEABHandler(store).RegisterRoutes(r)
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)

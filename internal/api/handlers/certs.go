@@ -43,7 +43,14 @@ func (h *CertHandler) loadProfileByName(ctx context.Context, name string) (*stor
 // it is refused. When no rule applies to the provisioner, behavior is unchanged
 // (no auto-approval policy governs this CSR).
 func (h *CertHandler) enforceCSRAutoApproval(ctx context.Context, provisionerID uuid.UUID, csrPEM string, ttlSeconds int64) error {
-	s, ok := h.store.(csrApprovalStore)
+	return enforceCSRAutoApproval(ctx, h.store, provisionerID, csrPEM, ttlSeconds)
+}
+
+// enforceCSRAutoApproval is the store-agnostic form shared by any handler
+// that signs a CSR directly (REST cert signing, SCEP), so the same
+// auto-approval gate applies consistently.
+func enforceCSRAutoApproval(ctx context.Context, store storage.Store, provisionerID uuid.UUID, csrPEM string, ttlSeconds int64) error {
+	s, ok := store.(csrApprovalStore)
 	if !ok {
 		return nil
 	}

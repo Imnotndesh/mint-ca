@@ -127,7 +127,7 @@ func TestNewOrder_ReusesValidStandaloneAuthz_NoDuplicatePending(t *testing.T) {
 		t.Fatalf("failed to mark pre-auth valid: %v", err)
 	}
 
-	order, _, prob := svc.NewOrder(ctx, account, prov, []Identifier{{Type: "dns", Value: "order-reuse.example.com"}})
+	order, _, prob := svc.NewOrder(ctx, account, prov, []Identifier{{Type: "dns", Value: "order-reuse.example.com"}}, "")
 	if prob != nil {
 		t.Fatalf("NewOrder failed: %v", prob)
 	}

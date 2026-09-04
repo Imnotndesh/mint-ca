@@ -15,6 +15,7 @@ import (
 	"mint-ca/internal/acme/challenge"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/ca/revocation"
+	"mint-ca/internal/policy"
 	"mint-ca/internal/storage"
 	"net/url"
 	"strings"
@@ -22,6 +23,14 @@ import (
 
 	"github.com/google/uuid"
 )
+
+// profileLookup is the minimal profile-resolution surface the ACME service
+// needs. Kept local (like csrApprovalStore/profileStore in the handlers
+// package) so fake stores elsewhere don't need to implement profiles.
+type profileLookup interface {
+	GetProfile(ctx context.Context, id uuid.UUID) (*storage.Profile, error)
+	GetProfileByName(ctx context.Context, name string) (*storage.Profile, error)
+}
 
 // ProvisionerConfig is the JSON stored in provisioners.config for ACME
 // provisioners. It controls per-provisioner ACME behaviour.
@@ -658,12 +667,51 @@ func (s *Service) validateEAB(
 	return &cred.ID, nil
 }
 
+// resolveProfile resolves the certificate profile that applies to an ACME
+// order: a provisioner-pinned profile (Provisioner.ProfileID) takes priority
+// over a client-requested one (from the new-order payload). Returns
+// (nil, nil) when neither applies, or the store does not support profiles.
+func (s *Service) resolveProfile(
+	ctx context.Context,
+	provisioner *storage.Provisioner,
+	requestedName string,
+) (*storage.Profile, *Problem) {
+	if provisioner.ProfileID == nil && requestedName == "" {
+		return nil, nil
+	}
+	pl, ok := s.store.(profileLookup)
+	if !ok {
+		return nil, ErrServerInternalProblem("store does not support profiles")
+	}
+	if provisioner.ProfileID != nil {
+		prof, err := pl.GetProfile(ctx, *provisioner.ProfileID)
+		if err != nil {
+			return nil, ErrServerInternalProblem("load pinned profile: " + err.Error())
+		}
+		if prof == nil {
+			return nil, ErrServerInternalProblem("pinned profile no longer exists")
+		}
+		return prof, nil
+	}
+	prof, err := pl.GetProfileByName(ctx, requestedName)
+	if err != nil {
+		return nil, ErrServerInternalProblem("load requested profile: " + err.Error())
+	}
+	if prof == nil {
+		return nil, NewProblem(ErrMalformed, 400, "unknown profile \""+requestedName+"\"")
+	}
+	return prof, nil
+}
+
 // NewOrder creates a new ACME order and its associated challenges.
+// profileName optionally names a certificate profile requested by the
+// client; it is ignored if the provisioner pins its own profile.
 func (s *Service) NewOrder(
 	ctx context.Context,
 	account *storage.ACMEAccount,
 	provisioner *storage.Provisioner,
 	identifiers []Identifier,
+	profileName string,
 ) (*storage.ACMEOrder, []*storage.ACMEChallenge, *Problem) {
 
 	var cfg ProvisionerConfig
@@ -677,8 +725,31 @@ func (s *Service) NewOrder(
 		}
 	}
 
-	// Build the identifier JSON for storage (order level).
+	prof, prob := s.resolveProfile(ctx, provisioner, profileName)
+	if prob != nil {
+		return nil, nil, prob
+	}
+	if prof != nil {
+		var sans []string
+		for _, id := range identifiers {
+			sans = append(sans, id.Value)
+		}
+		if err := policy.EvaluateProfile(prof, policy.CertRequest{
+			SANsDNS:    sans,
+			TTLSeconds: cfg.DefaultTTLSeconds,
+		}); err != nil {
+			return nil, nil, NewProblem(ErrRejectedIdentifier, 403, err.Error())
+		}
+	}
+
+	// Build the identifier JSON for storage (order level). The resolved
+	// profile (if any) rides along in the same JSON blob so FinalizeOrder can
+	// re-enforce it against the actual CSR without a schema change.
 	idObj := map[string]interface{}{"identifiers": identifiers}
+	if prof != nil {
+		idObj["profile_id"] = prof.ID.String()
+		idObj["profile_name"] = prof.Name
+	}
 	idJSON, err := json.Marshal(idObj)
 	if err != nil {
 		return nil, nil, ErrServerInternalProblem("marshal identifiers: " + err.Error())
@@ -1100,6 +1171,31 @@ func (s *Service) FinalizeOrder(
 			fmt.Sprintf("order status is %q; must be \"ready\" before finalizing", order.Status))
 	}
 
+	// Re-enforce the order's resolved profile (if any) against the actual
+	// CSR: identifiers/SANs may not perfectly mirror the order's, and the
+	// key algorithm is only known now.
+	if prof, prob := s.parseOrderProfile(ctx, order); prob != nil {
+		return nil, nil, prob
+	} else if prof != nil {
+		csr, err := x509.ParseCertificateRequest(csrDER)
+		if err != nil {
+			return nil, nil, ErrBadCSRProblem("parse CSR: " + err.Error())
+		}
+		keyAlgo, err := ca.KeyAlgoFromPublicKey(csr.PublicKey)
+		if err != nil {
+			return nil, nil, ErrBadCSRProblem("determine CSR key algorithm: " + err.Error())
+		}
+		if err := policy.EvaluateProfile(prof, policy.CertRequest{
+			KeyAlgo:    string(keyAlgo),
+			TTLSeconds: ttlSeconds,
+			SANsDNS:    csr.DNSNames,
+			SANsIP:     csr.IPAddresses,
+			SANsEmail:  csr.EmailAddresses,
+		}); err != nil {
+			return nil, nil, ErrBadCSRProblem(err.Error())
+		}
+	}
+
 	// Encode CSR as PEM so we can pass it to the engine.
 	csrPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE REQUEST", Bytes: csrDER})
 
@@ -1274,6 +1370,33 @@ func validateIdentifier(id Identifier) error {
 		return fmt.Errorf("malformed identifier %q: bare wildcards not permitted", v)
 	}
 	return nil
+}
+
+// parseOrderProfile extracts the profile resolved at NewOrder time (if any)
+// from the order's identifiers JSON blob. Returns (nil, nil) when the order
+// carries no profile.
+func (s *Service) parseOrderProfile(ctx context.Context, order *storage.ACMEOrder) (*storage.Profile, *Problem) {
+	raw, ok := order.Identifiers["profile_id"]
+	if !ok {
+		return nil, nil
+	}
+	idStr, _ := raw.(string)
+	profID, err := uuid.Parse(idStr)
+	if err != nil {
+		return nil, ErrServerInternalProblem("order carries an invalid profile_id: " + err.Error())
+	}
+	pl, ok := s.store.(profileLookup)
+	if !ok {
+		return nil, ErrServerInternalProblem("store does not support profiles")
+	}
+	prof, err := pl.GetProfile(ctx, profID)
+	if err != nil {
+		return nil, ErrServerInternalProblem("load order profile: " + err.Error())
+	}
+	if prof == nil {
+		return nil, ErrServerInternalProblem("order's profile no longer exists")
+	}
+	return prof, nil
 }
 
 // parseOrderIdentifiers extracts the []Identifier slice from an order's JSON.
