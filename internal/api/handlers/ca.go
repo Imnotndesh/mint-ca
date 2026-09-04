@@ -18,7 +18,6 @@ type CAHandler struct {
 func NewCAHandler(engine *ca.Engine, store storage.Store) *CAHandler {
 	return &CAHandler{engine: engine, store: store}
 }
-
 // getPermittedCA loads the CA by id and ensures the caller may see it. Returns
 // nil after writing a 404/error response when it is missing or owned by
 // another tenant. callers use the non-nil result.
