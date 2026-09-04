@@ -21,6 +21,7 @@ type scopeFakeStore struct {
 	storage.Store
 	mu       sync.Mutex
 	cas      map[uuid.UUID]*storage.CertificateAuthority
+	certs    map[uuid.UUID]*storage.Certificate
 	provs    map[uuid.UUID]*storage.Provisioner
 	policies map[uuid.UUID]*storage.Policy
 	profiles map[uuid.UUID]*storage.Profile
@@ -29,6 +30,7 @@ type scopeFakeStore struct {
 func newScopeFakeStore() *scopeFakeStore {
 	return &scopeFakeStore{
 		cas:      map[uuid.UUID]*storage.CertificateAuthority{},
+		certs:    map[uuid.UUID]*storage.Certificate{},
 		provs:    map[uuid.UUID]*storage.Provisioner{},
 		policies: map[uuid.UUID]*storage.Policy{},
 		profiles: map[uuid.UUID]*storage.Profile{},
@@ -62,6 +64,11 @@ func (f *scopeFakeStore) UpdateCAStatus(ctx context.Context, id uuid.UUID, s sto
 		f.cas[id].Status = s
 	}
 	return nil
+}
+func (f *scopeFakeStore) GetCertificate(ctx context.Context, id uuid.UUID) (*storage.Certificate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.certs[id], nil
 }
 
 // ---- Provisioner ----
@@ -192,5 +199,30 @@ func TestPhase2_Policy_CrossTenantDenied(t *testing.T) {
 	}
 	if rec := doScopeRequest(r, http.MethodDelete, "/api/v1/policies/"+polB.ID.String(), "", &tenantA); rec.Code != http.StatusNotFound {
 		t.Fatalf("cross policy delete = %d, want 404", rec.Code)
+	}
+}
+
+// TestPhase3_Cert_TransitiveTenantScope ensures a certificate is scoped through
+// its CA: tenant A cannot read tenant B's CA's certificate (404 exists-hiding).
+func TestPhase3_Cert_TransitiveTenantScope(t *testing.T) {
+	store := newScopeFakeStore()
+	tenantB := uuid.New()
+	caB := &storage.CertificateAuthority{ID: uuid.New(), Name: "caB", TenantID: tenantB}
+	cert := &storage.Certificate{ID: uuid.New(), CAID: caB.ID, Serial: "111"}
+	store.cas[caB.ID] = caB
+	store.certs[cert.ID] = cert
+
+	tenantA := uuid.New()
+	ch := NewCertHandler(nil, nil, store, nil, nil)
+	r := chi.NewRouter()
+	ch.RegisterRoutes(r)
+
+	// Platform admin can get it.
+	if rec := doScopeRequest(r, http.MethodGet, "/api/v1/certs/"+cert.ID.String(), "", nil); rec.Code != http.StatusOK {
+		t.Fatalf("platform cert get = %d: %s", rec.Code, rec.Body.String())
+	}
+	// Tenant A (foreign) gets 404.
+	if rec := doScopeRequest(r, http.MethodGet, "/api/v1/certs/"+cert.ID.String(), "", &tenantA); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross cert get = %d, want 404", rec.Code)
 	}
 }
