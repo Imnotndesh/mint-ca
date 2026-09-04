@@ -79,7 +79,7 @@ func setupBatchHandler(t *testing.T) (*batchFakeStore, chi.Router, uuid.UUID) {
 	if err != nil {
 		t.Fatalf("create root: %v", err)
 	}
-	h := NewCertHandler(engine, policy.NewEngine(store), store, nil)
+	h := NewCertHandler(engine, policy.NewEngine(store), store, nil, nil)
 	r := chi.NewRouter()
 	h.RegisterRoutes(r)
 	return store, r, root.ID

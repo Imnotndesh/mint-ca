@@ -180,7 +180,11 @@ Sign a CSR submitted by the client (the private key stays with the client).
   "provisioner_id": "provisioner-uuid",
   "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...",
   "ttl_seconds": 86400,
-  "metadata": { "env": "prod" }
+  "metadata": { "env": "prod" },
+  "attestation": {                  // optional: gate signing on hardware attestation, see 1.20
+    "format": "tpm2",
+    "data_b64": "<base64 of the format-specific evidence>"
+  }
 }
 ```
 
@@ -225,7 +229,9 @@ abort the rest.
   ]
 }
 ```
-Max 1000 items. Per‑item `metadata` overrides the shared metadata.
+Max 1000 items. Per‑item `metadata` overrides the shared metadata. Each item
+may also carry its own `"attestation"` (same shape as in `POST
+/api/v1/certs/sign`, see 1.20); a failed attestation fails only that item.
 
 **Response (200 OK)**
 ```json
@@ -1032,3 +1038,54 @@ affects the API response that triggered the event.
   }
 }
 ```
+
+## 1.20 Hardware-Attestation-Gated Issuance
+
+`POST /api/v1/certs/sign` and each item of `POST /api/v1/certs/batch/sign` can
+carry an optional `"attestation"` field, proving the CSR's key is bound to a
+hardware root of trust before mint-ca signs it. Attestation is **opt-in**:
+omit the field to sign as before. When present, mint-ca dispatches it to the
+verifier registered for `format`; if none is registered for that format, or
+verification fails, the request is refused with `403`.
+
+```json
+{
+  "format": "tpm2",
+  "data_b64": "<base64 of the format-specific evidence>"
+}
+```
+
+Two verifiers are registered by default:
+
+**`tpm2`** — proves possession of a TPM Endorsement Key (EK). `data_b64`
+decodes to:
+```json
+{
+  "ek_cert_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "signature_b64": "<base64 signature, made with the EK private key, over sha256(csrDER)>"
+}
+```
+This is a simplified binding compared to full TPM 2.0 remote attestation
+(a `TPM2B_ATTEST` quote over PCRs, signed by an AK certified by the EK) —
+implementing the TPM2 wire protocol needs a dependency this repo doesn't
+carry yet. What's checked: the EK certificate parses, optionally chains to a
+trusted root (`MINT_ATTESTATION_TPM_ROOTS_FILE`, see Setup.md — when unset,
+any well-formed EK certificate is accepted, which only proves possession of
+its key, not genuine TPM hardware), and the signature verifies over this
+specific CSR.
+
+**`webauthn`** — proves the CSR is backed by a WebAuthn/FIDO2 authenticator
+credential (as from `navigator.credentials.create()`). `data_b64` decodes to:
+```json
+{
+  "client_data_json_b64": "<base64 clientDataJSON>",
+  "attestation_object_b64": "<base64 CBOR attestationObject>"
+}
+```
+The `clientDataJSON.challenge` must equal `sha256(csrDER)` — set this as the
+challenge when calling `navigator.credentials.create()`, binding the
+attestation to this specific CSR. Supported `attStmt` formats: `packed` (with
+an `x5c` attestation certificate, or self-attestation using the credential's
+own key) and `none` (binding check only, no attestation signature — lower
+assurance). Other formats (`android-key`, `android-safetynet`, `fido-u2f`,
+`tpm`) return an explicit "unsupported" error rather than a false pass.

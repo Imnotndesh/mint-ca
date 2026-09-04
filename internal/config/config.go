@@ -17,17 +17,18 @@ import (
 // No package other than this one calls os.Getenv. If you need a value from the
 // environment, add it here.
 type Config struct {
-	Server    ServerConfig
-	Storage   StorageConfig
-	Crypto    CryptoConfig
-	ACME      ACMEConfig
-	CRL       CRLConfig
-	Log       LogConfig
-	RateLimit RateLimitConfig
-	MTLS      MTLSConfig
-	Renewal   RenewalConfig
-	SCEP      SCEPConfig
-	Events    EventsConfig
+	Server      ServerConfig
+	Storage     StorageConfig
+	Crypto      CryptoConfig
+	ACME        ACMEConfig
+	CRL         CRLConfig
+	Log         LogConfig
+	RateLimit   RateLimitConfig
+	MTLS        MTLSConfig
+	Renewal     RenewalConfig
+	SCEP        SCEPConfig
+	Events      EventsConfig
+	Attestation AttestationConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -288,6 +289,20 @@ type EventsConfig struct {
 	WebhookURL string
 }
 
+// AttestationConfig controls hardware-attestation-gated issuance (see
+// internal/attestation). Attestation is always opt-in per request (a
+// "attestation" field on POST /api/v1/certs/sign); this config only narrows
+// what the built-in TPM2 verifier accepts.
+type AttestationConfig struct {
+	// TPMRootsFile, when set, is a PEM bundle of trusted TPM manufacturer
+	// root certificates. The tpm2 verifier only accepts EK certificates
+	// chaining to one of these. When empty, any well-formed EK certificate
+	// is accepted (proves possession of its key, not genuine TPM hardware —
+	// fine for development, not recommended for production).
+	// Env: MINT_ATTESTATION_TPM_ROOTS_FILE
+	TPMRootsFile string
+}
+
 // Load reads all configuration from environment variables, applies defaults,
 // validates every field, and returns a fully populated Config.
 //
@@ -478,6 +493,7 @@ func Load() (*Config, error) {
 	}
 
 	c.Events.WebhookURL = strings.TrimSpace(os.Getenv("MINT_EVENTS_WEBHOOK_URL"))
+	c.Attestation.TPMRootsFile = strings.TrimSpace(os.Getenv("MINT_ATTESTATION_TPM_ROOTS_FILE"))
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)
