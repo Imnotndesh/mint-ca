@@ -122,6 +122,10 @@ Default values are shown; variables marked **Required** must be set.
 | `MINT_SCEP_DEFAULT_TTL_SECONDS` | Leaf certificate lifetime granted to SCEP enrollments. | `7776000` (90 days) | No |
 | `MINT_EVENTS_WEBHOOK_URL` | When set, mint-ca POSTs a JSON event (`cert.issued`, `cert.revoked`) for each certificate issuance/revocation, asynchronously and best-effort. | – | No |
 | `MINT_ATTESTATION_TPM_ROOTS_FILE` | Path to a PEM bundle of trusted TPM manufacturer root certificates. Narrows the built-in `tpm2` attestation verifier to only accept EK certificates chaining to one of these. When unset, any well-formed EK certificate is accepted (see Api.md 1.20). | – | No |
+| `MINT_HA_ENABLED` | Run multiple mint-ca processes against one shared Postgres database in active-passive HA: only the current leader serves API traffic. Requires `MINT_DB_DRIVER=postgres`. | `false` | No |
+| `MINT_HA_NODE_ID` | This process's identity in the leader-election lock. | OS hostname | If hostname unavailable |
+| `MINT_HA_LEASE_SECONDS` | How long a won leadership lease lasts before another node can take over, if not renewed. | `15` | No |
+| `MINT_HA_RENEW_SECONDS` | How often every node attempts to acquire/renew the lease. Must be less than `MINT_HA_LEASE_SECONDS`. | `5` | No |
 | **Logging** | | | |
 | `MINT_LOG_LEVEL` | Log level: `debug`, `info`, `warn`, `error`. | `info` | No |
 | `MINT_LOG_JSON` | Output logs as JSON (structured) instead of human‑readable. | `false` | No |
@@ -248,6 +252,18 @@ Changes take effect on the next process restart (configs are loaded into memory 
 - **Backups**: Back up the database file (SQLite) or use PostgreSQL native backups. Also back up the master key – without it, encrypted CA keys cannot be recovered.
 - **Monitoring**: The `/metrics` endpoint provides Prometheus metrics. Scrape it from your monitoring system.
 - **Logging**: Use `MINT_LOG_JSON=true` and forward logs to a central system.
+- **High availability**: Run several mint-ca processes pointed at the same
+  Postgres database with `MINT_HA_ENABLED=true`. They elect a single leader
+  via a lease row in that database (see Api.md's HA section, if present, or
+  `internal/ha`); the leader serves all authenticated API and ACME traffic
+  and runs the write-side background workers (CRL refresh, renewal notices),
+  while standbys return `503 Service Unavailable` with `Retry-After: 5` on
+  every such request. Point a load balancer's health check at a
+  leader-only endpoint, or simply retry across nodes — a standby that
+  becomes leader starts accepting traffic within one `MINT_HA_RENEW_SECONDS`
+  cycle. `/healthz` and public PKI/OCSP/CRL endpoints are unaffected and stay
+  up on every node regardless of leadership. This mode is not supported on
+  the sqlite backend, which is single-process by design.
 
 ## 2.9 Troubleshooting
 

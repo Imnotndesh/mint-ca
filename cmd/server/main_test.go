@@ -28,6 +28,7 @@ import (
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
 	mintcrypto "mint-ca/internal/crypto"
+	"mint-ca/internal/ha"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
@@ -223,7 +224,7 @@ func runLiveStack(m *testing.M) (int, error) {
 	}
 
 	// ---- full API, bound to the SAME address baked into cfg.ACME.BaseURL ----
-	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager)
+	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, ha.NewElector(nil, "test-node", 0, 0))
 	fullSrv := httptest.NewUnstartedServer(fullRouter)
 	_ = fullSrv.Listener.Close()
 	fullSrv.Listener = listener
