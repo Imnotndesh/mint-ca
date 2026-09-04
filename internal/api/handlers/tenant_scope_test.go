@@ -272,3 +272,16 @@ func TestPhase4_SSHCA_ListIsTenantScoped(t *testing.T) {
 		t.Fatalf("platform sshca list missing CAs: %s", rec.Body.String())
 	}
 }
+
+// TestPhase_SystemStatusIsOperatorOnly ensures a tenant-scoped key cannot read
+// node-level /system/status intel.
+func TestSystemStatusIsOperatorOnly(t *testing.T) {
+	store := newScopeFakeStore()
+	h := NewSystemHandler(store, nil)
+	r := chi.NewRouter()
+	h.RegisterRoutes(r)
+	tenant := uuid.New()
+	if rec := doScopeRequest(r, http.MethodGet, "/api/v1/system/status", "", &tenant); rec.Code != http.StatusForbidden {
+		t.Fatalf("tenant system status = %d, want 403", rec.Code)
+	}
+}
