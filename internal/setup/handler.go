@@ -47,11 +47,28 @@ func NewHandler(
 }
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
+	// /setup/state is public (no bootstrap key) so onboarding tooling can
+	// detect where the server is in the setup state machine before it has a key.
+	r.Get("/setup/state", h.getState)
 	r.Route("/setup", func(r chi.Router) {
 		r.Use(h.requireBootstrapKey)
 		r.Get("/terms", h.getTerms)
 		r.Post("/root-ca", h.createRootCA)
 		r.Post("/api-key", h.createAPIKey)
+	})
+}
+
+// getState returns the machine-readable setup state so a CLI/web wizard can
+// tell whether a fresh server needs onboarding (setup) or is already configured.
+func (h *Handler) getState(w http.ResponseWriter, r *http.Request) {
+	st, err := h.store.GetSetupState(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read setup state")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"state":      string(st),
+		"configured": st == storage.StateReady,
 	})
 }
 
