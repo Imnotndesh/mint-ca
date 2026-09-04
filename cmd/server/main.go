@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"mint-ca/internal/logger"
 	"mint-ca/internal/ratelimit"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -166,50 +164,21 @@ func main() {
 	// reports bind/serve errors back through errCh. The returned stop func
 	// gracefully shuts the server down (closing the listener).
 	startServer := func(addr string, handler http.Handler, useTLS bool) (func(), error) {
-		ln, lerr := net.Listen("tcp", addr)
-		if lerr != nil {
-			return nil, lerr
+		certFile, keyFile := tlsFilePaths(cfg)
+		stop2, srvErr, err := serveListener(addr, handler, useTLS, certFile, keyFile,
+			cfg.Server.ReadTimeout, cfg.Server.WriteTimeout, cfg.Server.IdleTimeout)
+		if err != nil {
+			return nil, err
 		}
-		srv := &http.Server{
-			Handler:      handler,
-			ReadTimeout:  cfg.Server.ReadTimeout,
-			WriteTimeout: cfg.Server.WriteTimeout,
-			IdleTimeout:  cfg.Server.IdleTimeout,
-		}
-		var tlsLn net.Listener
-		if useTLS {
-			tlsConf := &tls.Config{
-				MinVersion:               tls.VersionTLS12,
-				CurvePreferences:         []tls.CurveID{tls.X25519, tls.CurveP256},
-				PreferServerCipherSuites: true,
+		go func() {
+			for e := range srvErr {
+				if e != nil && !errors.Is(e, http.ErrServerClosed) {
+					errCh <- e
+					return
+				}
 			}
-			certFile, keyFile := tlsFilePaths(cfg)
-			cert, cerr := tls.LoadX509KeyPair(certFile, keyFile)
-			if cerr != nil {
-				_ = ln.Close()
-				return nil, fmt.Errorf("load server TLS keypair: %w", cerr)
-			}
-			tlsConf.Certificates = []tls.Certificate{cert}
-			tlsLn = tls.NewListener(ln, tlsConf)
-		}
-		shutdown := func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-			defer cancel()
-			_ = srv.Shutdown(ctx)
-		}
-		serveLn := ln
-		if tlsLn != nil {
-			serveLn = tlsLn
-		}
-		go func(l net.Listener) {
-			if useTLS {
-				slog.Info("listening (TLS)", "addr", l.Addr().String())
-			} else {
-				slog.Info("listening (plain HTTP)", "addr", l.Addr().String())
-			}
-			errCh <- srv.Serve(l)
-		}(serveLn)
-		return shutdown, nil
+		}()
+		return stop2, nil
 	}
 
 	// onReady is invoked by the setup router when /setup/api-key completes.
