@@ -96,6 +96,7 @@ Default values are shown; variables marked **Required** must be set.
 | `MINT_MASTER_KEY` | 32‑byte hex‑encoded AES‑256 key used to encrypt CA private keys at rest. | – | **Yes** |
 | **ACME** | | | |
 | `MINT_ACME_ENABLED` | Enable the ACME protocol endpoints. | `false` | No |
+| `MINT_BOOTSTRAP_KEY` | Supplied bootstrap key used for first‑boot setup instead of a random console‑only one, letting `mca init`/CI onboard a fresh instance. | (random) | No |
 | `MINT_ACME_BASE_URL` | Public HTTPS URL where mint‑ca is reachable (e.g., `https://ca.example.com`). | – | If ACME enabled |
 | `MINT_ACME_EAB_REQUIRED` | Require External Account Binding for new ACME accounts. | `false` | No |
 | `MINT_ACME_CAA_DOMAIN` | This CA's public identity used for RFC 8659 CAA checks. When set, issuance is refused unless each identifier's CAA record authorises this domain. Empty disables CAA enforcement. | – | No |
@@ -205,8 +206,7 @@ Using `curl` (or any HTTP client), perform the following two requests **before**
 1. Create the root CA (see 3.2 in the user guide).
 2. Create the permanent API key (see 3.3).
 
-After the second request, the server automatically deletes the bootstrap key and restarts its HTTP listener (now in ready mode).  
-If you are using Docker, the container does **not** restart; the listener is replaced in‑process, but the process stays alive.
+After the second request, the server automatically deletes the bootstrap key and transition the listener **in‑process** to the ready API over TLS (no process exit, no container restart needed; `/setup/state` reports `"state":"ready"`). If you restarted during setup (`state == "setup"`), the bootstrap key was printed earlier and remains valid for finishing. To let a CLI/CI onboard without reading the console, set `MINT_BOOTSTRAP_KEY` on the container — first boot then accepts that exact key at the `/setup/*` endpoints.
 
 The first permanent key created via `POST /setup/api-key` is a **platform‑admin** key — the person standing up the instance is, by definition, the platform operator. A platform‑admin key bypasses tenant isolation and can also mint tenants and per‑tenant (or additional platform‑admin) keys afterward:
 
