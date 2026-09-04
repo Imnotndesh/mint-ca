@@ -127,7 +127,7 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 	`); err != nil {
 		return fmt.Errorf("postgres: migrate api_keys tenant_id: %w", err)
 	}
-	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies"} {
+	for _, t := range []string{"certificate_authorities", "provisioners", "profiles", "policies", "ssh_certificate_authorities"} {
 		if _, err := s.db.ExecContext(ctx, `ALTER TABLE `+t+` ADD COLUMN IF NOT EXISTS tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL;`); err != nil {
 			return fmt.Errorf("postgres: migrate %s tenant_id: %w", t, err)
 		}
@@ -135,7 +135,7 @@ func (s *postgresStore) Migrate(ctx context.Context) error {
 	if err := seedDefaultTenantPostgres(ctx, s.db); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE certificate_authorities SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE provisioners SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE profiles SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE policies SET tenant_id = $1 WHERE tenant_id IS NULL;`, DefaultTenantID.String()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE certificate_authorities SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE provisioners SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE profiles SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE policies SET tenant_id = $1 WHERE tenant_id IS NULL; UPDATE ssh_certificate_authorities SET tenant_id = $1 WHERE tenant_id IS NULL;`, DefaultTenantID.String()); err != nil {
 		return fmt.Errorf("postgres: backfill tenant_id: %w", err)
 	}
 	return nil
@@ -2280,10 +2280,11 @@ func pgScanTenantRows(rows *sql.Rows) (*Tenant, error) {
 func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAuthority) error {
 	_, err := s.db.ExecContext(ctx, `
 		INSERT INTO ssh_certificate_authorities
-			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+			(id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		ca.ID.String(), ca.Name, string(ca.KeyAlgo), ca.PublicKey,
-		ca.KeyEnc, string(ca.Status), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), ca.CreatedAt.UTC(),
+		ca.KeyEnc, string(ca.Status), pgUUIDToSQL(ca.LogicalCAID), pgUUIDToSQL(ca.ParentID), pgUUIDNullable(ca.TenantID),
+		ca.CreatedAt.UTC(),
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: CreateSSHCA: %w", err)
@@ -2292,14 +2293,14 @@ func (s *postgresStore) CreateSSHCA(ctx context.Context, ca *SSHCertificateAutho
 }
 
 const pgSSHCASelectSQL = `
-	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, created_at
+	SELECT id, name, key_algo, public_key, key_enc, status, logical_ca_id, parent_id, tenant_id, created_at
 	FROM ssh_certificate_authorities`
 
 func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 	var ca SSHCertificateAuthority
 	var idStr string
-	var logicalID, parentID *string
-	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt)
+	var logicalID, parentID, tenantID *string
+	err := row.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -2307,6 +2308,7 @@ func pgScanSSHCA(row *sql.Row) (*SSHCertificateAuthority, error) {
 		return nil, err
 	}
 	ca.ID = uuid.MustParse(idStr)
+	ca.TenantID = pgSQLToUUIDValue(tenantID)
 	ca.LogicalCAID = pgSQLToUUID(logicalID)
 	ca.ParentID = pgSQLToUUID(parentID)
 	return &ca, nil
@@ -2340,11 +2342,12 @@ func (s *postgresStore) ListSSHCAs(ctx context.Context) ([]*SSHCertificateAuthor
 	for rows.Next() {
 		var ca SSHCertificateAuthority
 		var idStr string
-		var logicalID, parentID *string
-		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &ca.CreatedAt); err != nil {
+		var logicalID, parentID, tenantID *string
+		if err := rows.Scan(&idStr, &ca.Name, &ca.KeyAlgo, &ca.PublicKey, &ca.KeyEnc, &ca.Status, &logicalID, &parentID, &tenantID, &ca.CreatedAt); err != nil {
 			return nil, err
 		}
 		ca.ID = uuid.MustParse(idStr)
+		ca.TenantID = pgSQLToUUIDValue(tenantID)
 		ca.LogicalCAID = pgSQLToUUID(logicalID)
 		ca.ParentID = pgSQLToUUID(parentID)
 		out = append(out, &ca)

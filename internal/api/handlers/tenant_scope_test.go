@@ -22,6 +22,7 @@ type scopeFakeStore struct {
 	mu       sync.Mutex
 	cas      map[uuid.UUID]*storage.CertificateAuthority
 	certs    map[uuid.UUID]*storage.Certificate
+	sshcAs   map[uuid.UUID]*storage.SSHCertificateAuthority
 	provs    map[uuid.UUID]*storage.Provisioner
 	policies map[uuid.UUID]*storage.Policy
 	profiles map[uuid.UUID]*storage.Profile
@@ -31,6 +32,7 @@ func newScopeFakeStore() *scopeFakeStore {
 	return &scopeFakeStore{
 		cas:      map[uuid.UUID]*storage.CertificateAuthority{},
 		certs:    map[uuid.UUID]*storage.Certificate{},
+		sshcAs:   map[uuid.UUID]*storage.SSHCertificateAuthority{},
 		provs:    map[uuid.UUID]*storage.Provisioner{},
 		policies: map[uuid.UUID]*storage.Policy{},
 		profiles: map[uuid.UUID]*storage.Profile{},
@@ -38,6 +40,22 @@ func newScopeFakeStore() *scopeFakeStore {
 }
 
 func (f *scopeFakeStore) Close() error { return nil }
+
+// ---- SSH CA (list filter) ----
+func (f *scopeFakeStore) GetSSHCA(ctx context.Context, id uuid.UUID) (*storage.SSHCertificateAuthority, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sshcAs[id], nil
+}
+func (f *scopeFakeStore) ListSSHCAs(ctx context.Context) ([]*storage.SSHCertificateAuthority, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := []*storage.SSHCertificateAuthority{}
+	for _, c := range f.sshcAs {
+		out = append(out, c)
+	}
+	return out, nil
+}
 
 // ---- CA ----
 func (f *scopeFakeStore) GetCA(ctx context.Context, id uuid.UUID) (*storage.CertificateAuthority, error) {
@@ -224,5 +242,33 @@ func TestPhase3_Cert_TransitiveTenantScope(t *testing.T) {
 	// Tenant A (foreign) gets 404.
 	if rec := doScopeRequest(r, http.MethodGet, "/api/v1/certs/"+cert.ID.String(), "", &tenantA); rec.Code != http.StatusNotFound {
 		t.Fatalf("cross cert get = %d, want 404", rec.Code)
+	}
+}
+
+// TestPhase4_SSHCA_ListIsTenantScoped ensures SSH CA lists only expose the
+// caller's own tenant's SSH CAs.
+func TestPhase4_SSHCA_ListIsTenantScoped(t *testing.T) {
+	store := newScopeFakeStore()
+	tenantA, tenantB := uuid.New(), uuid.New()
+	sshA := &storage.SSHCertificateAuthority{ID: uuid.New(), Name: "sshA", TenantID: tenantA}
+	sshB := &storage.SSHCertificateAuthority{ID: uuid.New(), Name: "sshB", TenantID: tenantB}
+	store.sshcAs[sshA.ID] = sshA
+	store.sshcAs[sshB.ID] = sshB
+
+	h := NewSSHCAHandler(nil, store, nil)
+	r := chi.NewRouter()
+	h.RegisterRoutes(r)
+
+	rec := doScopeRequest(r, http.MethodGet, "/api/v1/sshca/", "", &tenantA)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), `"sshA"`) || strings.Contains(rec.Body.String(), `"sshB"`) {
+		t.Fatalf("tenant scoped sshca list leaked other tenant: %s", rec.Body.String())
+	}
+	// Platform admin sees both.
+	rec = doScopeRequest(r, http.MethodGet, "/api/v1/sshca/", "", nil)
+	if !strings.Contains(rec.Body.String(), `"sshA"`) || !strings.Contains(rec.Body.String(), `"sshB"`) {
+		t.Fatalf("platform sshca list missing CAs: %s", rec.Body.String())
 	}
 }

@@ -54,6 +54,9 @@ type CreateCARequest struct {
 	Name string
 	// KeyAlgo is the algorithm for the CA signing key. Defaults to ed25519.
 	KeyAlgo KeyAlgo
+	// TenantID stamps the SSH CA row with its owning tenant. Zero for
+	// legacy/bootstrap flows.
+	TenantID uuid.UUID
 }
 
 func (r *CreateCARequest) setDefaults() {
@@ -202,6 +205,7 @@ func (e *Engine) CreateCA(ctx context.Context, req CreateCARequest) (*storage.SS
 	record := &storage.SSHCertificateAuthority{
 		ID:          uuid.New(),
 		Name:        req.Name,
+		TenantID:    req.TenantID,
 		KeyAlgo:     req.KeyAlgo.storageAlgo(),
 		PublicKey:   strings.TrimSpace(string(authorizedKey)),
 		KeyEnc:      encKey,
