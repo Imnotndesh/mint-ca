@@ -17,15 +17,19 @@ import (
 // No package other than this one calls os.Getenv. If you need a value from the
 // environment, add it here.
 type Config struct {
-	Server    ServerConfig
-	Storage   StorageConfig
-	Crypto    CryptoConfig
-	ACME      ACMEConfig
-	CRL       CRLConfig
-	Log       LogConfig
-	RateLimit RateLimitConfig
-	MTLS      MTLSConfig
-	Renewal   RenewalConfig
+	Server      ServerConfig
+	Storage     StorageConfig
+	Crypto      CryptoConfig
+	ACME        ACMEConfig
+	CRL         CRLConfig
+	Log         LogConfig
+	RateLimit   RateLimitConfig
+	MTLS        MTLSConfig
+	Renewal     RenewalConfig
+	SCEP        SCEPConfig
+	Events      EventsConfig
+	Attestation AttestationConfig
+	HA          HAConfig
 }
 
 // ServerConfig controls the HTTP/TLS listener.
@@ -245,6 +249,86 @@ type RenewalConfig struct {
 	// due for renewal, letting an external system perform the actual renewal.
 	// Env: MINT_RENEWAL_WEBHOOK_URL
 	WebhookURL string
+
+	// ExpiringSeconds is a tighter window than LeadSeconds: certs whose NotAfter
+	// falls within this window are classified "expiring_soon" instead of just
+	// "due", so automation can distinguish urgency.
+	// Env: MINT_RENEWAL_EXPIRING_SECONDS
+	ExpiringSeconds int64
+}
+
+// SCEPConfig controls the public SCEP (RFC 8894-ish) enrollment endpoint at
+// /pki/{caID}/scep. Pre-release, single-user posture: one provisioner handles
+// every SCEP enrollment rather than per-device provisioner mapping.
+//
+// This implementation does not wrap requests/responses in PKCS#7 as the full
+// SCEP spec requires (PKIOperation's SignedData/EnvelopedData). It accepts a
+// raw PKCS#10 CSR as the POST body and returns a raw DER certificate,
+// documented as a deviation in docs/Api.md. Clients or gateways that speak
+// full SCEP need a PKCS#7 unwrap/wrap shim in front of this endpoint.
+type SCEPConfig struct {
+	// Enabled turns on the /pki/{caID}/scep routes.
+	// Env: MINT_SCEP_ENABLED
+	Enabled bool
+
+	// ProvisionerID is the provisioner every SCEP enrollment is signed under.
+	// Env: MINT_SCEP_PROVISIONER_ID
+	ProvisionerID string
+
+	// DefaultTTLSeconds is the leaf lifetime granted to SCEP enrollments.
+	// Env: MINT_SCEP_DEFAULT_TTL_SECONDS
+	DefaultTTLSeconds int64
+}
+
+// EventsConfig controls the generic action-notification webhook. When set,
+// mint-ca POSTs a JSON event for each significant action (certificate issued,
+// certificate revoked) so external systems (SIEM, chat, ticketing) can react
+// in real time instead of polling the audit log.
+type EventsConfig struct {
+	// WebhookURL, when set, is POSTed a JSON payload for each event.
+	// Env: MINT_EVENTS_WEBHOOK_URL
+	WebhookURL string
+}
+
+// AttestationConfig controls hardware-attestation-gated issuance (see
+// internal/attestation). Attestation is always opt-in per request (a
+// "attestation" field on POST /api/v1/certs/sign); this config only narrows
+// what the built-in TPM2 verifier accepts.
+type AttestationConfig struct {
+	// TPMRootsFile, when set, is a PEM bundle of trusted TPM manufacturer
+	// root certificates. The tpm2 verifier only accepts EK certificates
+	// chaining to one of these. When empty, any well-formed EK certificate
+	// is accepted (proves possession of its key, not genuine TPM hardware —
+	// fine for development, not recommended for production).
+	// Env: MINT_ATTESTATION_TPM_ROOTS_FILE
+	TPMRootsFile string
+}
+
+// HAConfig controls active-passive leader election for running multiple
+// mint-ca processes against one shared Postgres database (see internal/ha).
+// Only one node — the current leader — serves API traffic at a time;
+// standbys return 503 until they win an election. Requires the postgres
+// storage backend, since sqlite is inherently single-process.
+type HAConfig struct {
+	// Enabled turns on leader election. Requires MINT_DB_DRIVER=postgres.
+	// Env: MINT_HA_ENABLED
+	Enabled bool
+
+	// NodeID identifies this process in the leader-election lock. Defaults
+	// to the OS hostname if unset.
+	// Env: MINT_HA_NODE_ID
+	NodeID string
+
+	// LeaseSeconds is how long a won leadership lease lasts before it can be
+	// taken over, if not renewed.
+	// Env: MINT_HA_LEASE_SECONDS
+	LeaseSeconds int64
+
+	// RenewSeconds is how often the leader (and every standby) attempts to
+	// acquire/renew the lease. Should be well under LeaseSeconds so a
+	// healthy leader doesn't lose its lease due to renewal jitter.
+	// Env: MINT_HA_RENEW_SECONDS
+	RenewSeconds int64
 }
 
 // Load reads all configuration from environment variables, applies defaults,
@@ -424,6 +508,47 @@ func Load() (*Config, error) {
 		c.Renewal.LeadSeconds = 7 * 24 * 3600 // 7 days
 	}
 	c.Renewal.WebhookURL = strings.TrimSpace(os.Getenv("MINT_RENEWAL_WEBHOOK_URL"))
+	c.Renewal.ExpiringSeconds = int64(envIntOptional("MINT_RENEWAL_EXPIRING_SECONDS"))
+	if c.Renewal.ExpiringSeconds == 0 {
+		c.Renewal.ExpiringSeconds = 48 * 3600 // 48h
+	}
+
+	c.SCEP.Enabled = envBool("MINT_SCEP_ENABLED")
+	c.SCEP.ProvisionerID = strings.TrimSpace(os.Getenv("MINT_SCEP_PROVISIONER_ID"))
+	c.SCEP.DefaultTTLSeconds = int64(envIntOptional("MINT_SCEP_DEFAULT_TTL_SECONDS"))
+	if c.SCEP.DefaultTTLSeconds == 0 {
+		c.SCEP.DefaultTTLSeconds = 90 * 24 * 3600 // 90 days
+	}
+
+	c.Events.WebhookURL = strings.TrimSpace(os.Getenv("MINT_EVENTS_WEBHOOK_URL"))
+	c.Attestation.TPMRootsFile = strings.TrimSpace(os.Getenv("MINT_ATTESTATION_TPM_ROOTS_FILE"))
+
+	c.HA.Enabled = envBool("MINT_HA_ENABLED")
+	c.HA.NodeID = strings.TrimSpace(os.Getenv("MINT_HA_NODE_ID"))
+	if c.HA.NodeID == "" {
+		if h, err := os.Hostname(); err == nil {
+			c.HA.NodeID = h
+		}
+	}
+	c.HA.LeaseSeconds = int64(envIntOptional("MINT_HA_LEASE_SECONDS"))
+	if c.HA.LeaseSeconds == 0 {
+		c.HA.LeaseSeconds = 15
+	}
+	c.HA.RenewSeconds = int64(envIntOptional("MINT_HA_RENEW_SECONDS"))
+	if c.HA.RenewSeconds == 0 {
+		c.HA.RenewSeconds = 5
+	}
+	if c.HA.Enabled {
+		if c.Storage.Driver != "postgres" {
+			errs = append(errs, "MINT_HA_ENABLED requires MINT_DB_DRIVER=postgres (sqlite is single-process)")
+		}
+		if c.HA.NodeID == "" {
+			errs = append(errs, "MINT_HA_NODE_ID is required when MINT_HA_ENABLED=true and the hostname could not be determined")
+		}
+		if c.HA.RenewSeconds >= c.HA.LeaseSeconds {
+			errs = append(errs, "MINT_HA_RENEW_SECONDS must be less than MINT_HA_LEASE_SECONDS")
+		}
+	}
 
 	if len(errs) > 0 {
 		return nil, formatErrors(errs)

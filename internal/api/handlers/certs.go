@@ -7,11 +7,18 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	gox509 "crypto/x509"
+	"encoding/base64"
+
 	"mint-ca/internal/approval"
+	"mint-ca/internal/attestation"
 	"mint-ca/internal/ca"
+	"mint-ca/internal/events"
 	"mint-ca/internal/policy"
+	"mint-ca/internal/spiffe"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -19,13 +26,77 @@ import (
 )
 
 type CertHandler struct {
-	engine *ca.Engine
-	policy *policy.Engine
-	store  storage.Store
+	engine      *ca.Engine
+	policy      *policy.Engine
+	store       storage.Store
+	events      events.Emitter
+	attestation *attestation.Registry
 }
 
-func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store) *CertHandler {
-	return &CertHandler{engine: engine, policy: policyEngine, store: store}
+func NewCertHandler(engine *ca.Engine, policyEngine *policy.Engine, store storage.Store, emitter events.Emitter, attestationRegistry *attestation.Registry) *CertHandler {
+	if emitter == nil {
+		emitter = events.NoopEmitter{}
+	}
+	if attestationRegistry == nil {
+		attestationRegistry = attestation.NewRegistry()
+	}
+	return &CertHandler{engine: engine, policy: policyEngine, store: store, events: emitter, attestation: attestationRegistry}
+}
+
+// attestationRequest optionally accompanies a CSR-signing request, proving
+// the requested key is bound to a hardware root of trust (see
+// internal/attestation). DataB64 is the format-specific evidence, base64
+// encoded.
+type attestationRequest struct {
+	Format  string `json:"format"`
+	DataB64 string `json:"data_b64"`
+}
+
+// verifyAttestation, when req is non-nil, decodes the CSR to DER and checks
+// req against the handler's attestation registry. A nil req is a no-op:
+// attestation is opt-in per request.
+func (h *CertHandler) verifyAttestation(ctx context.Context, csrPEM string, req *attestationRequest) error {
+	if req == nil {
+		return nil
+	}
+	block, _ := pem.Decode([]byte(csrPEM))
+	if block == nil {
+		return errors.New("attestation: no PEM block found in csr_pem")
+	}
+	data, err := base64.StdEncoding.DecodeString(req.DataB64)
+	if err != nil {
+		return fmt.Errorf("attestation: decode data_b64: %w", err)
+	}
+	result, err := h.attestation.Verify(ctx, block.Bytes, attestation.Statement{Format: req.Format, Data: data})
+	if err != nil {
+		return fmt.Errorf("attestation: %w", err)
+	}
+	if !result.Verified {
+		return errors.New("attestation: statement did not verify")
+	}
+	return nil
+}
+
+// emitCertIssued notifies the events bus that a certificate was issued.
+func (h *CertHandler) emitCertIssued(cert *storage.Certificate) {
+	h.events.Emit(events.New(events.CertIssued, map[string]any{
+		"cert_id":    cert.ID.String(),
+		"ca_id":      cert.CAID.String(),
+		"serial":     cert.Serial,
+		"subject_cn": cert.SubjectCN,
+		"not_after":  cert.NotAfter,
+	}))
+}
+
+// emitCertRevoked notifies the events bus that a certificate was revoked.
+func (h *CertHandler) emitCertRevoked(cert *storage.Certificate, reason *int) {
+	h.events.Emit(events.New(events.CertRevoked, map[string]any{
+		"cert_id":    cert.ID.String(),
+		"ca_id":      cert.CAID.String(),
+		"serial":     cert.Serial,
+		"subject_cn": cert.SubjectCN,
+		"reason":     reason,
+	}))
 }
 
 // loadProfileByName resolves a named profile via the store, or (nil,nil) when
@@ -43,7 +114,14 @@ func (h *CertHandler) loadProfileByName(ctx context.Context, name string) (*stor
 // it is refused. When no rule applies to the provisioner, behavior is unchanged
 // (no auto-approval policy governs this CSR).
 func (h *CertHandler) enforceCSRAutoApproval(ctx context.Context, provisionerID uuid.UUID, csrPEM string, ttlSeconds int64) error {
-	s, ok := h.store.(csrApprovalStore)
+	return enforceCSRAutoApproval(ctx, h.store, provisionerID, csrPEM, ttlSeconds)
+}
+
+// enforceCSRAutoApproval is the store-agnostic form shared by any handler
+// that signs a CSR directly (REST cert signing, SCEP), so the same
+// auto-approval gate applies consistently.
+func enforceCSRAutoApproval(ctx context.Context, store storage.Store, provisionerID uuid.UUID, csrPEM string, ttlSeconds int64) error {
+	s, ok := store.(csrApprovalStore)
 	if !ok {
 		return nil
 	}
@@ -127,6 +205,11 @@ type issueCertRequest struct {
 	// Profile optionally names a certificate profile to enforce against this
 	// issuance. Resolved by name and evaluated with policy.EvaluateProfile.
 	Profile string `json:"profile"`
+	// SANsURI adds arbitrary URI SAN values. SpiffeID is a convenience for
+	// the common case: it's validated (see internal/spiffe) and appended
+	// here automatically, so callers don't need to duplicate it.
+	SANsURI  []string `json:"sans_uri"`
+	SpiffeID string   `json:"spiffe_id"`
 }
 
 func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
@@ -155,6 +238,33 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ips = append(ips, ip)
+	}
+
+	uris := make([]*url.URL, 0, len(req.SANsURI)+1)
+	for _, v := range req.SANsURI {
+		if strings.HasPrefix(v, "spiffe://") {
+			u, err := spiffe.ValidateID(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			uris = append(uris, u)
+			continue
+		}
+		u, err := url.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid URI in sans_uri: "+v)
+			return
+		}
+		uris = append(uris, u)
+	}
+	if req.SpiffeID != "" {
+		u, err := spiffe.ValidateID(req.SpiffeID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		uris = append(uris, u)
 	}
 
 	algo := req.KeyAlgo
@@ -229,6 +339,7 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		SANsDNS:          req.SANsDNS,
 		SANsIP:           ips,
 		SANsEmail:        req.SANsEmail,
+		SANsURI:          uris,
 		TTLSeconds:       req.TTLSeconds,
 		KeyAlgo:          ca.KeyAlgo(algo),
 		KeyUsage:         ku,
@@ -243,6 +354,7 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	h.emitCertIssued(issued.Record)
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"certificate": issued.Record,
@@ -258,6 +370,10 @@ type signCSRRequest struct {
 	CSRPEM        string       `json:"csr_pem"`
 	TTLSeconds    int64        `json:"ttl_seconds"`
 	Metadata      storage.JSON `json:"metadata"`
+	// Attestation optionally proves the CSR's key is bound to a hardware
+	// root of trust (TPM, WebAuthn authenticator, ...). Opt-in: omit to sign
+	// without an attestation check.
+	Attestation *attestationRequest `json:"attestation,omitempty"`
 }
 
 func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
@@ -284,6 +400,10 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, err.Error())
 		return
 	}
+	if err := h.verifyAttestation(r.Context(), req.CSRPEM, req.Attestation); err != nil {
+		writeError(w, http.StatusForbidden, err.Error())
+		return
+	}
 
 	issued, err := h.engine.SignCSR(r.Context(), ca.SignCSRRequest{
 		CAID:          caID,
@@ -297,6 +417,7 @@ func (h *CertHandler) signCSR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	h.emitCertIssued(issued.Record)
 
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"certificate": issued.Record,
@@ -346,6 +467,11 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 		if item.Metadata != nil {
 			meta = item.Metadata
 		}
+		if err := h.verifyAttestation(r.Context(), item.CSRPEM, item.Attestation); err != nil {
+			res.Error = err.Error()
+			results = append(results, res)
+			continue
+		}
 		issued, err := h.engine.SignCSR(r.Context(), ca.SignCSRRequest{
 			CAID:          caID,
 			ProvisionerID: provID,
@@ -361,6 +487,7 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 			res.Serial = issued.Record.Serial
 			res.SubjectCN = issued.Record.SubjectCN
 			res.CertPEM = string(issued.CertPEM)
+			h.emitCertIssued(issued.Record)
 		}
 		results = append(results, res)
 	}
@@ -374,9 +501,10 @@ func (h *CertHandler) batchSignCSR(w http.ResponseWriter, r *http.Request) {
 
 // batchSignItem is one CSR to sign in a batch request.
 type batchSignItem struct {
-	CSRPEM     string       `json:"csr_pem"`
-	TTLSeconds int64        `json:"ttl_seconds"`
-	Metadata   storage.JSON `json:"metadata,omitempty"`
+	CSRPEM      string              `json:"csr_pem"`
+	TTLSeconds  int64               `json:"ttl_seconds"`
+	Metadata    storage.JSON        `json:"metadata,omitempty"`
+	Attestation *attestationRequest `json:"attestation,omitempty"`
 }
 
 // batchSignResult is the per-item outcome.
@@ -438,8 +566,11 @@ func (h *CertHandler) key(w http.ResponseWriter, r *http.Request) {
 	w.Write(keyPEM)
 }
 
-// export returns a tar.gz bundle of a certificate (leaf, chain, manifest) and,
-// when the key was escrowed and a valid passcode is supplied, the key too.
+// export returns a certificate bundle: by default a tar.gz (leaf, chain,
+// manifest) and, when the key was escrowed and a valid passcode is supplied,
+// the key too. With ?format=p12 it instead returns a password-protected
+// PKCS#12 file (requires an escrowed key + passcode, since a p12 always
+// carries a key).
 func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 	id, err := uuid.Parse(chi.URLParam(r, "certID"))
 	if err != nil {
@@ -456,6 +587,55 @@ func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	if r.URL.Query().Get("format") == "p12" {
+		chainPEM, err := h.engine.GetLeafChainPEM(r.Context(), cert.CAID, []byte(cert.CertPEM))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		password := r.URL.Query().Get("p12_password")
+		if password == "" {
+			password = pkcs12DefaultPassword
+		}
+		data, err := exportP12([]byte(cert.CertPEM), chainPEM, keyPEM, password)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-pkcs12")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".p12\"")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		return
+	}
+
+	if r.URL.Query().Get("format") == "jks" {
+		chainPEM, err := h.engine.GetLeafChainPEM(r.Context(), cert.CAID, []byte(cert.CertPEM))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		password := r.URL.Query().Get("jks_password")
+		if password == "" {
+			password = pkcs12DefaultPassword
+		}
+		alias := r.URL.Query().Get("jks_alias")
+		if alias == "" {
+			alias = "mint-ca"
+		}
+		data, err := exportJKS([]byte(cert.CertPEM), chainPEM, keyPEM, password, alias)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-java-keystore")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".jks\"")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		return
+	}
+
 	data, err := exportCert(r.Context(), h.engine, cert, keyPEM)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -502,9 +682,13 @@ func (h *CertHandler) revoke(w http.ResponseWriter, r *http.Request) {
 	}
 	var req revokeRequest
 	_ = decodeJSON(r, &req)
+	cert, _ := h.store.GetCertificate(r.Context(), id)
 	if err := h.store.RevokeCertificate(r.Context(), id, req.Reason); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
+	}
+	if cert != nil {
+		h.emitCertRevoked(cert, &req.Reason)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }

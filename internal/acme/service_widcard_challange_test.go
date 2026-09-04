@@ -79,7 +79,7 @@ func TestNewOrderWildcardChallengeRestriction(t *testing.T) {
 
 	order, challenges, prob := svc.NewOrder(ctx, account, prov, []Identifier{
 		{Type: "dns", Value: "*.example.com"},
-	})
+	}, "")
 	if prob != nil {
 		t.Fatalf("NewOrder failed: %v", prob)
 	}

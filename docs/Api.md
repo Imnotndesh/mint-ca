@@ -152,6 +152,8 @@ Generate a new key pair and issue a certificate.
   "profile": "web",                 // optional: enforce a named certificate profile
   "store_key": false,                 // optional: escrow the generated key for later retrieval
   "key_passcode": "",                // optional: passcode-guard the escrowed key
+  "sans_uri": [],                    // optional: arbitrary URI SANs
+  "spiffe_id": "spiffe://example.org/ns/default/sa/backend",  // optional: see 1.21
   "metadata": { "environment": "prod" }
 }
 ```
@@ -180,7 +182,11 @@ Sign a CSR submitted by the client (the private key stays with the client).
   "provisioner_id": "provisioner-uuid",
   "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...",
   "ttl_seconds": 86400,
-  "metadata": { "env": "prod" }
+  "metadata": { "env": "prod" },
+  "attestation": {                  // optional: gate signing on hardware attestation, see 1.20
+    "format": "tpm2",
+    "data_b64": "<base64 of the format-specific evidence>"
+  }
 }
 ```
 
@@ -225,7 +231,9 @@ abort the rest.
   ]
 }
 ```
-Max 1000 items. Per‑item `metadata` overrides the shared metadata.
+Max 1000 items. Per‑item `metadata` overrides the shared metadata. Each item
+may also carry its own `"attestation"` (same shape as in `POST
+/api/v1/certs/sign`, see 1.20); a failed attestation fails only that item.
 
 **Response (200 OK)**
 ```json
@@ -263,6 +271,25 @@ Download a tar.gz bundle of a certificate: `cert.pem`, `chain.pem`
 | Param | Description |
 |-------|-------------|
 | `passcode` | Required to include `key.pem` when the key is passcode‑protected. |
+| `format` | `p12` for a password‑protected PKCS#12 file, or `jks` for a Java KeyStore (see below). |
+
+With `?format=p12`, the response is a single `.p12`/`.pfx` file containing the
+leaf certificate, its private key, and its CA chain — for consumers that
+expect one self‑contained keystore file (Windows certificate stores, network
+appliances) rather than separate PEM parts. Requires an escrowed key: pass
+`passcode` if the key is passcode‑protected. Additional query parameters:
+| Param | Description |
+|-------|-------------|
+| `p12_password` | Password protecting the `.p12` file itself. Default: `changeit`. |
+
+With `?format=jks`, the response is a Java KeyStore (`.jks`) file — for JVM
+consumers (Java/Kotlin services, Android, Java-based network appliances) that
+specifically expect a JKS rather than a PKCS#12 file. Same key/passcode
+requirement as `p12`. Additional query parameters:
+| Param | Description |
+|-------|-------------|
+| `jks_password` | Password protecting the `.jks` file itself. Default: `changeit`. |
+| `jks_alias` | Alias the private-key entry is stored under. Default: `mint-ca`. |
 
 ### Auto‑renewal webhook (background, not request/response)
 When `MINT_RENEWAL_ENABLED` and `MINT_RENEWAL_WEBHOOK_URL` are set, a background
@@ -484,6 +511,12 @@ Delete an API key.
 
 ## 1.7 Audit Log
 
+Every mutating action is appended to a tamper-evident hash chain: each entry's
+`entry_hash` is derived from its own fields plus the previous entry's
+`entry_hash` (genesis chains from the empty string). Editing, deleting, or
+reordering any past entry breaks the chain from that point forward, which
+`GET /api/v1/audit/verify` detects.
+
 ### `GET /api/v1/audit`
 List audit entries (most recent first).
 
@@ -502,13 +535,70 @@ List audit entries (most recent first).
     "cert_id": "...",
     "payload": { ... },
     "ip_address": "10.0.0.1",
-    "created_at": "..."
+    "created_at": "...",
+    "prev_hash": "...",
+    "entry_hash": "..."
   }
 ]
 ```
 
 ### `GET /api/v1/audit/ca/{caID}`
 Same as above, filtered by CA.
+
+### `GET /api/v1/audit/merkle/root`
+Returns the current Merkle Tree Head over the audit log's hash chain — an
+RFC 6962 (Certificate Transparency)-style commitment, layered on top of the
+hash chain in 1.7. Useful as a value to pin and compare over time: if the
+root ever changes in a way not explained by new entries appended at the end,
+the log was tampered with.
+
+**Response (200 OK)**
+```json
+{ "root_hash": "3f...c2", "size": 1234 }
+```
+
+### `GET /api/v1/audit/merkle/proof/{index}`
+Returns an inclusion proof for the audit log entry at `{index}` (0-based,
+chronological — the same order `verify` walks), against the current tree —
+"prove this specific entry was recorded, without downloading the whole log."
+
+**Response (200 OK)**
+```json
+{
+  "index": 4,
+  "size": 9,
+  "entry_id": "550e8400-e29b-41d4-a716-446655440000",
+  "entry_hash": "a1...9f",
+  "proof": ["b2...", "c3...", "d4..."],
+  "root_hash": "3f...c2"
+}
+```
+`404` if `index >= size`. A verifier recomputes the root from `entry_hash`,
+`index`, `size`, and `proof` (RFC 6962 §2.1.1 audit path verification, with
+0x00/0x01 domain-separated leaf/node hashing) and compares it to a
+previously-pinned `root_hash` — no trust in mint-ca's own answer required for
+`ok: true`, only that it matches a root the verifier already trusts.
+
+### `GET /api/v1/audit/verify`
+Walks the entire audit log's hash chain, oldest first, and reports whether it
+is intact.
+
+**Response (200 OK)** — intact:
+```json
+{ "ok": true, "entries": 1234, "verified_at": "2026-01-01T00:00:00Z" }
+```
+
+**Response (200 OK)** — broken (e.g. a row was edited or deleted directly in
+the database, bypassing the API):
+```json
+{
+  "ok": false,
+  "entries": 1234,
+  "verified_at": "2026-01-01T00:00:00Z",
+  "broken_at_index": 57,
+  "broken_entry_id": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
 
 ---
 
@@ -844,3 +934,225 @@ Delete a rule.
 
 > Enforcement happens on `POST /api/v1/certs/sign`. The TLS/HTTPS config for CAA
 > checking is configured via env (`MINT_ACME_CAA_*`, see Setup.md), not the REST API.
+
+## 1.16 Renewal Lifecycle Intel
+
+Read-only visibility into certificate renewal risk, derived from existing
+certificate data (no separate tracking table). Useful for external automation
+to alert on certs needing action.
+
+### `GET /api/v1/renewal/status`
+Optionally filter with `?ca_id=<uuid>`.
+
+**Response (200 OK)**
+```json
+{
+  "certificates": [
+    {
+      "cert_id": "cert-uuid",
+      "ca_id": "ca-uuid",
+      "subject_cn": "svc.example.com",
+      "expires_at": "2026-09-10T00:00:00Z",
+      "days_left": 5,
+      "status": "due"
+    }
+  ],
+  "summary": {
+    "due": 1,
+    "expiring_soon": 0,
+    "expired": 0,
+    "revoked": 0
+  }
+}
+```
+
+Only certificates that are not classified `valid` are listed (i.e. `due`,
+`expiring_soon`, `expired`, or `revoked`); the `summary` gives totals per
+bucket. Buckets:
+- `revoked` — certificate status is revoked.
+- `expired` — certificate status is expired, or `NotAfter` has passed.
+- `expiring_soon` — `NotAfter` is within `MINT_RENEWAL_EXPIRING_SECONDS` (default 48h).
+- `due` — `NotAfter` is within `MINT_RENEWAL_LEAD_SECONDS` (default 7 days) but
+  beyond the expiring window.
+- `valid` — not returned in the list, but not counted as an issue either.
+
+## 1.17 ACME Profile Intents
+
+ACME orders can request a named certificate profile so `profile`-constrained
+issuance (see `POST /api/v1/certs/issue`'s `"profile"` field) works through
+ACME too. A provisioner may instead **pin** a profile via its existing
+`profile_id`, which always takes priority over a client-requested one.
+
+### `POST /acme/{provisionerID}/new-order`
+The new-order payload gains an optional `profile` field:
+```json
+{
+  "identifiers": [{"type": "dns", "value": "svc.example.com"}],
+  "profile": "internal-services"
+}
+```
+If the provisioner has a pinned profile, `profile` is ignored and the pinned
+one applies. An unknown requested profile name is rejected with `400
+malformed`. The resolved profile (if any) is evaluated against the order's
+identifiers immediately (e.g. rejecting a wildcard identifier when
+`allow_wildcard` is false) via `urn:ietf:params:acme:error:rejectedIdentifier`.
+
+### `POST /acme/{provisionerID}/order/{orderID}/finalize`
+The same profile is re-evaluated against the submitted CSR's actual SANs and
+key algorithm before issuance; a violation is rejected with
+`urn:ietf:params:acme:error:badCSR`.
+
+### Order responses
+`GET`/`POST` order responses include a `"profile"` field naming the applicable
+profile when one was resolved.
+
+## 1.18 SCEP Enrollment (Simplified)
+
+A public, unauthenticated SCEP-shaped enrollment endpoint at
+`/pki/{caID}/scep`, gated by `MINT_SCEP_ENABLED` (see Setup.md). Every
+enrollment is signed under one configured provisioner
+(`MINT_SCEP_PROVISIONER_ID`) — a pre-release, single-user simplification.
+
+> **Deviation from RFC 8894**: this endpoint does **not** wrap requests or
+> responses in PKCS#7 (`SignedData`/`EnvelopedData`), which the full SCEP spec
+> requires for `PKIOperation`. `PKCSReq` here accepts a **raw PKCS#10 CSR**
+> (DER-encoded) as the POST body and returns a **raw DER leaf certificate**,
+> not a PKCS#7 degenerate certs-only message. A genuine SCEP client (most
+> MDM/device-management stacks) needs a PKCS#7 unwrap/wrap shim in front of
+> this endpoint; `mint-ca` does not ship one (no PKCS#7 dependency in
+> `go.mod`).
+
+### `GET /pki/{caID}/scep?operation=GetCACaps`
+Returns `text/plain`, newline-separated capabilities:
+```
+GetNextCACert
+POSTPKIOperation
+SHA-256
+Renewal
+```
+
+### `GET /pki/{caID}/scep?operation=GetCACert`
+Returns the CA certificate as `application/x-x509-ca-cert` (raw DER).
+
+### `GET /pki/{caID}/scep?operation=GetNextCACert`
+`501 Not Implemented` — mint-ca does not cross-cert a renewal chain.
+
+### `POST /pki/{caID}/scep?operation=PKCSReq`
+Body: raw DER-encoded PKCS#10 CSR. Enforces the same CSR auto-approval rules
+as `POST /api/v1/certs/sign` (`403` if a rule exists for the provisioner and
+this CSR does not satisfy it). On success, returns the signed leaf as
+`application/x-x509-user-cert` (raw DER).
+
+## 1.19 Action-Notification Webhook (background, not request/response)
+
+When `MINT_EVENTS_WEBHOOK_URL` is set, mint-ca POSTs a JSON event to that URL
+for every certificate issuance and revocation — so external systems (SIEM,
+chat, ticketing) can react in real time instead of polling the audit log.
+Delivery is asynchronous and best-effort: a failed or slow webhook never
+affects the API response that triggered the event.
+
+**`cert.issued`** — sent after `POST /api/v1/certs/issue`, `POST
+/api/v1/certs/sign`, and each successfully-signed item in `POST
+/api/v1/certs/batch/sign`:
+```json
+{
+  "type": "cert.issued",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "data": {
+    "cert_id": "550e8400-e29b-41d4-a716-446655440000",
+    "ca_id": "...",
+    "serial": "12345",
+    "subject_cn": "api.example.com",
+    "not_after": "2027-01-01T00:00:00Z"
+  }
+}
+```
+
+**`cert.revoked`** — sent after `PUT /api/v1/certs/{certID}/revoke`:
+```json
+{
+  "type": "cert.revoked",
+  "timestamp": "2026-01-01T00:00:00Z",
+  "data": {
+    "cert_id": "550e8400-e29b-41d4-a716-446655440000",
+    "ca_id": "...",
+    "serial": "12345",
+    "subject_cn": "api.example.com",
+    "reason": 1
+  }
+}
+```
+
+## 1.20 Hardware-Attestation-Gated Issuance
+
+`POST /api/v1/certs/sign` and each item of `POST /api/v1/certs/batch/sign` can
+carry an optional `"attestation"` field, proving the CSR's key is bound to a
+hardware root of trust before mint-ca signs it. Attestation is **opt-in**:
+omit the field to sign as before. When present, mint-ca dispatches it to the
+verifier registered for `format`; if none is registered for that format, or
+verification fails, the request is refused with `403`.
+
+```json
+{
+  "format": "tpm2",
+  "data_b64": "<base64 of the format-specific evidence>"
+}
+```
+
+Two verifiers are registered by default:
+
+**`tpm2`** — proves possession of a TPM Endorsement Key (EK). `data_b64`
+decodes to:
+```json
+{
+  "ek_cert_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "signature_b64": "<base64 signature, made with the EK private key, over sha256(csrDER)>"
+}
+```
+This is a simplified binding compared to full TPM 2.0 remote attestation
+(a `TPM2B_ATTEST` quote over PCRs, signed by an AK certified by the EK) —
+implementing the TPM2 wire protocol needs a dependency this repo doesn't
+carry yet. What's checked: the EK certificate parses, optionally chains to a
+trusted root (`MINT_ATTESTATION_TPM_ROOTS_FILE`, see Setup.md — when unset,
+any well-formed EK certificate is accepted, which only proves possession of
+its key, not genuine TPM hardware), and the signature verifies over this
+specific CSR.
+
+**`webauthn`** — proves the CSR is backed by a WebAuthn/FIDO2 authenticator
+credential (as from `navigator.credentials.create()`). `data_b64` decodes to:
+```json
+{
+  "client_data_json_b64": "<base64 clientDataJSON>",
+  "attestation_object_b64": "<base64 CBOR attestationObject>"
+}
+```
+The `clientDataJSON.challenge` must equal `sha256(csrDER)` — set this as the
+challenge when calling `navigator.credentials.create()`, binding the
+attestation to this specific CSR. Supported `attStmt` formats: `packed` (with
+an `x5c` attestation certificate, or self-attestation using the credential's
+own key) and `none` (binding check only, no attestation signature — lower
+assurance). Other formats (`android-key`, `android-safetynet`, `fido-u2f`,
+`tpm`) return an explicit "unsupported" error rather than a false pass.
+
+## 1.21 SPIFFE-Style X.509-SVIDs
+
+`POST /api/v1/certs/issue` can embed a [SPIFFE ID](https://github.com/spiffe/spiffe)
+as a URI SAN, turning the issued leaf into an X.509-SVID consumable by
+SPIFFE-aware service-mesh/workload tooling (Envoy, Istio, SPIRE-adjacent
+stacks) — no SPIFFE-specific protocol support is needed on mint-ca's side,
+since an X.509-SVID is just an ordinary certificate with a `spiffe://` URI SAN.
+
+- `"spiffe_id"` — a convenience field: the value is validated (scheme
+  `spiffe`, non-empty lowercase trust domain, no userinfo/query/fragment, at
+  most 2048 bytes) and added as a URI SAN. Invalid IDs are refused with `400`.
+- `"sans_uri"` — a general list of URI SAN values. Any entry starting with
+  `spiffe://` is validated the same way as `spiffe_id`; other URI schemes are
+  parsed but not otherwise restricted.
+
+`POST /api/v1/certs/sign` and `POST /api/v1/certs/batch/sign` don't take a
+`spiffe_id` field — any URI SANs (including `spiffe://` ones) already present
+in the submitted CSR are carried through unmodified, the same way DNS/IP/
+email SANs are.
+
+Only X.509-SVIDs are supported; JWT-SVIDs (and the SPIFFE Workload API) are
+out of scope for now.

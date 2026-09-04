@@ -1,15 +1,22 @@
 package api
 
 import (
+	"crypto/x509"
+	"log/slog"
 	internalacme "mint-ca/internal/acme"
 	"mint-ca/internal/ratelimit"
 	"net/http"
+	"os"
 
 	"mint-ca/internal/api/handlers"
 	apimiddleware "mint-ca/internal/api/middleware"
+	"mint-ca/internal/attestation"
+	"mint-ca/internal/attestation/tpm2"
+	"mint-ca/internal/attestation/webauthn"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
+	"mint-ca/internal/events"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
@@ -32,6 +39,7 @@ func BuildRouter(
 	policyEngine *policy.Engine,
 	rlEngine *ratelimit.Engine,
 	sshKRLMgr *krl.Manager,
+	elector apimiddleware.LeaderChecker,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -51,6 +59,7 @@ func BuildRouter(
 
 	r.Group(func(r chi.Router) {
 		handlers.NewPKIHandler(crlMgr, ocspResponder, caEngine, store).RegisterRoutes(r)
+		handlers.NewSCEPHandler(caEngine, store, cfg.SCEP).RegisterRoutes(r)
 		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterPublicRoutes(r)
 		r.Get(setup.TermsPath, func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -59,21 +68,27 @@ func BuildRouter(
 	})
 
 	r.Group(func(r chi.Router) {
+		r.Use(apimiddleware.RequireLeader(elector))
 		r.Use(apimiddleware.Auth(store))
 		r.Use(apimiddleware.RateLimit(rlEngine, store))
 		r.Use(apimiddleware.Audit(store))
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
 		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterRoutes(r)
-		handlers.NewCertHandler(caEngine, policyEngine, store).RegisterRoutes(r)
+		var emitter events.Emitter = events.NoopEmitter{}
+		if cfg.Events.WebhookURL != "" {
+			emitter = events.NewWebhookEmitter(cfg.Events.WebhookURL)
+		}
+		handlers.NewCertHandler(caEngine, policyEngine, store, emitter, buildAttestationRegistry(cfg.Attestation)).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
 		handlers.NewPolicyHandler(store).RegisterRoutes(r)
 		handlers.NewProfileHandler(store).RegisterRoutes(r)
 		handlers.NewApprovalHandler(store).RegisterRoutes(r)
+		handlers.NewRenewalHandler(store, cfg.Renewal).RegisterRoutes(r)
 		handlers.NewEABHandler(store).RegisterRoutes(r)
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
-		handlers.NewMetricsHandler(store).RegisterRoutes(r)
+		handlers.NewMetricsHandler(store, cfg.Renewal).RegisterRoutes(r)
 	})
 
 	if cfg.ACME.Enabled {
@@ -83,7 +98,10 @@ func BuildRouter(
 			internalacme.SplitBypassLabels(cfg.ACME.CAABypassLabels),
 		)
 		acmeSvc := internalacme.NewService(store, caEngine, internalacme.NewNonceManager(store, 0), crlMgr, caaChecker, cfg.ACME.BaseURL)
-		handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
+		r.Group(func(r chi.Router) {
+			r.Use(apimiddleware.RequireLeader(elector))
+			handlers.NewACMEHandler(store, caEngine, acmeSvc, cfg.ACME, rlEngine).RegisterRoutes(r) // rlEngine passed through
+		})
 	}
 
 	return r
@@ -127,4 +145,27 @@ func BuildSetupRouter(
 	})
 
 	return r
+}
+
+// buildAttestationRegistry wires up the built-in attestation verifiers (see
+// internal/attestation). Attestation itself is opt-in per request, so both
+// are always registered; cfg only narrows what the TPM2 verifier accepts.
+func buildAttestationRegistry(cfg config.AttestationConfig) *attestation.Registry {
+	reg := attestation.NewRegistry()
+
+	var roots *x509.CertPool
+	if cfg.TPMRootsFile != "" {
+		pemBytes, err := os.ReadFile(cfg.TPMRootsFile)
+		if err != nil {
+			slog.Warn("attestation: failed to read TPM roots file, EK certificates will not be chain-verified", "file", cfg.TPMRootsFile, "err", err)
+		} else {
+			roots = x509.NewCertPool()
+			if !roots.AppendCertsFromPEM(pemBytes) {
+				slog.Warn("attestation: TPM roots file contained no usable certificates", "file", cfg.TPMRootsFile)
+			}
+		}
+	}
+	reg.Register(tpm2.New(roots))
+	reg.Register(webauthn.New())
+	return reg
 }
