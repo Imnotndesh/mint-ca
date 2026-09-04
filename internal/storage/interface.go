@@ -134,6 +134,9 @@ type SANs struct {
 	DNS   []string `json:"dns,omitempty"`
 	IP    []string `json:"ip,omitempty"`
 	Email []string `json:"email,omitempty"`
+	// URI holds URI SAN values, notably SPIFFE IDs (spiffe://trust-domain/path)
+	// for issuing X.509-SVIDs (see internal/spiffe).
+	URI []string `json:"uri,omitempty"`
 }
 
 // CertificateAuthority represents a root or intermediate CA stored in mint-ca.

@@ -152,6 +152,8 @@ Generate a new key pair and issue a certificate.
   "profile": "web",                 // optional: enforce a named certificate profile
   "store_key": false,                 // optional: escrow the generated key for later retrieval
   "key_passcode": "",                // optional: passcode-guard the escrowed key
+  "sans_uri": [],                    // optional: arbitrary URI SANs
+  "spiffe_id": "spiffe://example.org/ns/default/sa/backend",  // optional: see 1.21
   "metadata": { "environment": "prod" }
 }
 ```
@@ -269,17 +271,25 @@ Download a tar.gz bundle of a certificate: `cert.pem`, `chain.pem`
 | Param | Description |
 |-------|-------------|
 | `passcode` | Required to include `key.pem` when the key is passcode‑protected. |
-| `format` | Set to `p12` to instead download a password‑protected PKCS#12 (`.p12`) file (see below). |
+| `format` | `p12` for a password‑protected PKCS#12 file, or `jks` for a Java KeyStore (see below). |
 
 With `?format=p12`, the response is a single `.p12`/`.pfx` file containing the
 leaf certificate, its private key, and its CA chain — for consumers that
-expect one self‑contained keystore file (Windows certificate stores, Java
-keystores, network appliances) rather than separate PEM parts. Requires an
-escrowed key: pass `passcode` if the key is passcode‑protected. Additional
-query parameters:
+expect one self‑contained keystore file (Windows certificate stores, network
+appliances) rather than separate PEM parts. Requires an escrowed key: pass
+`passcode` if the key is passcode‑protected. Additional query parameters:
 | Param | Description |
 |-------|-------------|
 | `p12_password` | Password protecting the `.p12` file itself. Default: `changeit`. |
+
+With `?format=jks`, the response is a Java KeyStore (`.jks`) file — for JVM
+consumers (Java/Kotlin services, Android, Java-based network appliances) that
+specifically expect a JKS rather than a PKCS#12 file. Same key/passcode
+requirement as `p12`. Additional query parameters:
+| Param | Description |
+|-------|-------------|
+| `jks_password` | Password protecting the `.jks` file itself. Default: `changeit`. |
+| `jks_alias` | Alias the private-key entry is stored under. Default: `mint-ca`. |
 
 ### Auto‑renewal webhook (background, not request/response)
 When `MINT_RENEWAL_ENABLED` and `MINT_RENEWAL_WEBHOOK_URL` are set, a background
@@ -534,6 +544,40 @@ List audit entries (most recent first).
 
 ### `GET /api/v1/audit/ca/{caID}`
 Same as above, filtered by CA.
+
+### `GET /api/v1/audit/merkle/root`
+Returns the current Merkle Tree Head over the audit log's hash chain — an
+RFC 6962 (Certificate Transparency)-style commitment, layered on top of the
+hash chain in 1.7. Useful as a value to pin and compare over time: if the
+root ever changes in a way not explained by new entries appended at the end,
+the log was tampered with.
+
+**Response (200 OK)**
+```json
+{ "root_hash": "3f...c2", "size": 1234 }
+```
+
+### `GET /api/v1/audit/merkle/proof/{index}`
+Returns an inclusion proof for the audit log entry at `{index}` (0-based,
+chronological — the same order `verify` walks), against the current tree —
+"prove this specific entry was recorded, without downloading the whole log."
+
+**Response (200 OK)**
+```json
+{
+  "index": 4,
+  "size": 9,
+  "entry_id": "550e8400-e29b-41d4-a716-446655440000",
+  "entry_hash": "a1...9f",
+  "proof": ["b2...", "c3...", "d4..."],
+  "root_hash": "3f...c2"
+}
+```
+`404` if `index >= size`. A verifier recomputes the root from `entry_hash`,
+`index`, `size`, and `proof` (RFC 6962 §2.1.1 audit path verification, with
+0x00/0x01 domain-separated leaf/node hashing) and compares it to a
+previously-pinned `root_hash` — no trust in mint-ca's own answer required for
+`ok: true`, only that it matches a root the verifier already trusts.
 
 ### `GET /api/v1/audit/verify`
 Walks the entire audit log's hash chain, oldest first, and reports whether it
@@ -1089,3 +1133,26 @@ an `x5c` attestation certificate, or self-attestation using the credential's
 own key) and `none` (binding check only, no attestation signature — lower
 assurance). Other formats (`android-key`, `android-safetynet`, `fido-u2f`,
 `tpm`) return an explicit "unsupported" error rather than a false pass.
+
+## 1.21 SPIFFE-Style X.509-SVIDs
+
+`POST /api/v1/certs/issue` can embed a [SPIFFE ID](https://github.com/spiffe/spiffe)
+as a URI SAN, turning the issued leaf into an X.509-SVID consumable by
+SPIFFE-aware service-mesh/workload tooling (Envoy, Istio, SPIRE-adjacent
+stacks) — no SPIFFE-specific protocol support is needed on mint-ca's side,
+since an X.509-SVID is just an ordinary certificate with a `spiffe://` URI SAN.
+
+- `"spiffe_id"` — a convenience field: the value is validated (scheme
+  `spiffe`, non-empty lowercase trust domain, no userinfo/query/fragment, at
+  most 2048 bytes) and added as a URI SAN. Invalid IDs are refused with `400`.
+- `"sans_uri"` — a general list of URI SAN values. Any entry starting with
+  `spiffe://` is validated the same way as `spiffe_id`; other URI schemes are
+  parsed but not otherwise restricted.
+
+`POST /api/v1/certs/sign` and `POST /api/v1/certs/batch/sign` don't take a
+`spiffe_id` field — any URI SANs (including `spiffe://` ones) already present
+in the submitted CSR are carried through unmodified, the same way DNS/IP/
+email SANs are.
+
+Only X.509-SVIDs are supported; JWT-SVIDs (and the SPIFFE Workload API) are
+out of scope for now.

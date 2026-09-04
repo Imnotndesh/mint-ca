@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"time"
 
 	"mint-ca/internal/audit"
@@ -30,6 +31,8 @@ func (h *AuditHandler) RegisterRoutes(r chi.Router) {
 		r.Get("/", h.list)
 		r.Get("/ca/{caID}", h.listByCA)
 		r.Get("/verify", h.verify)
+		r.Get("/merkle/root", h.merkleRoot)
+		r.Get("/merkle/proof/{index}", h.merkleProof)
 	})
 }
 
@@ -80,6 +83,81 @@ func (h *AuditHandler) verify(w http.ResponseWriter, r *http.Request) {
 		resp["broken_entry_id"] = logs[brokenAt].ID
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// merkleRoot returns the current Merkle tree head over the audit log's
+// hash chain (see internal/audit), CT-log style: a public commitment
+// callers can pin and compare over time.
+func (h *AuditHandler) merkleRoot(w http.ResponseWriter, r *http.Request) {
+	s, ok := h.store.(auditChainStore)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "store does not support audit chain verification")
+		return
+	}
+	logs, err := s.ListAuditLogsChronological(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	tree, err := audit.NewMerkleTree(entryHashesOf(logs))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"root_hash": tree.RootHash(),
+		"size":      tree.Size(),
+	})
+}
+
+// merkleProof returns an inclusion proof for the audit log entry at the
+// given (0-based, chronological) index, against the current tree.
+func (h *AuditHandler) merkleProof(w http.ResponseWriter, r *http.Request) {
+	index, err := strconv.Atoi(chi.URLParam(r, "index"))
+	if err != nil || index < 0 {
+		writeError(w, http.StatusBadRequest, "invalid index")
+		return
+	}
+	s, ok := h.store.(auditChainStore)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "store does not support audit chain verification")
+		return
+	}
+	logs, err := s.ListAuditLogsChronological(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if index >= len(logs) {
+		writeError(w, http.StatusNotFound, "index out of range")
+		return
+	}
+	tree, err := audit.NewMerkleTree(entryHashesOf(logs))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	proof, err := tree.InclusionProof(index)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"index":      index,
+		"size":       tree.Size(),
+		"entry_id":   logs[index].ID,
+		"entry_hash": logs[index].EntryHash,
+		"proof":      proof,
+		"root_hash":  tree.RootHash(),
+	})
+}
+
+func entryHashesOf(logs []*storage.AuditLog) []string {
+	out := make([]string, len(logs))
+	for i, l := range logs {
+		out[i] = l.EntryHash
+	}
+	return out
 }
 
 func (h *AuditHandler) list(w http.ResponseWriter, r *http.Request) {

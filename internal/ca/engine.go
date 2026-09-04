@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -453,13 +454,18 @@ func applyCertPoliciesToTemplate(template *x509.Certificate, oids []string, cpsU
 // the keypair for and sign. The private key is returned to the caller once and
 // never stored.
 type IssueCertRequest struct {
-	CAID             uuid.UUID
-	ProvisionerID    uuid.UUID
-	Requester        string
-	CommonName       string
-	SANsDNS          []string
-	SANsIP           []net.IP
-	SANsEmail        []string
+	CAID          uuid.UUID
+	ProvisionerID uuid.UUID
+	Requester     string
+	CommonName    string
+	SANsDNS       []string
+	SANsIP        []net.IP
+	SANsEmail     []string
+	// SANsURI holds URI SAN values, notably a SPIFFE ID
+	// (spiffe://trust-domain/path) for issuing an X.509-SVID — see
+	// internal/spiffe. Callers are responsible for validating each URI
+	// before passing it here; the engine does not restrict URI schemes.
+	SANsURI          []*url.URL
 	KeyUsage         x509.KeyUsage
 	ExtKeyUsage      []x509.ExtKeyUsage
 	TTLSeconds       int64
@@ -1152,6 +1158,7 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 		DNSNames:              req.SANsDNS,
 		IPAddresses:           req.SANsIP,
 		EmailAddresses:        req.SANsEmail,
+		URIs:                  req.SANsURI,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 		SubjectKeyId:          ski,
@@ -1199,12 +1206,16 @@ func (e *Engine) IssueCert(ctx context.Context, req IssueCertRequest) (*IssuedCe
 	for i, ip := range req.SANsIP {
 		ipStrings[i] = ip.String()
 	}
+	uriStrings := make([]string, len(req.SANsURI))
+	for i, u := range req.SANsURI {
+		uriStrings[i] = u.String()
+	}
 	record := &storage.Certificate{
 		ID:            uuid.New(),
 		CAID:          req.CAID,
 		Serial:        serial.String(),
 		SubjectCN:     req.CommonName,
-		SANs:          storage.SANs{DNS: req.SANsDNS, IP: ipStrings, Email: req.SANsEmail},
+		SANs:          storage.SANs{DNS: req.SANsDNS, IP: ipStrings, Email: req.SANsEmail, URI: uriStrings},
 		KeyUsage:      keyUsageStrings(req.KeyUsage, req.ExtKeyUsage),
 		CertPEM:       string(certPEM),
 		Status:        storage.CertStatusActive,
@@ -1300,6 +1311,7 @@ func (e *Engine) SignCSR(ctx context.Context, req SignCSRRequest) (*IssuedCertif
 		DNSNames:              csr.DNSNames,
 		IPAddresses:           csr.IPAddresses,
 		EmailAddresses:        csr.EmailAddresses,
+		URIs:                  csr.URIs,
 		BasicConstraintsValid: true,
 		IsCA:                  false,
 		SubjectKeyId:          ski,
@@ -1327,12 +1339,16 @@ func (e *Engine) SignCSR(ctx context.Context, req SignCSRRequest) (*IssuedCertif
 		ipStrings[i] = ip.String()
 	}
 
+	csrURIStrings := make([]string, len(csr.URIs))
+	for i, u := range csr.URIs {
+		csrURIStrings[i] = u.String()
+	}
 	record := &storage.Certificate{
 		ID:            uuid.New(),
 		CAID:          req.CAID,
 		Serial:        serial.String(),
 		SubjectCN:     csr.Subject.CommonName,
-		SANs:          storage.SANs{DNS: csr.DNSNames, IP: ipStrings, Email: csr.EmailAddresses},
+		SANs:          storage.SANs{DNS: csr.DNSNames, IP: ipStrings, Email: csr.EmailAddresses, URI: csrURIStrings},
 		KeyUsage:      []string{"digital_signature", "key_encipherment", "server_auth", "client_auth"},
 		CertPEM:       string(certPEM),
 		Status:        storage.CertStatusActive,

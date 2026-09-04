@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strings"
 
 	gox509 "crypto/x509"
 	"encoding/base64"
@@ -16,6 +18,7 @@ import (
 	"mint-ca/internal/ca"
 	"mint-ca/internal/events"
 	"mint-ca/internal/policy"
+	"mint-ca/internal/spiffe"
 	"mint-ca/internal/storage"
 
 	"github.com/go-chi/chi/v5"
@@ -202,6 +205,11 @@ type issueCertRequest struct {
 	// Profile optionally names a certificate profile to enforce against this
 	// issuance. Resolved by name and evaluated with policy.EvaluateProfile.
 	Profile string `json:"profile"`
+	// SANsURI adds arbitrary URI SAN values. SpiffeID is a convenience for
+	// the common case: it's validated (see internal/spiffe) and appended
+	// here automatically, so callers don't need to duplicate it.
+	SANsURI  []string `json:"sans_uri"`
+	SpiffeID string   `json:"spiffe_id"`
 }
 
 func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +238,33 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ips = append(ips, ip)
+	}
+
+	uris := make([]*url.URL, 0, len(req.SANsURI)+1)
+	for _, v := range req.SANsURI {
+		if strings.HasPrefix(v, "spiffe://") {
+			u, err := spiffe.ValidateID(v)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			uris = append(uris, u)
+			continue
+		}
+		u, err := url.Parse(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid URI in sans_uri: "+v)
+			return
+		}
+		uris = append(uris, u)
+	}
+	if req.SpiffeID != "" {
+		u, err := spiffe.ValidateID(req.SpiffeID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		uris = append(uris, u)
 	}
 
 	algo := req.KeyAlgo
@@ -304,6 +339,7 @@ func (h *CertHandler) issue(w http.ResponseWriter, r *http.Request) {
 		SANsDNS:          req.SANsDNS,
 		SANsIP:           ips,
 		SANsEmail:        req.SANsEmail,
+		SANsURI:          uris,
 		TTLSeconds:       req.TTLSeconds,
 		KeyAlgo:          ca.KeyAlgo(algo),
 		KeyUsage:         ku,
@@ -569,6 +605,32 @@ func (h *CertHandler) export(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/x-pkcs12")
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".p12\"")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		return
+	}
+
+	if r.URL.Query().Get("format") == "jks" {
+		chainPEM, err := h.engine.GetLeafChainPEM(r.Context(), cert.CAID, []byte(cert.CertPEM))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		password := r.URL.Query().Get("jks_password")
+		if password == "" {
+			password = pkcs12DefaultPassword
+		}
+		alias := r.URL.Query().Get("jks_alias")
+		if alias == "" {
+			alias = "mint-ca"
+		}
+		data, err := exportJKS([]byte(cert.CertPEM), chainPEM, keyPEM, password, alias)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-java-keystore")
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+cert.Serial+".jks\"")
 		w.WriteHeader(http.StatusOK)
 		w.Write(data)
 		return

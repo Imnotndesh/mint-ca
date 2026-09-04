@@ -16,6 +16,7 @@ import (
 	"mint-ca/internal/ca"
 	"mint-ca/internal/storage"
 
+	"github.com/pavlo-v-chernykh/keystore-go/v4"
 	"software.sslmate.com/src/go-pkcs12"
 )
 
@@ -116,6 +117,60 @@ func exportP12(certPEM, chainPEM, keyPEM []byte, password string) ([]byte, error
 		return nil, fmt.Errorf("export: pkcs12 encode: %w", err)
 	}
 	return data, nil
+}
+
+// exportJKS bundles a leaf certificate, its private key, and its CA chain
+// into a password-protected Java KeyStore (.jks) file, for JVM consumers
+// (Java/Kotlin services, Android, Java-based network appliances) that expect
+// a JKS rather than a PKCS#12 file. The private key is stored PKCS#8-encoded,
+// as JKS requires. alias names the entry within the keystore.
+func exportJKS(certPEM, chainPEM, keyPEM []byte, password, alias string) ([]byte, error) {
+	if len(keyPEM) == 0 {
+		return nil, errors.New("export: jks export requires an escrowed key with a valid passcode")
+	}
+	leaf, err := parseCertPEM(certPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse leaf cert: %w", err)
+	}
+	chain, err := parseCertChainPEM(chainPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse chain: %w", err)
+	}
+	key, err := parseKeyPEM(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("export: parse key: %w", err)
+	}
+	pkcs8DER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return nil, fmt.Errorf("export: marshal PKCS8 key: %w", err)
+	}
+
+	// chain is leaf-first (see GetLeafChainPEM); ensure the leaf itself heads
+	// the certificate chain entry even if certPEM/chainPEM disagree on order.
+	certChain := make([]keystore.Certificate, 0, len(chain)+1)
+	certChain = append(certChain, keystore.Certificate{Type: "X509", Content: leaf.Raw})
+	for _, c := range chain {
+		if c.Equal(leaf) {
+			continue
+		}
+		certChain = append(certChain, keystore.Certificate{Type: "X509", Content: c.Raw})
+	}
+
+	ks := keystore.New()
+	entry := keystore.PrivateKeyEntry{
+		CreationTime:     time.Now(),
+		PrivateKey:       pkcs8DER,
+		CertificateChain: certChain,
+	}
+	if err := ks.SetPrivateKeyEntry(alias, entry, []byte(password)); err != nil {
+		return nil, fmt.Errorf("export: set private key entry: %w", err)
+	}
+
+	var buf bytes.Buffer
+	if err := ks.Store(&buf, []byte(password)); err != nil {
+		return nil, fmt.Errorf("export: store JKS: %w", err)
+	}
+	return buf.Bytes(), nil
 }
 
 // parseCertPEM decodes the first certificate in a PEM block.
