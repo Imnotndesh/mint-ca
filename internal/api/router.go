@@ -17,6 +17,7 @@ import (
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
 	"mint-ca/internal/events"
+	"mint-ca/internal/notify"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
@@ -40,6 +41,7 @@ func BuildRouter(
 	rlEngine *ratelimit.Engine,
 	sshKRLMgr *krl.Manager,
 	elector apimiddleware.LeaderChecker,
+	notifyMgr *notify.Manager,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -80,9 +82,16 @@ func BuildRouter(
 
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
 		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterRoutes(r)
-		var emitter events.Emitter = events.NoopEmitter{}
+		var emitters events.MultiEmitter
 		if cfg.Events.WebhookURL != "" {
-			emitter = events.NewWebhookEmitter(cfg.Events.WebhookURL)
+			emitters = append(emitters, events.NewWebhookEmitter(cfg.Events.WebhookURL))
+		}
+		if notifyMgr != nil {
+			emitters = append(emitters, notify.EventEmitter{Manager: notifyMgr})
+		}
+		var emitter events.Emitter = events.NoopEmitter{}
+		if len(emitters) > 0 {
+			emitter = emitters
 		}
 		handlers.NewCertHandler(caEngine, policyEngine, store, emitter, buildAttestationRegistry(cfg.Attestation)).RegisterRoutes(r)
 		handlers.NewProvisionerHandler(store).RegisterRoutes(r)
@@ -94,6 +103,7 @@ func BuildRouter(
 		handlers.NewAPIKeyHandler(store).RegisterRoutes(r)
 		handlers.NewTenantHandler(store).RegisterRoutes(r)
 		handlers.NewSettingsHandler(store, rlEngine).RegisterRoutes(r)
+		handlers.NewNotificationHandler(store, notifyMgr).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
 		handlers.NewSystemHandler(store, elector).RegisterRoutes(r)
 		handlers.NewMetricsHandler(store, cfg.Renewal).RegisterRoutes(r)

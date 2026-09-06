@@ -557,6 +557,31 @@ CREATE TABLE IF NOT EXISTS rate_limit_counters (
 CREATE INDEX IF NOT EXISTS idx_rl_counters_window_start ON rate_limit_counters(window_start);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_ssh_certs_ca_serial ON ssh_certificates(ca_id, serial);
 
+CREATE TABLE IF NOT EXISTS smtp_servers (
+    id           TEXT NOT NULL PRIMARY KEY,
+    name         TEXT NOT NULL UNIQUE,
+    host         TEXT NOT NULL,
+    port         INTEGER NOT NULL,
+    username     TEXT NOT NULL DEFAULT '',
+    password_enc BLOB,
+    from_address TEXT NOT NULL,
+    from_name    TEXT NOT NULL DEFAULT '',
+    security     TEXT NOT NULL DEFAULT 'starttls',
+    skip_verify  INTEGER NOT NULL DEFAULT 0,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    is_default   INTEGER NOT NULL DEFAULT 0,
+    created_at   DATETIME NOT NULL,
+    updated_at   DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_rules (
+    category       TEXT NOT NULL PRIMARY KEY,
+    enabled        INTEGER NOT NULL DEFAULT 0,
+    smtp_server_id TEXT REFERENCES smtp_servers(id) ON DELETE SET NULL,
+    recipients     TEXT NOT NULL DEFAULT '[]',
+    updated_at     DATETIME NOT NULL
+);
+
 `
 
 func marshalJSON(v interface{}) (string, error) {
@@ -2901,4 +2926,228 @@ func (s *sqliteStore) PruneExpiredNonces(ctx context.Context) error {
 		return fmt.Errorf("sqlite: PruneExpiredNonces: %w", err)
 	}
 	return nil
+}
+
+func (s *sqliteStore) CreateSMTPServer(ctx context.Context, srv *SMTPServer) error {
+	skipVerify, enabled, isDefault := boolToInt(srv.SkipVerify), boolToInt(srv.Enabled), boolToInt(srv.IsDefault)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO smtp_servers
+			(id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		srv.ID.String(), srv.Name, srv.Host, srv.Port, srv.Username, srv.PasswordEnc, srv.FromAddress, srv.FromName,
+		string(srv.Security), skipVerify, enabled, isDefault, srv.CreatedAt.UTC(), srv.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateSMTPServer: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetSMTPServer(ctx context.Context, id uuid.UUID) (*SMTPServer, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at
+		FROM smtp_servers WHERE id = ?`, id.String())
+	srv, err := scanSMTPServer(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetSMTPServer: %w", err)
+	}
+	return srv, nil
+}
+
+func (s *sqliteStore) ListSMTPServers(ctx context.Context) ([]*SMTPServer, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at
+		FROM smtp_servers ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListSMTPServers: %w", err)
+	}
+	defer rows.Close()
+	var out []*SMTPServer
+	for rows.Next() {
+		srv, err := scanSMTPServerRows(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: ListSMTPServers: %w", err)
+		}
+		out = append(out, srv)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpdateSMTPServer(ctx context.Context, srv *SMTPServer) error {
+	skipVerify, enabled := boolToInt(srv.SkipVerify), boolToInt(srv.Enabled)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE smtp_servers SET
+			name = ?, host = ?, port = ?, username = ?, password_enc = ?, from_address = ?, from_name = ?,
+			security = ?, skip_verify = ?, enabled = ?, updated_at = ?
+		WHERE id = ?`,
+		srv.Name, srv.Host, srv.Port, srv.Username, srv.PasswordEnc, srv.FromAddress, srv.FromName,
+		string(srv.Security), skipVerify, enabled, srv.UpdatedAt.UTC(), srv.ID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateSMTPServer: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateSMTPServer: %q not found", srv.ID)
+	}
+	return nil
+}
+
+func (s *sqliteStore) DeleteSMTPServer(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM smtp_servers WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: DeleteSMTPServer: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) SetDefaultSMTPServer(ctx context.Context, id uuid.UUID) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: SetDefaultSMTPServer: begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE smtp_servers SET is_default = 0`); err != nil {
+		return fmt.Errorf("sqlite: SetDefaultSMTPServer: clear: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE smtp_servers SET is_default = 1 WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: SetDefaultSMTPServer: set: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: SetDefaultSMTPServer: %q not found", id)
+	}
+	return tx.Commit()
+}
+
+func (s *sqliteStore) GetDefaultSMTPServer(ctx context.Context) (*SMTPServer, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at
+		FROM smtp_servers WHERE is_default = 1 LIMIT 1`)
+	srv, err := scanSMTPServer(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetDefaultSMTPServer: %w", err)
+	}
+	return srv, nil
+}
+
+type sqlScannable interface {
+	Scan(dest ...interface{}) error
+}
+
+func scanSMTPServer(row *sql.Row) (*SMTPServer, error) {
+	return scanSMTPServerScannable(row)
+}
+
+func scanSMTPServerRows(rows *sql.Rows) (*SMTPServer, error) {
+	return scanSMTPServerScannable(rows)
+}
+
+func scanSMTPServerScannable(row sqlScannable) (*SMTPServer, error) {
+	var srv SMTPServer
+	var idStr, security string
+	var skipVerify, enabled, isDefault int
+	err := row.Scan(&idStr, &srv.Name, &srv.Host, &srv.Port, &srv.Username, &srv.PasswordEnc,
+		&srv.FromAddress, &srv.FromName, &security, &skipVerify, &enabled, &isDefault,
+		&srv.CreatedAt, &srv.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	srv.ID = uuid.MustParse(idStr)
+	srv.Security = SMTPSecurityMode(security)
+	srv.SkipVerify = skipVerify == 1
+	srv.Enabled = enabled == 1
+	srv.IsDefault = isDefault == 1
+	return &srv, nil
+}
+
+func (s *sqliteStore) GetNotificationRule(ctx context.Context, category string) (*NotificationRule, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT category, enabled, smtp_server_id, recipients, updated_at
+		FROM notification_rules WHERE category = ?`, category)
+	rule, err := scanNotificationRule(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetNotificationRule: %w", err)
+	}
+	return rule, nil
+}
+
+func (s *sqliteStore) ListNotificationRules(ctx context.Context) ([]*NotificationRule, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT category, enabled, smtp_server_id, recipients, updated_at
+		FROM notification_rules ORDER BY category ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListNotificationRules: %w", err)
+	}
+	defer rows.Close()
+	var out []*NotificationRule
+	for rows.Next() {
+		rule, err := scanNotificationRuleScannable(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: ListNotificationRules: %w", err)
+		}
+		out = append(out, rule)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpsertNotificationRule(ctx context.Context, rule *NotificationRule) error {
+	recipients, err := marshalStringSlice(rule.Recipients)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpsertNotificationRule: marshal recipients: %w", err)
+	}
+	var smtpID *string
+	if rule.SMTPServerID != nil {
+		v := rule.SMTPServerID.String()
+		smtpID = &v
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO notification_rules (category, enabled, smtp_server_id, recipients, updated_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(category) DO UPDATE SET
+			enabled = excluded.enabled, smtp_server_id = excluded.smtp_server_id,
+			recipients = excluded.recipients, updated_at = excluded.updated_at`,
+		rule.Category, boolToInt(rule.Enabled), smtpID, recipients, rule.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpsertNotificationRule: %w", err)
+	}
+	return nil
+}
+
+func scanNotificationRule(row *sql.Row) (*NotificationRule, error) {
+	return scanNotificationRuleScannable(row)
+}
+
+func scanNotificationRuleScannable(row sqlScannable) (*NotificationRule, error) {
+	var rule NotificationRule
+	var enabled int
+	var smtpID *string
+	var recipients string
+	err := row.Scan(&rule.Category, &enabled, &smtpID, &recipients, &rule.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rule.Enabled = enabled == 1
+	if smtpID != nil {
+		id := uuid.MustParse(*smtpID)
+		rule.SMTPServerID = &id
+	}
+	rule.Recipients, err = unmarshalStringSlice(recipients)
+	if err != nil {
+		return nil, err
+	}
+	return &rule, nil
+}
+
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
