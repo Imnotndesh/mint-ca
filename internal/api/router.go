@@ -66,6 +66,10 @@ func BuildRouter(
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			_, _ = w.Write([]byte(setup.DefaultTermsText))
 		})
+		// GET /setup/state must stay reachable once ready too — onboarding
+		// tooling (the web dashboard included) checks it on every boot to
+		// decide between the connect screen and the setup wizard.
+		setup.NewHandler(store, caEngine, cfg, nil).RegisterStateRoute(r)
 	})
 
 	r.Group(func(r chi.Router) {
