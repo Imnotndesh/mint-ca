@@ -47,15 +47,23 @@ func NewHandler(
 }
 
 func (h *Handler) RegisterRoutes(r chi.Router) {
-	// /setup/state is public (no bootstrap key) so onboarding tooling can
-	// detect where the server is in the setup state machine before it has a key.
-	r.Get("/setup/state", h.getState)
+	h.RegisterStateRoute(r)
 	r.Route("/setup", func(r chi.Router) {
 		r.Use(h.requireBootstrapKey)
 		r.Get("/terms", h.getTerms)
 		r.Post("/root-ca", h.createRootCA)
 		r.Post("/api-key", h.createAPIKey)
 	})
+}
+
+// RegisterStateRoute mounts only GET /setup/state — public (no bootstrap key)
+// so onboarding tooling (CLI, web dashboard) can always detect where the
+// server is in the setup state machine, whether it's still in setup or
+// already ready. Called both from RegisterRoutes (setup-mode router) and
+// directly from the ready-mode router, since the rest of /setup/* only
+// makes sense before the server is configured.
+func (h *Handler) RegisterStateRoute(r chi.Router) {
+	r.Get("/setup/state", h.getState)
 }
 
 // getState returns the machine-readable setup state so a CLI/web wizard can
