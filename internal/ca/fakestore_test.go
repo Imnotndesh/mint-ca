@@ -450,3 +450,44 @@ func (f *caFakeStore) IsKeyIDRetired(ctx context.Context, keyID string) (bool, e
 	caNotImplemented("IsKeyIDRetired")
 	return false, nil
 }
+
+func (f *caFakeStore) CreateSMTPServer(ctx context.Context, s *storage.SMTPServer) error {
+	caNotImplemented("CreateSMTPServer")
+	return nil
+}
+func (f *caFakeStore) GetSMTPServer(ctx context.Context, id uuid.UUID) (*storage.SMTPServer, error) {
+	caNotImplemented("GetSMTPServer")
+	return nil, nil
+}
+func (f *caFakeStore) ListSMTPServers(ctx context.Context) ([]*storage.SMTPServer, error) {
+	caNotImplemented("ListSMTPServers")
+	return nil, nil
+}
+func (f *caFakeStore) UpdateSMTPServer(ctx context.Context, s *storage.SMTPServer) error {
+	caNotImplemented("UpdateSMTPServer")
+	return nil
+}
+func (f *caFakeStore) DeleteSMTPServer(ctx context.Context, id uuid.UUID) error {
+	caNotImplemented("DeleteSMTPServer")
+	return nil
+}
+func (f *caFakeStore) SetDefaultSMTPServer(ctx context.Context, id uuid.UUID) error {
+	caNotImplemented("SetDefaultSMTPServer")
+	return nil
+}
+func (f *caFakeStore) GetDefaultSMTPServer(ctx context.Context) (*storage.SMTPServer, error) {
+	caNotImplemented("GetDefaultSMTPServer")
+	return nil, nil
+}
+func (f *caFakeStore) GetNotificationRule(ctx context.Context, category string) (*storage.NotificationRule, error) {
+	caNotImplemented("GetNotificationRule")
+	return nil, nil
+}
+func (f *caFakeStore) ListNotificationRules(ctx context.Context) ([]*storage.NotificationRule, error) {
+	caNotImplemented("ListNotificationRules")
+	return nil, nil
+}
+func (f *caFakeStore) UpsertNotificationRule(ctx context.Context, rule *storage.NotificationRule) error {
+	caNotImplemented("UpsertNotificationRule")
+	return nil
+}

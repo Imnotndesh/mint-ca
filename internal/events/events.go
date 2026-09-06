@@ -45,6 +45,16 @@ type NoopEmitter struct{}
 // Emit implements Emitter.
 func (NoopEmitter) Emit(Event) {}
 
+// MultiEmitter fans an event out to every configured emitter.
+type MultiEmitter []Emitter
+
+// Emit implements Emitter.
+func (m MultiEmitter) Emit(e Event) {
+	for _, em := range m {
+		em.Emit(e)
+	}
+}
+
 // WebhookEmitter POSTs each event as JSON to a configured URL, asynchronously
 // so callers are never blocked or failed by a slow/unreachable receiver.
 type WebhookEmitter struct {
