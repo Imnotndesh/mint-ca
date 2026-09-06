@@ -20,6 +20,7 @@ import (
 	"mint-ca/internal/config"
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/ha"
+	"mint-ca/internal/notify"
 	"mint-ca/internal/mtls"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/renewal"
@@ -74,6 +75,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	notifyMgr := notify.NewManager(store, ks)
+
 	caEngine := ca.NewEngine(store, ks, cfg.ACME.BaseURL)
 	policyEngine := policy.NewEngine(store)
 	sshcaEngine := sshca.NewEngine(store, ks, policyEngine)
@@ -104,10 +107,12 @@ func main() {
 	apiWorkers.Add(workers.NewSSHKRLWorker(sshKRLManager, cfg.CRL))
 	apiWorkers.Add(workers.NewRateLimitPruneWorker(store))
 	if cfg.Renewal.Enabled {
-		var deliverer renewal.Deliverer
+		var deliverers renewal.MultiDeliverer
 		if cfg.Renewal.WebhookURL != "" {
-			deliverer = renewal.NewWebhookDeliverer(cfg.Renewal.WebhookURL)
+			deliverers = append(deliverers, renewal.NewWebhookDeliverer(cfg.Renewal.WebhookURL))
 		}
+		deliverers = append(deliverers, notify.RenewalDeliverer{Manager: notifyMgr})
+		var deliverer renewal.Deliverer = deliverers
 		apiWorkers.Add(renewal.NewWorker(store, deliverer,
 			time.Duration(cfg.Renewal.IntervalSeconds)*time.Second,
 			time.Duration(cfg.Renewal.LeadSeconds)*time.Second))
@@ -152,7 +157,7 @@ func main() {
 		slog.Info("setup complete — starting full API")
 	}
 
-	readyRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, elector)
+	readyRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, elector, notifyMgr)
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)

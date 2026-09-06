@@ -734,3 +734,44 @@ func TestHandlers_SSHCA_RekeyAndCrossSign(t *testing.T) {
 		t.Error("cross-sign must share the target public key")
 	}
 }
+
+func (f *sshFakeStore) CreateSMTPServer(ctx context.Context, s *storage.SMTPServer) error {
+	sshNotImplemented("CreateSMTPServer")
+	return nil
+}
+func (f *sshFakeStore) GetSMTPServer(ctx context.Context, id uuid.UUID) (*storage.SMTPServer, error) {
+	sshNotImplemented("GetSMTPServer")
+	return nil, nil
+}
+func (f *sshFakeStore) ListSMTPServers(ctx context.Context) ([]*storage.SMTPServer, error) {
+	sshNotImplemented("ListSMTPServers")
+	return nil, nil
+}
+func (f *sshFakeStore) UpdateSMTPServer(ctx context.Context, s *storage.SMTPServer) error {
+	sshNotImplemented("UpdateSMTPServer")
+	return nil
+}
+func (f *sshFakeStore) DeleteSMTPServer(ctx context.Context, id uuid.UUID) error {
+	sshNotImplemented("DeleteSMTPServer")
+	return nil
+}
+func (f *sshFakeStore) SetDefaultSMTPServer(ctx context.Context, id uuid.UUID) error {
+	sshNotImplemented("SetDefaultSMTPServer")
+	return nil
+}
+func (f *sshFakeStore) GetDefaultSMTPServer(ctx context.Context) (*storage.SMTPServer, error) {
+	sshNotImplemented("GetDefaultSMTPServer")
+	return nil, nil
+}
+func (f *sshFakeStore) GetNotificationRule(ctx context.Context, category string) (*storage.NotificationRule, error) {
+	sshNotImplemented("GetNotificationRule")
+	return nil, nil
+}
+func (f *sshFakeStore) ListNotificationRules(ctx context.Context) ([]*storage.NotificationRule, error) {
+	sshNotImplemented("ListNotificationRules")
+	return nil, nil
+}
+func (f *sshFakeStore) UpsertNotificationRule(ctx context.Context, rule *storage.NotificationRule) error {
+	sshNotImplemented("UpsertNotificationRule")
+	return nil
+}

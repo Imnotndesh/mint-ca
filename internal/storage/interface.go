@@ -251,6 +251,39 @@ type RateLimitConfig struct {
 	Enabled       bool      `json:"enabled"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
+type SMTPSecurityMode string
+
+const (
+	SMTPSecurityNone     SMTPSecurityMode = "none"
+	SMTPSecurityStartTLS SMTPSecurityMode = "starttls"
+	SMTPSecurityTLS      SMTPSecurityMode = "tls"
+)
+
+type SMTPServer struct {
+	ID          uuid.UUID        `json:"id"`
+	Name        string           `json:"name"`
+	Host        string           `json:"host"`
+	Port        int              `json:"port"`
+	Username    string           `json:"username"`
+	PasswordEnc []byte           `json:"-"`
+	FromAddress string           `json:"from_address"`
+	FromName    string           `json:"from_name"`
+	Security    SMTPSecurityMode `json:"security"`
+	SkipVerify  bool             `json:"skip_verify"`
+	Enabled     bool             `json:"enabled"`
+	IsDefault   bool             `json:"is_default"`
+	CreatedAt   time.Time        `json:"created_at"`
+	UpdatedAt   time.Time        `json:"updated_at"`
+}
+
+type NotificationRule struct {
+	Category     string     `json:"category"`
+	Enabled      bool       `json:"enabled"`
+	SMTPServerID *uuid.UUID `json:"smtp_server_id,omitempty"`
+	Recipients   []string   `json:"recipients"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
 type ACMEAuthorizationStatus string
 
 const (
@@ -776,6 +809,19 @@ type Store interface {
 
 	// GetDeltaCRL returns the cached delta CRL for a CA, or (nil, nil).
 	GetDeltaCRL(ctx context.Context, caID uuid.UUID) (*DeltaCRLCache, error)
+
+	CreateSMTPServer(ctx context.Context, s *SMTPServer) error
+	GetSMTPServer(ctx context.Context, id uuid.UUID) (*SMTPServer, error)
+	ListSMTPServers(ctx context.Context) ([]*SMTPServer, error)
+	UpdateSMTPServer(ctx context.Context, s *SMTPServer) error
+	DeleteSMTPServer(ctx context.Context, id uuid.UUID) error
+	SetDefaultSMTPServer(ctx context.Context, id uuid.UUID) error
+	GetDefaultSMTPServer(ctx context.Context) (*SMTPServer, error)
+
+	GetNotificationRule(ctx context.Context, category string) (*NotificationRule, error)
+	ListNotificationRules(ctx context.Context) ([]*NotificationRule, error)
+	UpsertNotificationRule(ctx context.Context, rule *NotificationRule) error
+
 	// Close releases all connections held by the store.
 	Close() error
 }

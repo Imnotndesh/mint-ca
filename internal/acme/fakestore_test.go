@@ -667,3 +667,44 @@ func (f *fakeStore) ListAuthorizationsByAccount(ctx context.Context, accountID u
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt.After(out[j].CreatedAt) })
 	return out, nil
 }
+
+func (f *fakeStore) CreateSMTPServer(ctx context.Context, s *storage.SMTPServer) error {
+	notImplemented("CreateSMTPServer")
+	return nil
+}
+func (f *fakeStore) GetSMTPServer(ctx context.Context, id uuid.UUID) (*storage.SMTPServer, error) {
+	notImplemented("GetSMTPServer")
+	return nil, nil
+}
+func (f *fakeStore) ListSMTPServers(ctx context.Context) ([]*storage.SMTPServer, error) {
+	notImplemented("ListSMTPServers")
+	return nil, nil
+}
+func (f *fakeStore) UpdateSMTPServer(ctx context.Context, s *storage.SMTPServer) error {
+	notImplemented("UpdateSMTPServer")
+	return nil
+}
+func (f *fakeStore) DeleteSMTPServer(ctx context.Context, id uuid.UUID) error {
+	notImplemented("DeleteSMTPServer")
+	return nil
+}
+func (f *fakeStore) SetDefaultSMTPServer(ctx context.Context, id uuid.UUID) error {
+	notImplemented("SetDefaultSMTPServer")
+	return nil
+}
+func (f *fakeStore) GetDefaultSMTPServer(ctx context.Context) (*storage.SMTPServer, error) {
+	notImplemented("GetDefaultSMTPServer")
+	return nil, nil
+}
+func (f *fakeStore) GetNotificationRule(ctx context.Context, category string) (*storage.NotificationRule, error) {
+	notImplemented("GetNotificationRule")
+	return nil, nil
+}
+func (f *fakeStore) ListNotificationRules(ctx context.Context) ([]*storage.NotificationRule, error) {
+	notImplemented("ListNotificationRules")
+	return nil, nil
+}
+func (f *fakeStore) UpsertNotificationRule(ctx context.Context, rule *storage.NotificationRule) error {
+	notImplemented("UpsertNotificationRule")
+	return nil
+}

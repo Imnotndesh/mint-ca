@@ -436,6 +436,31 @@ CREATE TABLE IF NOT EXISTS rate_limit_counters (
 );
 CREATE INDEX IF NOT EXISTS idx_pg_rl_counters_window_start ON rate_limit_counters(window_start);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_pg_ssh_certs_ca_serial ON ssh_certificates(ca_id, serial);
+
+CREATE TABLE IF NOT EXISTS smtp_servers (
+    id           TEXT        NOT NULL PRIMARY KEY,
+    name         TEXT        NOT NULL UNIQUE,
+    host         TEXT        NOT NULL,
+    port         INTEGER     NOT NULL,
+    username     TEXT        NOT NULL DEFAULT '',
+    password_enc BYTEA,
+    from_address TEXT        NOT NULL,
+    from_name    TEXT        NOT NULL DEFAULT '',
+    security     TEXT        NOT NULL DEFAULT 'starttls',
+    skip_verify  BOOLEAN     NOT NULL DEFAULT FALSE,
+    enabled      BOOLEAN     NOT NULL DEFAULT TRUE,
+    is_default   BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at   TIMESTAMPTZ NOT NULL,
+    updated_at   TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notification_rules (
+    category       TEXT        NOT NULL PRIMARY KEY,
+    enabled        BOOLEAN     NOT NULL DEFAULT FALSE,
+    smtp_server_id TEXT        REFERENCES smtp_servers(id) ON DELETE SET NULL,
+    recipients     TEXT        NOT NULL DEFAULT '[]',
+    updated_at     TIMESTAMPTZ NOT NULL
+);
 `
 
 func pgMarshalJSON(v interface{}) (string, error) {
@@ -2663,4 +2688,201 @@ func (s *postgresStore) PruneExpiredNonces(ctx context.Context) error {
 		return fmt.Errorf("postgres: PruneExpiredNonces: %w", err)
 	}
 	return nil
+}
+
+func (s *postgresStore) CreateSMTPServer(ctx context.Context, srv *SMTPServer) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO smtp_servers
+			(id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		srv.ID.String(), srv.Name, srv.Host, srv.Port, srv.Username, srv.PasswordEnc, srv.FromAddress, srv.FromName,
+		string(srv.Security), srv.SkipVerify, srv.Enabled, srv.IsDefault, srv.CreatedAt.UTC(), srv.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateSMTPServer: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetSMTPServer(ctx context.Context, id uuid.UUID) (*SMTPServer, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at
+		FROM smtp_servers WHERE id = $1`, id.String())
+	srv, err := pgScanSMTPServer(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetSMTPServer: %w", err)
+	}
+	return srv, nil
+}
+
+func (s *postgresStore) ListSMTPServers(ctx context.Context) ([]*SMTPServer, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at
+		FROM smtp_servers ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListSMTPServers: %w", err)
+	}
+	defer rows.Close()
+	var out []*SMTPServer
+	for rows.Next() {
+		srv, err := pgScanSMTPServerScannable(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: ListSMTPServers: %w", err)
+		}
+		out = append(out, srv)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateSMTPServer(ctx context.Context, srv *SMTPServer) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE smtp_servers SET
+			name = $1, host = $2, port = $3, username = $4, password_enc = $5, from_address = $6, from_name = $7,
+			security = $8, skip_verify = $9, enabled = $10, updated_at = $11
+		WHERE id = $12`,
+		srv.Name, srv.Host, srv.Port, srv.Username, srv.PasswordEnc, srv.FromAddress, srv.FromName,
+		string(srv.Security), srv.SkipVerify, srv.Enabled, srv.UpdatedAt.UTC(), srv.ID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateSMTPServer: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: UpdateSMTPServer: %q not found", srv.ID)
+	}
+	return nil
+}
+
+func (s *postgresStore) DeleteSMTPServer(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM smtp_servers WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: DeleteSMTPServer: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) SetDefaultSMTPServer(ctx context.Context, id uuid.UUID) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: SetDefaultSMTPServer: begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE smtp_servers SET is_default = FALSE`); err != nil {
+		return fmt.Errorf("postgres: SetDefaultSMTPServer: clear: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE smtp_servers SET is_default = TRUE WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: SetDefaultSMTPServer: set: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: SetDefaultSMTPServer: %q not found", id)
+	}
+	return tx.Commit()
+}
+
+func (s *postgresStore) GetDefaultSMTPServer(ctx context.Context) (*SMTPServer, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, host, port, username, password_enc, from_address, from_name, security, skip_verify, enabled, is_default, created_at, updated_at
+		FROM smtp_servers WHERE is_default = TRUE LIMIT 1`)
+	srv, err := pgScanSMTPServer(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetDefaultSMTPServer: %w", err)
+	}
+	return srv, nil
+}
+
+type pgScannable interface {
+	Scan(dest ...interface{}) error
+}
+
+func pgScanSMTPServer(row *sql.Row) (*SMTPServer, error) {
+	return pgScanSMTPServerScannable(row)
+}
+
+func pgScanSMTPServerScannable(row pgScannable) (*SMTPServer, error) {
+	var srv SMTPServer
+	var idStr, security string
+	err := row.Scan(&idStr, &srv.Name, &srv.Host, &srv.Port, &srv.Username, &srv.PasswordEnc,
+		&srv.FromAddress, &srv.FromName, &security, &srv.SkipVerify, &srv.Enabled, &srv.IsDefault,
+		&srv.CreatedAt, &srv.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	srv.ID = uuid.MustParse(idStr)
+	srv.Security = SMTPSecurityMode(security)
+	return &srv, nil
+}
+
+func (s *postgresStore) GetNotificationRule(ctx context.Context, category string) (*NotificationRule, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT category, enabled, smtp_server_id, recipients, updated_at
+		FROM notification_rules WHERE category = $1`, category)
+	rule, err := pgScanNotificationRule(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetNotificationRule: %w", err)
+	}
+	return rule, nil
+}
+
+func (s *postgresStore) ListNotificationRules(ctx context.Context) ([]*NotificationRule, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT category, enabled, smtp_server_id, recipients, updated_at
+		FROM notification_rules ORDER BY category ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListNotificationRules: %w", err)
+	}
+	defer rows.Close()
+	var out []*NotificationRule
+	for rows.Next() {
+		rule, err := pgScanNotificationRuleScannable(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: ListNotificationRules: %w", err)
+		}
+		out = append(out, rule)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpsertNotificationRule(ctx context.Context, rule *NotificationRule) error {
+	recipients, err := pgMarshalStringSlice(rule.Recipients)
+	if err != nil {
+		return fmt.Errorf("postgres: UpsertNotificationRule: marshal recipients: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO notification_rules (category, enabled, smtp_server_id, recipients, updated_at)
+		VALUES ($1,$2,$3,$4,$5)
+		ON CONFLICT (category) DO UPDATE SET
+			enabled = excluded.enabled, smtp_server_id = excluded.smtp_server_id,
+			recipients = excluded.recipients, updated_at = excluded.updated_at`,
+		rule.Category, rule.Enabled, pgUUIDToSQL(rule.SMTPServerID), recipients, rule.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpsertNotificationRule: %w", err)
+	}
+	return nil
+}
+
+func pgScanNotificationRule(row *sql.Row) (*NotificationRule, error) {
+	return pgScanNotificationRuleScannable(row)
+}
+
+func pgScanNotificationRuleScannable(row pgScannable) (*NotificationRule, error) {
+	var rule NotificationRule
+	var recipients string
+	var smtpID *string
+	err := row.Scan(&rule.Category, &rule.Enabled, &smtpID, &recipients, &rule.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rule.SMTPServerID = pgSQLToUUID(smtpID)
+	rule.Recipients, err = pgUnmarshalStringSlice(recipients)
+	if err != nil {
+		return nil, err
+	}
+	return &rule, nil
 }
