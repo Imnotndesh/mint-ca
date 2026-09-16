@@ -135,6 +135,9 @@ func (s *sqliteStore) Migrate(ctx context.Context) error {
 	if _, err := s.db.ExecContext(ctx, sqliteNonceSchema); err != nil {
 		return err
 	}
+	if _, err := s.db.ExecContext(ctx, sqlitePasskeySchema); err != nil {
+		return fmt.Errorf("sqlite: passkey schema: %w", err)
+	}
 	if err := addColumnIfAbsentSQLite(ctx, s.db, "api_keys", "tenant_id",
 		"ALTER TABLE api_keys ADD COLUMN tenant_id TEXT REFERENCES tenants(id) ON DELETE SET NULL"); err != nil {
 		return err
