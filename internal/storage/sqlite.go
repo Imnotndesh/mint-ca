@@ -25,7 +25,8 @@ CREATE INDEX IF NOT EXISTS idx_nonces_expires_at ON acme_nonces(expires_at);
 `
 
 type sqliteStore struct {
-	db *sql.DB
+	db  *sql.DB
+	dsn string
 }
 
 var _ TenantStore = (*sqliteStore)(nil)
@@ -44,7 +45,7 @@ func newSQLiteStore(dsn string) (*sqliteStore, error) {
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0)
 
-	s := &sqliteStore{db: db}
+	s := &sqliteStore{db: db, dsn: dsn}
 	if err := db.PingContext(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("sqlite: ping: %w", err)

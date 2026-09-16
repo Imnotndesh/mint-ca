@@ -106,6 +106,7 @@ func BuildRouter(
 		handlers.NewNotificationHandler(store, notifyMgr).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
 		handlers.NewSystemHandler(store, elector).RegisterRoutes(r)
+		handlers.NewBackupHandler(store).RegisterRoutes(r)
 		handlers.NewMetricsHandler(store, cfg.Renewal).RegisterRoutes(r)
 	})
 

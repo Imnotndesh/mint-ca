@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -53,6 +54,42 @@ func (h *Handler) RegisterRoutes(r chi.Router) {
 		r.Get("/terms", h.getTerms)
 		r.Post("/root-ca", h.createRootCA)
 		r.Post("/api-key", h.createAPIKey)
+		r.Post("/restore", h.restore)
+	})
+}
+
+// setupBackupStore is the storage surface used by the setup restore flow.
+type setupBackupStore interface {
+	Restore(ctx context.Context, data []byte) error
+}
+
+// restore imports a whole-instance backup captured from another mint-ca
+// instance, so an operator can migrate by booting a blank instance and
+// uploading the backup. Gated by the bootstrap key (setup mode only).
+func (h *Handler) restore(w http.ResponseWriter, r *http.Request) {
+	s, ok := h.store.(setupBackupStore)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "store does not support restore")
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(r.Body, 1<<30))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "read backup body: "+err.Error())
+		return
+	}
+	if len(data) == 0 {
+		writeError(w, http.StatusBadRequest, "empty backup body")
+		return
+	}
+	if err := s.Restore(r.Context(), data); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status": "restored",
+		"message": "backup imported; restart the server to serve the restored instance " +
+			"(ensure the TLS cert/key files referenced by MINT_TLS_CERT/MINT_TLS_KEY are " +
+			"present, or set MINT_TLS_DISABLED for an initial check)",
 	})
 }
 

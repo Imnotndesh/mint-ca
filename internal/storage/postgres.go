@@ -18,7 +18,8 @@ import (
 
 // postgresStore is the Postgres implementation of Store.
 type postgresStore struct {
-	db *sql.DB
+	db  *sql.DB
+	dsn string
 }
 
 var _ TenantStore = (*postgresStore)(nil)
@@ -75,7 +76,7 @@ func newPostgresStore(dsn string) (*postgresStore, error) {
 		return nil, fmt.Errorf("postgres: ping: %w", err)
 	}
 
-	s := &postgresStore{db: db}
+	s := &postgresStore{db: db, dsn: dsn}
 
 	if err := s.Migrate(context.Background()); err != nil {
 		_ = db.Close()
