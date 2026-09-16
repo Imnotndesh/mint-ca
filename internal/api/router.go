@@ -18,6 +18,7 @@ import (
 	"mint-ca/internal/config"
 	"mint-ca/internal/events"
 	"mint-ca/internal/notify"
+	"mint-ca/internal/passkey"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/setup"
 	"mint-ca/internal/sshca"
@@ -80,6 +81,21 @@ func BuildRouter(
 		r.Use(apimiddleware.RateLimit(rlEngine, store))
 		r.Use(apimiddleware.Audit(store))
 
+		// Optional passkey (WebAuthn) login + step-up enforcement.
+		if pkCfg, enabled := passkey.ConfigFromEnv(); enabled {
+			if pstore, ok := store.(passkey.Store); ok {
+				if svc, perr := passkey.New(pstore, pkCfg); perr != nil {
+					slog.Error("passkey: disabled due to config error", "err", perr)
+				} else {
+					required := passkey.RequiredFromEnv()
+					r.Use(apimiddleware.RequireStepUp(required, svc.ValidateStepUp))
+					handlers.NewPasskeyHandler(svc, required).RegisterRoutes(r)
+				}
+			} else {
+				slog.Warn("passkey: storage backend does not support passkeys; disabled")
+			}
+		}
+
 		handlers.NewCAHandler(caEngine, store).RegisterRoutes(r)
 		handlers.NewSSHCAHandler(sshcaEngine, store, sshKRLMgr).RegisterRoutes(r)
 		var emitters events.MultiEmitter
@@ -106,6 +122,7 @@ func BuildRouter(
 		handlers.NewNotificationHandler(store, notifyMgr).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
 		handlers.NewSystemHandler(store, elector).RegisterRoutes(r)
+		handlers.NewBackupHandler(store).RegisterRoutes(r)
 		handlers.NewMetricsHandler(store, cfg.Renewal).RegisterRoutes(r)
 	})
 
