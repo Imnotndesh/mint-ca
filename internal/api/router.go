@@ -43,6 +43,7 @@ func BuildRouter(
 	sshKRLMgr *krl.Manager,
 	elector apimiddleware.LeaderChecker,
 	notifyMgr *notify.Manager,
+	transition setup.TransitionReporter,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -72,7 +73,7 @@ func BuildRouter(
 		// GET /setup/state must stay reachable once ready too — onboarding
 		// tooling (the web dashboard included) checks it on every boot to
 		// decide between the connect screen and the setup wizard.
-		setup.NewHandler(store, caEngine, cfg, nil).RegisterStateRoute(r)
+		setup.NewHandler(store, caEngine, cfg, nil, transition).RegisterStateRoute(r)
 	})
 
 	r.Group(func(r chi.Router) {
@@ -150,6 +151,7 @@ func BuildSetupRouter(
 	store storage.Store,
 	caEngine *ca.Engine,
 	onReady setup.ReadyFunc,
+	transition setup.TransitionReporter,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -168,7 +170,7 @@ func BuildSetupRouter(
 		}
 	})
 
-	setup.NewHandler(store, caEngine, cfg, onReady).RegisterRoutes(r)
+	setup.NewHandler(store, caEngine, cfg, onReady, transition).RegisterRoutes(r)
 
 	// Catch-all: tell callers the server is not ready yet instead of a bare 404.
 	r.NotFound(func(w http.ResponseWriter, r *http.Request) {

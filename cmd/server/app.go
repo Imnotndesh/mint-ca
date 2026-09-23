@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"mint-ca/internal/api"
@@ -68,8 +69,23 @@ func runServer(ctx context.Context, cfg *config.Config, store storage.Store,
 		slog.Info("setup complete — starting full API")
 	}
 
+	// transitionPhase is the live listener-transition status reported by the
+	// /setup/transition endpoint to onboarding tooling.
+	var phase atomic.Value
+	setPhase := func(p setup.TransitionPhase) { phase.Store(string(p)) }
+	reportPhase := func() setup.TransitionPhase {
+		v := phase.Load()
+		if v == nil {
+			return setup.TransitionSetup
+		}
+		return setup.TransitionPhase(v.(string))
+	}
+	if !startSetup {
+		setPhase(setup.TransitionReady)
+	}
+
 	readyRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager,
-		ocspResponder, policyEngine, rlEngine, sshKRLManager, elector, notifyMgr)
+		ocspResponder, policyEngine, rlEngine, sshKRLManager, elector, notifyMgr, reportPhase)
 
 	// On setup completion, onReady persists the cert (auto mode only) and emits
 	// the material so the supervisor can swap to HTTPS without touching disk.
@@ -92,7 +108,7 @@ func runServer(ctx context.Context, cfg *config.Config, store storage.Store,
 		}
 		return nil
 	}
-	setupRouter := api.BuildSetupRouter(cfg, store, caEngine, onReady)
+	setupRouter := api.BuildSetupRouter(cfg, store, caEngine, onReady, reportPhase)
 
 	sup := server.New(cfg.Server.ReadTimeout, cfg.Server.WriteTimeout, cfg.Server.IdleTimeout)
 
@@ -155,6 +171,7 @@ func runServer(ctx context.Context, cfg *config.Config, store storage.Store,
 			}
 			return nil
 		case mat := <-doneCh:
+			setPhase(setup.TransitionCompleting)
 			readyTLS := (*server.TLSMaterial)(nil)
 			if cfg.Server.TLSMode() != config.TLSDisabledMode {
 				if cfg.Server.TLSMode() == config.TLSAutoMode {
@@ -173,6 +190,7 @@ func runServer(ctx context.Context, cfg *config.Config, store storage.Store,
 			if err := swapWithCtx(ctx, sup, spec); err != nil {
 				return fmt.Errorf("swap to ready listener: %w", err)
 			}
+			setPhase(setup.TransitionReady)
 			startMTLSOnce(readyTLS)
 		case serr := <-sup.Errors():
 			if serr != nil {

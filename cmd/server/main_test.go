@@ -197,7 +197,7 @@ func runLiveStack(m *testing.M) (int, error) {
 
 	// ---- setup mode over real HTTP (separate ephemeral server; doesn't
 	// need to match baseURL since /setup/* never validates a JWS URL) ----
-	setupRouter := api.BuildSetupRouter(cfg, store, caEngine, func(certPEM, keyPEM []byte) error { return nil })
+	setupRouter := api.BuildSetupRouter(cfg, store, caEngine, func(certPEM, keyPEM []byte) error { return nil }, nil)
 	setupSrv := httptest.NewServer(setupRouter)
 	defer setupSrv.Close()
 
@@ -225,7 +225,7 @@ func runLiveStack(m *testing.M) (int, error) {
 	}
 
 	// ---- full API, bound to the SAME address baked into cfg.ACME.BaseURL ----
-	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, ha.NewElector(nil, "test-node", 0, 0), notify.NewManager(store, ks))
+	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, ha.NewElector(nil, "test-node", 0, 0), notify.NewManager(store, ks), nil)
 	fullSrv := httptest.NewUnstartedServer(fullRouter)
 	_ = fullSrv.Listener.Close()
 	fullSrv.Listener = listener

@@ -118,6 +118,11 @@ func TestAutoModeSetupReadySwap(t *testing.T) {
 		t.Fatalf("state = %q, want setup", st.State)
 	}
 
+	// 1b. The transition endpoint reports "setup" while in setup mode.
+	if status, configured := transitionStatus(t, base+"/setup/transition", false); status != "setup" || configured {
+		t.Fatalf("transition before swap = status %q configured %v, want setup/false", status, configured)
+	}
+
 	// 2. Complete setup over HTTP using the known bootstrap key.
 	if err := postTo(base+"/setup/root-ca", bootstrap, map[string]interface{}{
 		"common_name": "Transition Root", "key_algo": "ecdsa-p256", "ttl_days": 3650,
@@ -133,6 +138,11 @@ func TestAutoModeSetupReadySwap(t *testing.T) {
 	// 3. The same process/port now serves HTTPS with the minted cert.
 	waitFor(t, 10*time.Second, func() bool {
 		return getStatus("https://"+addr+"/healthz", true) == http.StatusOK
+	})
+	// 3b. The transition endpoint (now over HTTPS) reports ready.
+	waitFor(t, 10*time.Second, func() bool {
+		status, configured := transitionStatus(t, "https://"+addr+"/setup/transition", true)
+		return status == "ready" && configured
 	})
 	if got := getBody(t, "https://"+addr+"/healthz", true); got == "" {
 		t.Fatal("expected a response over HTTPS")
@@ -220,6 +230,19 @@ func getBody(t *testing.T, url string, tlsOn bool) string {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return string(b)
+}
+
+func transitionStatus(t *testing.T, url string, tlsOn bool) (string, bool) {
+	t.Helper()
+	b := getBody(t, url, tlsOn)
+	var tr struct {
+		Status     string `json:"status"`
+		Configured bool   `json:"configured"`
+	}
+	if err := json.Unmarshal([]byte(b), &tr); err != nil {
+		t.Fatalf("parse transition: %v (body=%q)", err, b)
+	}
+	return tr.Status, tr.Configured
 }
 
 func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
