@@ -25,12 +25,32 @@ import (
 // Receives the PEM cert and key the server should use for TLS.
 type ReadyFunc func(certPEM, keyPEM []byte) error
 
+// TransitionPhase is the live status of the setup→ready listener transition,
+// reported to onboarding tooling (dashboard wizard, mca init) over
+// /setup/transition.
+type TransitionPhase string
+
+const (
+	// TransitionSetup means the server is still in setup mode (plain HTTP).
+	TransitionSetup TransitionPhase = "setup"
+	// TransitionCompleting means setup finished and the listener swap to the
+	// ready (HTTPS) generation is in progress.
+	TransitionCompleting TransitionPhase = "completing"
+	// TransitionReady means the ready listener is serving (HTTPS, or HTTP in
+	// TLS-disabled dev mode).
+	TransitionReady TransitionPhase = "ready"
+)
+
+// TransitionReporter supplies the current transition phase. nil reports "setup".
+type TransitionReporter func() TransitionPhase
+
 // Handler serves /setup/* endpoints.
 type Handler struct {
-	store    storage.Store
-	caEngine *ca.Engine
-	cfg      *config.Config
-	onReady  ReadyFunc
+	store      storage.Store
+	caEngine   *ca.Engine
+	cfg        *config.Config
+	onReady    ReadyFunc
+	transition TransitionReporter
 }
 
 func NewHandler(
@@ -38,12 +58,14 @@ func NewHandler(
 	caEngine *ca.Engine,
 	cfg *config.Config,
 	onReady ReadyFunc,
+	transition TransitionReporter,
 ) *Handler {
 	return &Handler{
-		store:    store,
-		caEngine: caEngine,
-		cfg:      cfg,
-		onReady:  onReady,
+		store:      store,
+		caEngine:   caEngine,
+		cfg:        cfg,
+		onReady:    onReady,
+		transition: transition,
 	}
 }
 
@@ -101,6 +123,7 @@ func (h *Handler) restore(w http.ResponseWriter, r *http.Request) {
 // makes sense before the server is configured.
 func (h *Handler) RegisterStateRoute(r chi.Router) {
 	r.Get("/setup/state", h.getState)
+	r.Get("/setup/transition", h.getTransition)
 }
 
 // getState returns the machine-readable setup state so a CLI/web wizard can
@@ -114,7 +137,31 @@ func (h *Handler) getState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"state":      string(st),
 		"configured": st == storage.StateReady,
+		"transition": string(h.phase()),
 	})
+}
+
+// getTransition reports the live listener-transition phase so onboarding
+// tooling can poll across the plain-HTTP → HTTPS swap. It is public (no
+// bootstrap key) and mounted in both the setup-mode and ready-mode routers.
+func (h *Handler) getTransition(w http.ResponseWriter, r *http.Request) {
+	st, err := h.store.GetSetupState(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to read setup state")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":     string(h.phase()),
+		"state":      string(st),
+		"configured": st == storage.StateReady,
+	})
+}
+
+func (h *Handler) phase() TransitionPhase {
+	if h.transition != nil {
+		return h.transition()
+	}
+	return TransitionSetup
 }
 
 // getTerms returns the Terms of Service text so the operator can read and

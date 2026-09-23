@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -33,6 +34,22 @@ type Config struct {
 }
 
 // ServerConfig controls the HTTP/TLS listener.
+// TLSMode describes how the server's own listener is served.
+// It is derived from the TLS-related env vars; see ServerConfig.TLSMode.
+type TLSMode string
+
+const (
+	// TLSDisabledMode serves everything over plain HTTP (local dev only).
+	TLSDisabledMode TLSMode = "disabled"
+	// TLSProvidedMode serves HTTP during setup and HTTPS from operator-supplied
+	// cert/key files once ready. Config requires those files to exist at boot.
+	TLSProvidedMode TLSMode = "provided"
+	// TLSAutoMode serves HTTP during setup and HTTPS from the server-issued
+	// cert once ready. No cert is required at boot.
+	TLSAutoMode TLSMode = "auto"
+)
+
+// ServerConfig holds the HTTP/TLS listener configuration.
 type ServerConfig struct {
 	// ListenAddr is the address and port to bind on.
 	// Default: ":8443"
@@ -40,7 +57,9 @@ type ServerConfig struct {
 	ListenAddr string
 
 	// TLSCertFile and TLSKeyFile are paths to the PEM-encoded server TLS
-	// certificate and private key. Required unless TLSDisabled is true.
+	// certificate and private key. In "provided" mode both must exist at
+	// boot. In "auto" mode (neither set) the certificate is minted during
+	// setup and the server switches to HTTPS in-process.
 	// Env: MINT_TLS_CERT, MINT_TLS_KEY
 	TLSCertFile string
 	TLSKeyFile  string
@@ -357,18 +376,7 @@ func Load() (*Config, error) {
 	c.Server.IdleTimeout = envDuration("MINT_IDLE_TIMEOUT_SECONDS", 120*time.Second)
 	c.Server.BootstrapKey = strings.TrimSpace(os.Getenv("MINT_BOOTSTRAP_KEY"))
 
-	if !c.Server.TLSDisabled {
-		if c.Server.TLSCertFile == "" {
-			errs = append(errs, "MINT_TLS_CERT is required when TLS is enabled (set MINT_TLS_DISABLED=true for development)")
-		} else if _, err := os.Stat(c.Server.TLSCertFile); err != nil {
-			errs = append(errs, fmt.Sprintf("MINT_TLS_CERT: file not found or not readable: %s", c.Server.TLSCertFile))
-		}
-		if c.Server.TLSKeyFile == "" {
-			errs = append(errs, "MINT_TLS_KEY is required when TLS is enabled")
-		} else if _, err := os.Stat(c.Server.TLSKeyFile); err != nil {
-			errs = append(errs, fmt.Sprintf("MINT_TLS_KEY: file not found or not readable: %s", c.Server.TLSKeyFile))
-		}
-	}
+	errs = append(errs, validateTLS(c)...)
 
 	c.Storage.Driver = strings.ToLower(strings.TrimSpace(envOr("MINT_DB_DRIVER", "sqlite")))
 	c.Storage.DSN = strings.TrimSpace(os.Getenv("MINT_DB_DSN"))
@@ -705,4 +713,80 @@ func redactDSN(dsn string) string {
 	}
 	user := userInfo[:colonIdx]
 	return dsn[:schemeEnd+3] + user + ":***@" + dsn[atIdx+1:]
+}
+
+// TLSMode derives the effective listener mode from the TLS-related fields:
+// disabled when TLSDisabled, provided when operator cert/key paths are set,
+// otherwise auto. Enumeration from the same fields is always stable.
+func (s ServerConfig) TLSMode() TLSMode {
+	switch {
+	case s.TLSDisabled:
+		return TLSDisabledMode
+	case s.TLSCertFile != "" || s.TLSKeyFile != "":
+		return TLSProvidedMode
+	default:
+		return TLSAutoMode
+	}
+}
+
+// autoTLSDefaults returns the default cert/key paths used when serving the
+// setup-issued certificate (auto mode). They are placed next to the sqlite
+// database when one is used, else the conventional /data mount.
+func (c *Config) autoTLSDefaults() (certFile, keyFile string) {
+	certFile, keyFile = "/data/server.crt", "/data/server.key"
+	if strings.EqualFold(c.Storage.Driver, "sqlite") && c.Storage.DSN != "" &&
+		c.Storage.DSN != ":memory:" && !strings.HasPrefix(c.Storage.DSN, "file:") {
+		dir := filepath.Dir(c.Storage.DSN)
+		certFile = filepath.Join(dir, "server.crt")
+		keyFile = filepath.Join(dir, "server.key")
+	}
+	return certFile, keyFile
+}
+
+// ResolvedTLSCertFile returns the cert path actually used, honouring an
+// explicit MINT_TLS_CERT override and otherwise the auto default.
+func (c *Config) ResolvedTLSCertFile() string {
+	if c.Server.TLSCertFile != "" {
+		return c.Server.TLSCertFile
+	}
+	cert, _ := c.autoTLSDefaults()
+	return cert
+}
+
+// ResolvedTLSKeyFile returns the key path actually used, honouring an
+// explicit MINT_TLS_KEY override and otherwise the auto default.
+func (c *Config) ResolvedTLSKeyFile() string {
+	if c.Server.TLSKeyFile != "" {
+		return c.Server.TLSKeyFile
+	}
+	_, key := c.autoTLSDefaults()
+	return key
+}
+
+// validateTLS reports configuration problems for the server listener, keyed
+// to the derived TLSMode. In auto mode nothing is required at boot because
+// setup mints the certificate later. In provided mode the operator cert/key
+// must both be set and readable. Disabled mode has no requirements.
+func validateTLS(c *Config) []string {
+	var errs []string
+	switch c.Server.TLSMode() {
+	case TLSDisabledMode:
+		// Nothing to validate.
+	case TLSProvidedMode:
+		if c.Server.TLSCertFile == "" {
+			errs = append(errs, "MINT_TLS_CERT is required when TLS is provided (set it and MINT_TLS_KEY, or set MINT_TLS_DISABLED=true for development)")
+		} else if _, err := os.Stat(c.Server.TLSCertFile); err != nil {
+			errs = append(errs, fmt.Sprintf("MINT_TLS_CERT: file not found or not readable: %s", c.Server.TLSCertFile))
+		}
+		if c.Server.TLSKeyFile == "" {
+			errs = append(errs, "MINT_TLS_KEY is required when TLS is provided")
+		} else if _, err := os.Stat(c.Server.TLSKeyFile); err != nil {
+			errs = append(errs, fmt.Sprintf("MINT_TLS_KEY: file not found or not readable: %s", c.Server.TLSKeyFile))
+		}
+	case TLSAutoMode:
+		if (c.Server.TLSCertFile == "") != (c.Server.TLSKeyFile == "") {
+			errs = append(errs, "MINT_TLS_CERT and MINT_TLS_KEY must be set together (or both omitted)")
+		}
+	}
+	return errs
 }

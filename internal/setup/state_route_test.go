@@ -26,7 +26,7 @@ func (f *stateOnlyStore) GetSetupState(ctx context.Context) (storage.SetupState,
 // mounts the rest of Handler.RegisterRoutes) can still answer it — this is
 // what the dashboard's boot-time check and other onboarding tooling rely on.
 func TestRegisterStateRoute_ReadyStateReachableWithoutBootstrapKey(t *testing.T) {
-	h := NewHandler(&stateOnlyStore{st: storage.StateReady}, nil, nil, nil)
+	h := NewHandler(&stateOnlyStore{st: storage.StateReady}, nil, nil, nil, nil)
 	r := chi.NewRouter()
 	h.RegisterStateRoute(r)
 
@@ -50,7 +50,7 @@ func TestRegisterStateRoute_ReadyStateReachableWithoutBootstrapKey(t *testing.T)
 }
 
 func TestRegisterStateRoute_DoesNotMountProtectedSetupRoutes(t *testing.T) {
-	h := NewHandler(&stateOnlyStore{st: storage.StateReady}, nil, nil, nil)
+	h := NewHandler(&stateOnlyStore{st: storage.StateReady}, nil, nil, nil, nil)
 	r := chi.NewRouter()
 	h.RegisterStateRoute(r)
 

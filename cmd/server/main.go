@@ -6,22 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"mint-ca/internal/logger"
-	"mint-ca/internal/ratelimit"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"mint-ca/internal/api"
 	"mint-ca/internal/ca"
 	"mint-ca/internal/ca/revocation"
 	"mint-ca/internal/config"
 	mintcrypto "mint-ca/internal/crypto"
 	"mint-ca/internal/ha"
+	"mint-ca/internal/logger"
 	"mint-ca/internal/notify"
-	"mint-ca/internal/mtls"
 	"mint-ca/internal/policy"
 	"mint-ca/internal/renewal"
 	"mint-ca/internal/setup"
@@ -30,17 +26,13 @@ import (
 	"mint-ca/internal/storage"
 	"mint-ca/internal/workers"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 )
 
 func main() {
 	cfg, err := config.Load()
 	if err != nil {
-		_, err = os.Stderr.WriteString(err.Error() + "\n")
-		if err != nil {
-			return
-		}
+		_, _ = os.Stderr.WriteString(err.Error() + "\n")
 		os.Exit(1)
 	}
 
@@ -60,8 +52,7 @@ func main() {
 		_ = store.Close()
 		os.Exit(1)
 	}
-	var rlEngine *ratelimit.Engine
-	rlEngine, err = setup.LoadRateLimitEngine(context.Background(), store)
+	rlEngine, err := setup.LoadRateLimitEngine(context.Background(), store)
 	if err != nil {
 		slog.Error("failed to load rate limit engine", "err", err)
 		_ = store.Close()
@@ -112,211 +103,32 @@ func main() {
 			deliverers = append(deliverers, renewal.NewWebhookDeliverer(cfg.Renewal.WebhookURL))
 		}
 		deliverers = append(deliverers, notify.RenewalDeliverer{Manager: notifyMgr})
-		var deliverer renewal.Deliverer = deliverers
-		apiWorkers.Add(renewal.NewWorker(store, deliverer,
+		apiWorkers.Add(renewal.NewWorker(store, deliverers,
 			time.Duration(cfg.Renewal.IntervalSeconds)*time.Second,
 			time.Duration(cfg.Renewal.LeadSeconds)*time.Second))
 	}
 	apiWorkers.Start(context.Background())
-	// Read state before starting the listener so we know which router to mount.
-	state, err := store.GetSetupState(context.Background())
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// The listener lifecycle (setup HTTP -> ready HTTPS automatically) is owned
+	// by runServer; it returns on shutdown signal or fatal listener error.
+	err = runServer(ctx, cfg, store, rlEngine,
+		caEngine, policyEngine, sshcaEngine, crlManager, ocspResponder, sshKRLManager,
+		elector, notifyMgr)
+
+	apiWorkers.Stop()
+	if cerr := store.Close(); cerr != nil {
+		slog.Error("error closing storage", "err", cerr)
+	}
+	ks.Zero()
+
 	if err != nil {
-		slog.Error("failed to read setup state", "err", err)
-		apiWorkers.Stop()
-		_ = store.Close()
-		ks.Zero()
+		slog.Error("server failed", "err", err)
 		os.Exit(1)
 	}
-	// Build the router that runs initially based on setup state.
-	startSetup := false
-	switch state {
-	case storage.StateUninitialized:
-		slog.Info("first boot detected — entering setup mode")
-		if err := store.SetSetupState(context.Background(), storage.StateSetup); err != nil {
-			slog.Error("failed to transition to setup state", "err", err)
-			apiWorkers.Stop()
-			_ = store.Close()
-			ks.Zero()
-			os.Exit(1)
-		}
-		bk, err := setup.GenerateBootstrapKey(context.Background(), store, cfg.Server.BootstrapKey)
-		if err != nil {
-			slog.Error("failed to generate bootstrap key", "err", err)
-			apiWorkers.Stop()
-			_ = store.Close()
-			ks.Zero()
-			os.Exit(1)
-		}
-		setup.PrintBootstrapKey(bk)
-		startSetup = true
-	case storage.StateSetup:
-		slog.Warn("resumed in-progress setup — bootstrap key was printed on first boot; check earlier container logs")
-		slog.Warn("if you cannot find the key, delete /data/mint-ca.db and start fresh")
-		startSetup = true
-	case storage.StateReady:
-		slog.Info("setup complete — starting full API")
-	}
-
-	readyRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, elector, notifyMgr)
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	errCh := make(chan error, 1)
-	restartCh := make(chan struct{}, 1)
-
-	// startServer opens a listener on startAddr and serves handler. When
-	// useTLS, it wraps the listener in TLS. It runs in its own goroutine and
-	// reports bind/serve errors back through errCh. The returned stop func
-	// gracefully shuts the server down (closing the listener).
-	startServer := func(addr string, handler http.Handler, useTLS bool) (func(), error) {
-		certFile, keyFile := tlsFilePaths(cfg)
-		stop2, srvErr, err := serveListener(addr, handler, useTLS, certFile, keyFile,
-			cfg.Server.ReadTimeout, cfg.Server.WriteTimeout, cfg.Server.IdleTimeout)
-		if err != nil {
-			return nil, err
-		}
-		go func() {
-			for e := range srvErr {
-				if e != nil && !errors.Is(e, http.ErrServerClosed) {
-					errCh <- e
-					return
-				}
-			}
-		}()
-		return stop2, nil
-	}
-
-	// onReady is invoked by the setup router when /setup/api-key completes.
-	// It persists the freshly-issued TLS cert/key so the ready listener can
-	// serve HTTPS, then splits setup -> ready in-process.
-	onReady := func(certPEM, keyPEM []byte) error {
-		certPath := cfg.Server.TLSCertFile
-		keyPath := cfg.Server.TLSKeyFile
-		if certPath == "" {
-			certPath = "/data/server.crt"
-		}
-		if keyPath == "" {
-			keyPath = "/data/server.key"
-		}
-		if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
-			return err
-		}
-		if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
-			return err
-		}
-		slog.Info("setup: TLS certificate written to disk", "cert", certPath, "key", keyPath)
-		slog.Info("setup: complete — swapping to ready API over TLS in-process")
-		restartCh <- struct{}{}
-		return nil
-	}
-
-	newStop := func() func() {
-		return func() {}
-	}()
-	switch {
-	case startSetup:
-		// Initial serve: setup mode on plain HTTP.
-		stop, err := startServer(cfg.Server.ListenAddr, api.BuildSetupRouter(cfg, store, caEngine, onReady), false)
-		if err != nil {
-			slog.Error("setup listen failure", "err", err)
-			apiWorkers.Stop()
-			_ = store.Close()
-			ks.Zero()
-			os.Exit(1)
-		}
-		newStop = stop
-	default:
-		// Already configured: serve the ready API (TLS unless disabled).
-		stop, err := startServer(cfg.Server.ListenAddr, readyRouter, !cfg.Server.TLSDisabled)
-		if err != nil {
-			slog.Error("listener failure", "err", err)
-			apiWorkers.Stop()
-			_ = store.Close()
-			ks.Zero()
-			os.Exit(1)
-		}
-		newStop = stop
-	}
-
-	// Optional mutual-TLS device enrollment listener (ready state only).
-	var mtlsStop func()
-	if cfg.MTLS.Enabled && state == storage.StateReady {
-		mtlsSrv, merr := startMTLSListener(cfg, store, caEngine)
-		if merr != nil {
-			slog.Error("failed to start mtls enrollment listener", "err", merr)
-		} else {
-			mtlsStop = func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-				defer cancel()
-				_ = mtlsSrv.Shutdown(ctx)
-			}
-		}
-	} else if cfg.MTLS.Enabled {
-		slog.Warn("MTLS enrollment requested but server not in ready state; not starting")
-	}
-
-	for {
-		select {
-		case sig := <-quit:
-			slog.Info("shutdown signal received", "signal", sig.String())
-			if newStop != nil {
-				newStop()
-			}
-			if mtlsStop != nil {
-				mtlsStop()
-			}
-			if err := store.Close(); err != nil {
-				slog.Error("error closing storage", "err", err)
-			}
-			ks.Zero()
-			slog.Info("mint-ca stopped cleanly")
-			return
-		case <-restartCh:
-			// Setup finished: swap plain-HTTP setup -> ready over TLS. No exit.
-			if newStop != nil {
-				newStop()
-			}
-			if cfg.Server.TLSDisabled {
-				slog.Warn("server not in setup; ready listener running plain HTTP because TLS is disabled")
-			}
-			useTLS := !cfg.Server.TLSDisabled
-			stop, err := startServer(cfg.Server.ListenAddr, readyRouter, useTLS)
-			if err != nil {
-				slog.Error("ready listen failure", "err", err)
-				apiWorkers.Stop()
-				_ = store.Close()
-				ks.Zero()
-				os.Exit(1)
-			}
-			newStop = stop
-			// mtls can start now in ready state.
-			if cfg.MTLS.Enabled {
-				slog.Warn("mtls listener not restarted after setup; restart to enable")
-			}
-		case serr := <-errCh:
-			if serr != nil && !errors.Is(serr, http.ErrServerClosed) {
-				slog.Error("server error", "err", serr)
-				apiWorkers.Stop()
-				_ = store.Close()
-				ks.Zero()
-				os.Exit(1)
-			}
-		}
-	}
-}
-
-// tlsFilePaths returns the on-disk server TLS cert/key paths, defaulting to
-// the well-known /data locations used by the setup first-boot flow.
-func tlsFilePaths(cfg *config.Config) (certFile, keyFile string) {
-	certFile = cfg.Server.TLSCertFile
-	keyFile = cfg.Server.TLSKeyFile
-	if certFile == "" {
-		certFile = "/data/server.crt"
-	}
-	if keyFile == "" {
-		keyFile = "/data/server.key"
-	}
-	return certFile, keyFile
+	slog.Info("mint-ca stopped cleanly")
 }
 
 func buildLogger(cfg config.LogConfig) *slog.Logger {
@@ -339,35 +151,6 @@ func buildLogger(cfg config.LogConfig) *slog.Logger {
 	}
 
 	return slog.New(logger.NewPrettyHandler(os.Stdout, level))
-}
-
-func startMTLSListener(cfg *config.Config, store storage.Store, caEngine *ca.Engine) (*http.Server, error) {
-	issuerID, provID, err := resolveMTLSTargets(context.Background(), store)
-	if err != nil {
-		return nil, err
-	}
-
-	tlsConf, err := mtls.BuildServerTLSConfig(cfg.MTLS, []byte(cfg.MTLS.ClientCACertPEM))
-	if err != nil {
-		return nil, err
-	}
-
-	enroll := mtls.NewEnrollHandler(caEngine, store, issuerID, provID)
-	r := chi.NewRouter()
-	enroll.RegisterRoutes(r)
-
-	mtlsSrv := &http.Server{
-		Addr:      cfg.MTLS.ListenAddr,
-		Handler:   r,
-		TLSConfig: tlsConf,
-	}
-	go func() {
-		if err := mtlsSrv.ListenAndServeTLS(cfg.Server.TLSCertFile, cfg.Server.TLSKeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("mtls enrollment listener error", "err", err)
-		}
-	}()
-	slog.Info("mtls enrollment listener started", "addr", cfg.MTLS.ListenAddr)
-	return mtlsSrv, nil
 }
 
 // resolveMTLSTargets finds the signing CA and an "mtls"-type provisioner bound
