@@ -138,6 +138,15 @@ Default values are shown; variables marked **Required** must be set.
 
 \* Required when `MINT_TLS_DISABLED` is `false` (the default). If you set `MINT_TLS_DISABLED=true`, these become optional.
 
+**Auto-generated TLS (`MINT_TLS` not set).** On a fresh install with neither
+`MINT_TLS_CERT`/`MINT_TLS_KEY` nor `MINT_TLS_DISABLED=true` set, mint-ca boots
+into HTTP setup mode and mints its own server certificate during setup, then
+**switches the same process to HTTPS in-place using that certificate** — no
+container restart needed. The generated cert is persisted to
+`server.crt`/`server.key` next to the SQLite database (or `/data/`); on later
+boots it is used directly. If you do set `MINT_TLS_CERT`/`MINT_TLS_KEY`, those
+operator-provided files are used as-is and are never overwritten.
+
 ### 2.3.1 Generating a Master Key
 
 The master key must be 32 random bytes, hex‑encoded. Generate it with:
