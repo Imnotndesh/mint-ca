@@ -35,6 +35,7 @@ import (
 	"mint-ca/internal/sshca"
 	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
+	"mint-ca/internal/webhook"
 
 	"golang.org/x/crypto/ssh"
 )
@@ -225,7 +226,7 @@ func runLiveStack(m *testing.M) (int, error) {
 	}
 
 	// ---- full API, bound to the SAME address baked into cfg.ACME.BaseURL ----
-	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, ha.NewElector(nil, "test-node", 0, 0), notify.NewManager(store, ks))
+	fullRouter := api.BuildRouter(cfg, store, caEngine, sshcaEngine, crlManager, ocspResponder, policyEngine, rlEngine, sshKRLManager, ha.NewElector(nil, "test-node", 0, 0), notify.NewManager(store, ks), webhook.NewManager(store, ks))
 	fullSrv := httptest.NewUnstartedServer(fullRouter)
 	_ = fullSrv.Listener.Close()
 	fullSrv.Listener = listener

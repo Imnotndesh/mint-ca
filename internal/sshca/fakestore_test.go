@@ -494,3 +494,44 @@ func (f *fakeStore) UpsertNotificationRule(ctx context.Context, rule *storage.No
 	notImplemented("UpsertNotificationRule")
 	return nil
 }
+
+func (f *fakeStore) CreateWebhookConfig(ctx context.Context, w *storage.WebhookConfig) error {
+	notImplemented("CreateWebhookConfig")
+	return nil
+}
+func (f *fakeStore) GetWebhookConfig(ctx context.Context, id uuid.UUID) (*storage.WebhookConfig, error) {
+	notImplemented("GetWebhookConfig")
+	return nil, nil
+}
+func (f *fakeStore) ListWebhookConfigs(ctx context.Context) ([]*storage.WebhookConfig, error) {
+	notImplemented("ListWebhookConfigs")
+	return nil, nil
+}
+func (f *fakeStore) UpdateWebhookConfig(ctx context.Context, w *storage.WebhookConfig) error {
+	notImplemented("UpdateWebhookConfig")
+	return nil
+}
+func (f *fakeStore) DeleteWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	notImplemented("DeleteWebhookConfig")
+	return nil
+}
+func (f *fakeStore) SetDefaultWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	notImplemented("SetDefaultWebhookConfig")
+	return nil
+}
+func (f *fakeStore) GetDefaultWebhookConfig(ctx context.Context) (*storage.WebhookConfig, error) {
+	notImplemented("GetDefaultWebhookConfig")
+	return nil, nil
+}
+func (f *fakeStore) GetWebhookRule(ctx context.Context, category string) (*storage.WebhookRule, error) {
+	notImplemented("GetWebhookRule")
+	return nil, nil
+}
+func (f *fakeStore) ListWebhookRules(ctx context.Context) ([]*storage.WebhookRule, error) {
+	notImplemented("ListWebhookRules")
+	return nil, nil
+}
+func (f *fakeStore) UpsertWebhookRule(ctx context.Context, rule *storage.WebhookRule) error {
+	notImplemented("UpsertWebhookRule")
+	return nil
+}

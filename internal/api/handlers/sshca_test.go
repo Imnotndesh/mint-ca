@@ -775,3 +775,44 @@ func (f *sshFakeStore) UpsertNotificationRule(ctx context.Context, rule *storage
 	sshNotImplemented("UpsertNotificationRule")
 	return nil
 }
+
+func (f *sshFakeStore) CreateWebhookConfig(ctx context.Context, w *storage.WebhookConfig) error {
+	sshNotImplemented("CreateWebhookConfig")
+	return nil
+}
+func (f *sshFakeStore) GetWebhookConfig(ctx context.Context, id uuid.UUID) (*storage.WebhookConfig, error) {
+	sshNotImplemented("GetWebhookConfig")
+	return nil, nil
+}
+func (f *sshFakeStore) ListWebhookConfigs(ctx context.Context) ([]*storage.WebhookConfig, error) {
+	sshNotImplemented("ListWebhookConfigs")
+	return nil, nil
+}
+func (f *sshFakeStore) UpdateWebhookConfig(ctx context.Context, w *storage.WebhookConfig) error {
+	sshNotImplemented("UpdateWebhookConfig")
+	return nil
+}
+func (f *sshFakeStore) DeleteWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	sshNotImplemented("DeleteWebhookConfig")
+	return nil
+}
+func (f *sshFakeStore) SetDefaultWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	sshNotImplemented("SetDefaultWebhookConfig")
+	return nil
+}
+func (f *sshFakeStore) GetDefaultWebhookConfig(ctx context.Context) (*storage.WebhookConfig, error) {
+	sshNotImplemented("GetDefaultWebhookConfig")
+	return nil, nil
+}
+func (f *sshFakeStore) GetWebhookRule(ctx context.Context, category string) (*storage.WebhookRule, error) {
+	sshNotImplemented("GetWebhookRule")
+	return nil, nil
+}
+func (f *sshFakeStore) ListWebhookRules(ctx context.Context) ([]*storage.WebhookRule, error) {
+	sshNotImplemented("ListWebhookRules")
+	return nil, nil
+}
+func (f *sshFakeStore) UpsertWebhookRule(ctx context.Context, rule *storage.WebhookRule) error {
+	sshNotImplemented("UpsertWebhookRule")
+	return nil
+}

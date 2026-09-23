@@ -1,4 +1,5 @@
 /logs
 .env
+dev.env
 docker-compose.yml/server
 RULES.md
