@@ -462,6 +462,24 @@ CREATE TABLE IF NOT EXISTS notification_rules (
     recipients     TEXT        NOT NULL DEFAULT '[]',
     updated_at     TIMESTAMPTZ NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS webhook_configs (
+    id         TEXT        NOT NULL PRIMARY KEY,
+    name       TEXT        NOT NULL UNIQUE,
+    url        TEXT        NOT NULL,
+    secret_enc BYTEA,
+    enabled    BOOLEAN     NOT NULL DEFAULT TRUE,
+    is_default BOOLEAN     NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webhook_rules (
+    category          TEXT        NOT NULL PRIMARY KEY,
+    enabled           BOOLEAN     NOT NULL DEFAULT FALSE,
+    webhook_config_id TEXT        REFERENCES webhook_configs(id) ON DELETE SET NULL,
+    updated_at        TIMESTAMPTZ NOT NULL
+);
 `
 
 func pgMarshalJSON(v interface{}) (string, error) {
@@ -2885,5 +2903,183 @@ func pgScanNotificationRuleScannable(row pgScannable) (*NotificationRule, error)
 	if err != nil {
 		return nil, err
 	}
+	return &rule, nil
+}
+
+func (s *postgresStore) CreateWebhookConfig(ctx context.Context, w *WebhookConfig) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO webhook_configs
+			(id, name, url, secret_enc, enabled, is_default, created_at, updated_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+		w.ID.String(), w.Name, w.URL, w.SecretEnc, w.Enabled, w.IsDefault, w.CreatedAt.UTC(), w.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: CreateWebhookConfig: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) GetWebhookConfig(ctx context.Context, id uuid.UUID) (*WebhookConfig, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, url, secret_enc, enabled, is_default, created_at, updated_at
+		FROM webhook_configs WHERE id = $1`, id.String())
+	w, err := pgScanWebhookConfig(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetWebhookConfig: %w", err)
+	}
+	return w, nil
+}
+
+func (s *postgresStore) ListWebhookConfigs(ctx context.Context) ([]*WebhookConfig, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, url, secret_enc, enabled, is_default, created_at, updated_at
+		FROM webhook_configs ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListWebhookConfigs: %w", err)
+	}
+	defer rows.Close()
+	var out []*WebhookConfig
+	for rows.Next() {
+		w, err := pgScanWebhookConfigScannable(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: ListWebhookConfigs: %w", err)
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpdateWebhookConfig(ctx context.Context, w *WebhookConfig) error {
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_configs SET
+			name = $1, url = $2, secret_enc = $3, enabled = $4, updated_at = $5
+		WHERE id = $6`,
+		w.Name, w.URL, w.SecretEnc, w.Enabled, w.UpdatedAt.UTC(), w.ID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpdateWebhookConfig: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: UpdateWebhookConfig: %q not found", w.ID)
+	}
+	return nil
+}
+
+func (s *postgresStore) DeleteWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM webhook_configs WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: DeleteWebhookConfig: %w", err)
+	}
+	return nil
+}
+
+func (s *postgresStore) SetDefaultWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("postgres: SetDefaultWebhookConfig: begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE webhook_configs SET is_default = FALSE`); err != nil {
+		return fmt.Errorf("postgres: SetDefaultWebhookConfig: clear: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE webhook_configs SET is_default = TRUE WHERE id = $1`, id.String())
+	if err != nil {
+		return fmt.Errorf("postgres: SetDefaultWebhookConfig: set: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("postgres: SetDefaultWebhookConfig: %q not found", id)
+	}
+	return tx.Commit()
+}
+
+func (s *postgresStore) GetDefaultWebhookConfig(ctx context.Context) (*WebhookConfig, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, url, secret_enc, enabled, is_default, created_at, updated_at
+		FROM webhook_configs WHERE is_default = TRUE LIMIT 1`)
+	w, err := pgScanWebhookConfig(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetDefaultWebhookConfig: %w", err)
+	}
+	return w, nil
+}
+
+func pgScanWebhookConfig(row *sql.Row) (*WebhookConfig, error) {
+	return pgScanWebhookConfigScannable(row)
+}
+
+func pgScanWebhookConfigScannable(row pgScannable) (*WebhookConfig, error) {
+	var w WebhookConfig
+	var idStr string
+	err := row.Scan(&idStr, &w.Name, &w.URL, &w.SecretEnc, &w.Enabled, &w.IsDefault, &w.CreatedAt, &w.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.ID = uuid.MustParse(idStr)
+	return &w, nil
+}
+
+func (s *postgresStore) GetWebhookRule(ctx context.Context, category string) (*WebhookRule, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT category, enabled, webhook_config_id, updated_at
+		FROM webhook_rules WHERE category = $1`, category)
+	rule, err := pgScanWebhookRule(row)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: GetWebhookRule: %w", err)
+	}
+	return rule, nil
+}
+
+func (s *postgresStore) ListWebhookRules(ctx context.Context) ([]*WebhookRule, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT category, enabled, webhook_config_id, updated_at
+		FROM webhook_rules ORDER BY category ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: ListWebhookRules: %w", err)
+	}
+	defer rows.Close()
+	var out []*WebhookRule
+	for rows.Next() {
+		rule, err := pgScanWebhookRuleScannable(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: ListWebhookRules: %w", err)
+		}
+		out = append(out, rule)
+	}
+	return out, rows.Err()
+}
+
+func (s *postgresStore) UpsertWebhookRule(ctx context.Context, rule *WebhookRule) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO webhook_rules (category, enabled, webhook_config_id, updated_at)
+		VALUES ($1,$2,$3,$4)
+		ON CONFLICT (category) DO UPDATE SET
+			enabled = excluded.enabled, webhook_config_id = excluded.webhook_config_id,
+			updated_at = excluded.updated_at`,
+		rule.Category, rule.Enabled, pgUUIDToSQL(rule.WebhookConfigID), rule.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: UpsertWebhookRule: %w", err)
+	}
+	return nil
+}
+
+func pgScanWebhookRule(row *sql.Row) (*WebhookRule, error) {
+	return pgScanWebhookRuleScannable(row)
+}
+
+func pgScanWebhookRuleScannable(row pgScannable) (*WebhookRule, error) {
+	var rule WebhookRule
+	var webhookID *string
+	err := row.Scan(&rule.Category, &rule.Enabled, &webhookID, &rule.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rule.WebhookConfigID = pgSQLToUUID(webhookID)
 	return &rule, nil
 }

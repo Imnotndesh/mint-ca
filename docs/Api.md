@@ -1184,6 +1184,17 @@ affects the API response that triggered the event.
 }
 ```
 
+In addition to the env-var webhook above, `/api/v1/settings/webhooks` lets a
+platform admin register any number of named, runtime-configurable webhook
+targets and enable/disable delivery per category (`cert.issued`,
+`cert.revoked`, `cert.expiring`, plus the categories listed in
+`/api/v1/settings/notifications/categories`) without a restart — the two
+systems run side by side. Each configured webhook may carry an optional
+`secret`; when set, every POST carries a header
+`X-MintCA-Signature: sha256=<hex-hmac-sha256-of-the-raw-request-body>`,
+computed with that secret, so the receiver can verify the payload wasn't
+forged or tampered with in transit.
+
 ## 1.20 Hardware-Attestation-Gated Issuance
 
 `POST /api/v1/certs/sign` and each item of `POST /api/v1/certs/batch/sign` can

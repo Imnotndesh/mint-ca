@@ -586,6 +586,24 @@ CREATE TABLE IF NOT EXISTS notification_rules (
     updated_at     DATETIME NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS webhook_configs (
+    id         TEXT NOT NULL PRIMARY KEY,
+    name       TEXT NOT NULL UNIQUE,
+    url        TEXT NOT NULL,
+    secret_enc BLOB,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    created_at DATETIME NOT NULL,
+    updated_at DATETIME NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS webhook_rules (
+    category          TEXT NOT NULL PRIMARY KEY,
+    enabled           INTEGER NOT NULL DEFAULT 0,
+    webhook_config_id TEXT REFERENCES webhook_configs(id) ON DELETE SET NULL,
+    updated_at        DATETIME NOT NULL
+);
+
 `
 
 func marshalJSON(v interface{}) (string, error) {
@@ -3154,4 +3172,201 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func (s *sqliteStore) CreateWebhookConfig(ctx context.Context, w *WebhookConfig) error {
+	enabled, isDefault := boolToInt(w.Enabled), boolToInt(w.IsDefault)
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO webhook_configs
+			(id, name, url, secret_enc, enabled, is_default, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		w.ID.String(), w.Name, w.URL, w.SecretEnc, enabled, isDefault, w.CreatedAt.UTC(), w.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: CreateWebhookConfig: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) GetWebhookConfig(ctx context.Context, id uuid.UUID) (*WebhookConfig, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, url, secret_enc, enabled, is_default, created_at, updated_at
+		FROM webhook_configs WHERE id = ?`, id.String())
+	w, err := scanWebhookConfig(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetWebhookConfig: %w", err)
+	}
+	return w, nil
+}
+
+func (s *sqliteStore) ListWebhookConfigs(ctx context.Context) ([]*WebhookConfig, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, name, url, secret_enc, enabled, is_default, created_at, updated_at
+		FROM webhook_configs ORDER BY name ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListWebhookConfigs: %w", err)
+	}
+	defer rows.Close()
+	var out []*WebhookConfig
+	for rows.Next() {
+		w, err := scanWebhookConfigRows(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: ListWebhookConfigs: %w", err)
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpdateWebhookConfig(ctx context.Context, w *WebhookConfig) error {
+	enabled := boolToInt(w.Enabled)
+	res, err := s.db.ExecContext(ctx, `
+		UPDATE webhook_configs SET
+			name = ?, url = ?, secret_enc = ?, enabled = ?, updated_at = ?
+		WHERE id = ?`,
+		w.Name, w.URL, w.SecretEnc, enabled, w.UpdatedAt.UTC(), w.ID.String(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpdateWebhookConfig: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: UpdateWebhookConfig: %q not found", w.ID)
+	}
+	return nil
+}
+
+func (s *sqliteStore) DeleteWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM webhook_configs WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: DeleteWebhookConfig: %w", err)
+	}
+	return nil
+}
+
+func (s *sqliteStore) SetDefaultWebhookConfig(ctx context.Context, id uuid.UUID) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("sqlite: SetDefaultWebhookConfig: begin: %w", err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `UPDATE webhook_configs SET is_default = 0`); err != nil {
+		return fmt.Errorf("sqlite: SetDefaultWebhookConfig: clear: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE webhook_configs SET is_default = 1 WHERE id = ?`, id.String())
+	if err != nil {
+		return fmt.Errorf("sqlite: SetDefaultWebhookConfig: set: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("sqlite: SetDefaultWebhookConfig: %q not found", id)
+	}
+	return tx.Commit()
+}
+
+func (s *sqliteStore) GetDefaultWebhookConfig(ctx context.Context) (*WebhookConfig, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, name, url, secret_enc, enabled, is_default, created_at, updated_at
+		FROM webhook_configs WHERE is_default = 1 LIMIT 1`)
+	w, err := scanWebhookConfig(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetDefaultWebhookConfig: %w", err)
+	}
+	return w, nil
+}
+
+func scanWebhookConfig(row *sql.Row) (*WebhookConfig, error) {
+	return scanWebhookConfigScannable(row)
+}
+
+func scanWebhookConfigRows(rows *sql.Rows) (*WebhookConfig, error) {
+	return scanWebhookConfigScannable(rows)
+}
+
+func scanWebhookConfigScannable(row sqlScannable) (*WebhookConfig, error) {
+	var w WebhookConfig
+	var idStr string
+	var enabled, isDefault int
+	err := row.Scan(&idStr, &w.Name, &w.URL, &w.SecretEnc, &enabled, &isDefault, &w.CreatedAt, &w.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	w.ID = uuid.MustParse(idStr)
+	w.Enabled = enabled == 1
+	w.IsDefault = isDefault == 1
+	return &w, nil
+}
+
+func (s *sqliteStore) GetWebhookRule(ctx context.Context, category string) (*WebhookRule, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT category, enabled, webhook_config_id, updated_at
+		FROM webhook_rules WHERE category = ?`, category)
+	rule, err := scanWebhookRule(row)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: GetWebhookRule: %w", err)
+	}
+	return rule, nil
+}
+
+func (s *sqliteStore) ListWebhookRules(ctx context.Context) ([]*WebhookRule, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT category, enabled, webhook_config_id, updated_at
+		FROM webhook_rules ORDER BY category ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: ListWebhookRules: %w", err)
+	}
+	defer rows.Close()
+	var out []*WebhookRule
+	for rows.Next() {
+		rule, err := scanWebhookRuleScannable(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: ListWebhookRules: %w", err)
+		}
+		out = append(out, rule)
+	}
+	return out, rows.Err()
+}
+
+func (s *sqliteStore) UpsertWebhookRule(ctx context.Context, rule *WebhookRule) error {
+	var webhookID *string
+	if rule.WebhookConfigID != nil {
+		v := rule.WebhookConfigID.String()
+		webhookID = &v
+	}
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO webhook_rules (category, enabled, webhook_config_id, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(category) DO UPDATE SET
+			enabled = excluded.enabled, webhook_config_id = excluded.webhook_config_id,
+			updated_at = excluded.updated_at`,
+		rule.Category, boolToInt(rule.Enabled), webhookID, rule.UpdatedAt.UTC(),
+	)
+	if err != nil {
+		return fmt.Errorf("sqlite: UpsertWebhookRule: %w", err)
+	}
+	return nil
+}
+
+func scanWebhookRule(row *sql.Row) (*WebhookRule, error) {
+	return scanWebhookRuleScannable(row)
+}
+
+func scanWebhookRuleScannable(row sqlScannable) (*WebhookRule, error) {
+	var rule WebhookRule
+	var enabled int
+	var webhookID *string
+	err := row.Scan(&rule.Category, &enabled, &webhookID, &rule.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rule.Enabled = enabled == 1
+	if webhookID != nil {
+		id := uuid.MustParse(*webhookID)
+		rule.WebhookConfigID = &id
+	}
+	return &rule, nil
 }

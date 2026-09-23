@@ -284,6 +284,24 @@ type NotificationRule struct {
 	UpdatedAt    time.Time  `json:"updated_at"`
 }
 
+type WebhookConfig struct {
+	ID        uuid.UUID `json:"id"`
+	Name      string    `json:"name"`
+	URL       string    `json:"url"`
+	SecretEnc []byte    `json:"-"`
+	Enabled   bool      `json:"enabled"`
+	IsDefault bool      `json:"is_default"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type WebhookRule struct {
+	Category        string     `json:"category"`
+	Enabled         bool       `json:"enabled"`
+	WebhookConfigID *uuid.UUID `json:"webhook_config_id,omitempty"`
+	UpdatedAt       time.Time  `json:"updated_at"`
+}
+
 type ACMEAuthorizationStatus string
 
 const (
@@ -821,6 +839,18 @@ type Store interface {
 	GetNotificationRule(ctx context.Context, category string) (*NotificationRule, error)
 	ListNotificationRules(ctx context.Context) ([]*NotificationRule, error)
 	UpsertNotificationRule(ctx context.Context, rule *NotificationRule) error
+
+	CreateWebhookConfig(ctx context.Context, w *WebhookConfig) error
+	GetWebhookConfig(ctx context.Context, id uuid.UUID) (*WebhookConfig, error)
+	ListWebhookConfigs(ctx context.Context) ([]*WebhookConfig, error)
+	UpdateWebhookConfig(ctx context.Context, w *WebhookConfig) error
+	DeleteWebhookConfig(ctx context.Context, id uuid.UUID) error
+	SetDefaultWebhookConfig(ctx context.Context, id uuid.UUID) error
+	GetDefaultWebhookConfig(ctx context.Context) (*WebhookConfig, error)
+
+	GetWebhookRule(ctx context.Context, category string) (*WebhookRule, error)
+	ListWebhookRules(ctx context.Context) ([]*WebhookRule, error)
+	UpsertWebhookRule(ctx context.Context, rule *WebhookRule) error
 
 	// Close releases all connections held by the store.
 	Close() error

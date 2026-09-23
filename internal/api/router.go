@@ -24,6 +24,7 @@ import (
 	"mint-ca/internal/sshca"
 	"mint-ca/internal/sshca/krl"
 	"mint-ca/internal/storage"
+	"mint-ca/internal/webhook"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -43,6 +44,7 @@ func BuildRouter(
 	sshKRLMgr *krl.Manager,
 	elector apimiddleware.LeaderChecker,
 	notifyMgr *notify.Manager,
+	webhookMgr *webhook.Manager,
 ) http.Handler {
 	r := chi.NewRouter()
 
@@ -105,6 +107,9 @@ func BuildRouter(
 		if notifyMgr != nil {
 			emitters = append(emitters, notify.EventEmitter{Manager: notifyMgr})
 		}
+		if webhookMgr != nil {
+			emitters = append(emitters, webhook.EventEmitter{Manager: webhookMgr})
+		}
 		var emitter events.Emitter = events.NoopEmitter{}
 		if len(emitters) > 0 {
 			emitter = emitters
@@ -120,6 +125,7 @@ func BuildRouter(
 		handlers.NewTenantHandler(store).RegisterRoutes(r)
 		handlers.NewSettingsHandler(store, rlEngine).RegisterRoutes(r)
 		handlers.NewNotificationHandler(store, notifyMgr).RegisterRoutes(r)
+		handlers.NewWebhookHandler(store, webhookMgr).RegisterRoutes(r)
 		handlers.NewAuditHandler(store).RegisterRoutes(r)
 		handlers.NewSystemHandler(store, elector).RegisterRoutes(r)
 		handlers.NewBackupHandler(store).RegisterRoutes(r)
